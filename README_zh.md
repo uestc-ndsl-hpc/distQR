@@ -10,6 +10,7 @@
 - src/：项目的源代码。
 - include/：项目的头文件。
 - test/：项目的测试文件。
+- bench/：TSQR 与 cuSOLVER QR 的基准测试。
 - third_party/：项目的第三方库。
 
 ## 第三方库
@@ -19,4 +20,13 @@
 
 ```
 git submodule update --init --recursive
+```
+
+## 基准测试
+
+构建并运行 TSQR 与 cuSOLVER GEQRF 的性能对比：
+```
+cmake -S . -B build
+cmake --build build
+./build/bench/bench_tsqr --m 32768 --iters 20 --type float
 ```
