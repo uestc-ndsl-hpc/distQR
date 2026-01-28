@@ -11,4 +11,4 @@ target_link_libraries(test_tsqr PRIVATE GTest::gtest_main CUDA::cublas CUDA::cur
 
 add_executable(test_nvshmem_init test_nvshmem_init.cu)
 target_include_directories(test_nvshmem_init PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(test_nvshmem_init PRIVATE CUDA::cudart spdlog::spdlog)
+target_link_libraries(test_nvshmem_init PRIVATE CUDA::cudart MPI::MPI_CXX spdlog::spdlog)
