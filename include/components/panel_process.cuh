@@ -336,8 +336,8 @@ Note: Constructing the full Q and R requires recursive factorization of stacked
 R and batched GEMM to apply the stacked Q to each block.
 */
 template <typename T>
-void tsqr(cublasHandle_t cublas_handle, int m, T* A, int lda, T* R,
-                    int ldr, T* work, size_t work_elems) {
+void tsqr(
+    cublasHandle_t cublas_handle, int m, T* A, int lda, T* R, int ldr, T* work, size_t work_elems) {
     const int tsqr_n32_block_size = tsqr_block_size<T>();
     constexpr int tsqr_n32_n = 32;
     constexpr int warp_size = 32;
@@ -355,18 +355,15 @@ void tsqr(cublasHandle_t cublas_handle, int m, T* A, int lda, T* R,
         } else if constexpr (std::is_same_v<T, double>) {
             tsqr_n32_double<<<1, block>>>(m, A, lda, R, ldr);
         } else {
-            static_assert(std::is_same_v<T, float> ||
-                              std::is_same_v<T, double>,
+            static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                           "tsqr_recursive only supports float and double.");
         }
         return;
     }
 
-    const int block_num =
-        (m + tsqr_n32_block_size - 1) / tsqr_n32_block_size;
+    const int block_num = (m + tsqr_n32_block_size - 1) / tsqr_n32_block_size;
     const int stack_rows = block_num * tsqr_n32_n;
-    const size_t stack_elems =
-        static_cast<size_t>(stack_rows) * tsqr_n32_n;
+    const size_t stack_elems = static_cast<size_t>(stack_rows) * tsqr_n32_n;
     if (stack_elems > work_elems) {
         return;
     }
@@ -381,31 +378,24 @@ void tsqr(cublasHandle_t cublas_handle, int m, T* A, int lda, T* R,
                       "tsqr_recursive only supports float and double.");
     }
 
-    tsqr(cublas_handle, stack_rows, work, ldwork, R, ldr,
-                   work + stack_elems, work_elems - stack_elems);
+    tsqr(cublas_handle, stack_rows, work, ldwork, R, ldr, work + stack_elems,
+         work_elems - stack_elems);
 
     const T one = static_cast<T>(1);
     const T zero = static_cast<T>(0);
     const int full_blocks = m / tsqr_n32_block_size;
     if (full_blocks > 0) {
         CublasGemmTraits<T>::GemmStridedBatched(
-            cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, tsqr_n32_block_size,
-            tsqr_n32_n, tsqr_n32_n, &one, A, lda, tsqr_n32_block_size, work,
-            ldwork, tsqr_n32_n, &zero, A, lda, tsqr_n32_block_size,
-            full_blocks);
+            cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, tsqr_n32_block_size, tsqr_n32_n, tsqr_n32_n,
+            &one, A, lda, tsqr_n32_block_size, work, ldwork, tsqr_n32_n, &zero, A, lda,
+            tsqr_n32_block_size, full_blocks);
     }
 
     const int remaining_rows = m % tsqr_n32_block_size;
     if (remaining_rows > 0) {
-        CublasGemmTraits<T>::Gemm(
-            cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, remaining_rows, tsqr_n32_n,
-            tsqr_n32_n, &one, A + (m - remaining_rows), lda,
-            work + full_blocks * tsqr_n32_n, ldwork, &zero,
-            A + (m - remaining_rows), lda);
+        CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, remaining_rows,
+                                  tsqr_n32_n, tsqr_n32_n, &one, A + (m - remaining_rows), lda,
+                                  work + full_blocks * tsqr_n32_n, ldwork, &zero,
+                                  A + (m - remaining_rows), lda);
     }
-}
-
-template <typename T>
-void geqr(T* A, size_t m, size_t n, size_t nb, size_t b, T* W, T* Y) {
-    
 }
