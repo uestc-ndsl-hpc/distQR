@@ -151,19 +151,12 @@ inline MpiCudaEnv init_mpi_and_bind_gpu(int* argc, char*** argv) {
     }
     err = cudaFree(0);
     if (err != cudaSuccess) {
-        spdlog::error("cudaFree(0) failed on node {}: {}", env.node_name,
-                      cudaGetErrorString(err));
+        spdlog::error("cudaFree(0) failed on node {}: {}", env.node_name, cudaGetErrorString(err));
         return env;
     }
 
-    spdlog::info("node {} rank {}/{} local {}/{} -> device {}/{}",
-                 env.node_name,
-                 env.rank,
-                 env.size,
-                 env.local_rank,
-                 env.local_size,
-                 env.device_id,
-                 env.device_count);
+    spdlog::info("node {} rank {} local {} -> device {}", env.node_name, env.rank, env.local_rank,
+                 env.device_id);
     return env;
 }
 
