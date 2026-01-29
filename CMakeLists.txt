@@ -12,6 +12,9 @@ add_subdirectory(third_party/googletest)
 find_package(CUDAToolkit REQUIRED)
 # MPI
 find_package(MPI REQUIRED)
+# NCCL
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+find_package(NCCL REQUIRED)
 
 # Test
 add_subdirectory(test)

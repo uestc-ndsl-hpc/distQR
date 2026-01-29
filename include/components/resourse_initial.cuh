@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <mpi.h>
+#include <nccl.h>
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
@@ -17,6 +18,8 @@ struct MpiCudaEnv {
     int device_count = 0;
     std::string node_name;
     bool mpi_initialized_here = false;
+    ncclComm_t nccl_comm = nullptr;
+    bool nccl_initialized = false;
 };
 
 inline bool should_print_on_this_rank(const MpiCudaEnv* env) {
@@ -169,4 +172,56 @@ inline void finalize_mpi_if_needed(const MpiCudaEnv& env) {
     if (!mpi_finalized) {
         MPI_Finalize();
     }
+}
+
+inline bool init_nccl_comm(MpiCudaEnv* env, MPI_Comm comm = MPI_COMM_WORLD) {
+    if (!env) {
+        spdlog::error("init_nccl_comm called with null env.");
+        return false;
+    }
+    if (env->nccl_initialized) {
+        return true;
+    }
+
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+
+    int rank = 0;
+    int size = 1;
+    if (mpi_initialized) {
+        MPI_Comm_rank(comm, &rank);
+        MPI_Comm_size(comm, &size);
+    }
+
+    ncclUniqueId id{};
+    if (rank == 0) {
+        ncclResult_t get_id = ncclGetUniqueId(&id);
+        if (get_id != ncclSuccess) {
+            spdlog::error("ncclGetUniqueId failed: {}", ncclGetErrorString(get_id));
+            return false;
+        }
+    }
+
+    if (mpi_initialized) {
+        MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, comm);
+    }
+
+    ncclResult_t init_res = ncclCommInitRank(&env->nccl_comm, size, id, rank);
+    if (init_res != ncclSuccess) {
+        spdlog::error("ncclCommInitRank failed: {}", ncclGetErrorString(init_res));
+        env->nccl_comm = nullptr;
+        return false;
+    }
+
+    env->nccl_initialized = true;
+    return true;
+}
+
+inline void finalize_nccl_if_needed(MpiCudaEnv* env) {
+    if (!env || !env->nccl_initialized) {
+        return;
+    }
+    ncclCommDestroy(env->nccl_comm);
+    env->nccl_comm = nullptr;
+    env->nccl_initialized = false;
 }

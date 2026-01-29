@@ -1,0 +1,29 @@
+# Locate NCCL
+# This module defines:
+#   NCCL_INCLUDE_DIR
+#   NCCL_LIBRARY
+#   NCCL_FOUND
+#   NCCL::NCCL
+
+set(_NCCL_ROOT_HINTS $ENV{NCCL_ROOT} $ENV{NCCL_HOME} $ENV{NCCL_DIR})
+
+find_path(NCCL_INCLUDE_DIR
+  NAMES nccl.h
+  HINTS ${_NCCL_ROOT_HINTS}
+  PATH_SUFFIXES include)
+
+find_library(NCCL_LIBRARY
+  NAMES nccl
+  HINTS ${_NCCL_ROOT_HINTS}
+  PATH_SUFFIXES lib lib64)
+
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(NCCL
+  REQUIRED_VARS NCCL_LIBRARY NCCL_INCLUDE_DIR)
+
+if(NCCL_FOUND AND NOT TARGET NCCL::NCCL)
+  add_library(NCCL::NCCL UNKNOWN IMPORTED)
+  set_target_properties(NCCL::NCCL PROPERTIES
+    IMPORTED_LOCATION "${NCCL_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${NCCL_INCLUDE_DIR}")
+endif()
