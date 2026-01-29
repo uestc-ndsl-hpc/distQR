@@ -193,8 +193,8 @@ inline bool init_nccl_comm(MpiCudaEnv* env, MPI_Comm comm = MPI_COMM_WORLD) {
         MPI_Comm_size(comm, &size);
     }
 
-    spdlog::info("NCCL init start: rank {} / {} on node {} (device {})",
-                 rank, size, env->node_name, env->device_id);
+    spdlog::info("NCCL init start: rank {} on node {} (device {})", rank, env->node_name,
+                 env->device_id);
 
     ncclUniqueId id{};
     if (rank == 0) {
@@ -217,8 +217,8 @@ inline bool init_nccl_comm(MpiCudaEnv* env, MPI_Comm comm = MPI_COMM_WORLD) {
     }
 
     env->nccl_initialized = true;
-    spdlog::info("NCCL init done: rank {} / {} on node {} (device {})",
-                 rank, size, env->node_name, env->device_id);
+    spdlog::info("NCCL init done: rank {} on node {} (device {})", rank, env->node_name,
+                 env->device_id);
     return true;
 }
 
