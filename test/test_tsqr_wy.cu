@@ -83,6 +83,7 @@ double RelativeFrobeniusError(const std::vector<T>& A,
     return std::sqrt(diff) / denom;
 }
 
+template <typename T>
 void RunTsqrWyTest(int m, double tol) {
     constexpr int n = 32;
     const int lda = m;
@@ -90,15 +91,15 @@ void RunTsqrWyTest(int m, double tol) {
     const int ldy = m;
     const int ldw = m;
 
-    float* d_A = nullptr;
-    float* d_R = nullptr;
-    float* d_Y = nullptr;
-    float* d_W = nullptr;
-    float* d_work = nullptr;
+    T* d_A = nullptr;
+    T* d_R = nullptr;
+    T* d_Y = nullptr;
+    T* d_W = nullptr;
+    T* d_work = nullptr;
 
-    const size_t a_bytes = static_cast<size_t>(lda) * n * sizeof(float);
-    const size_t r_bytes = static_cast<size_t>(ldr) * n * sizeof(float);
-    const size_t wy_bytes = static_cast<size_t>(m) * n * sizeof(float);
+    const size_t a_bytes = static_cast<size_t>(lda) * n * sizeof(T);
+    const size_t r_bytes = static_cast<size_t>(ldr) * n * sizeof(T);
+    const size_t wy_bytes = static_cast<size_t>(m) * n * sizeof(T);
 
     AssertCuda(cudaMalloc(&d_A, a_bytes), "cudaMalloc d_A");
     AssertCuda(cudaMalloc(&d_R, r_bytes), "cudaMalloc d_R");
@@ -107,9 +108,9 @@ void RunTsqrWyTest(int m, double tol) {
 
     FillDeviceRandom(d_A, static_cast<size_t>(lda) * n, 123ULL);
 
-    size_t work_elems = tsqr_work_elems<float>(m);
+    size_t work_elems = tsqr_work_elems<T>(m);
     if (work_elems > 0) {
-        AssertCuda(cudaMalloc(&d_work, work_elems * sizeof(float)),
+        AssertCuda(cudaMalloc(&d_work, work_elems * sizeof(T)),
                    "cudaMalloc d_work");
     }
 
@@ -124,9 +125,9 @@ void RunTsqrWyTest(int m, double tol) {
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize generate_wy");
     AssertCuda(cudaGetLastError(), "cudaGetLastError generate_wy");
 
-    std::vector<float> h_Q(static_cast<size_t>(m) * n);
-    std::vector<float> h_Y(static_cast<size_t>(m) * n);
-    std::vector<float> h_W(static_cast<size_t>(m) * n);
+    std::vector<T> h_Q(static_cast<size_t>(m) * n);
+    std::vector<T> h_Y(static_cast<size_t>(m) * n);
+    std::vector<T> h_W(static_cast<size_t>(m) * n);
 
     AssertCuda(cudaMemcpy(h_Q.data(), d_A, a_bytes, cudaMemcpyDeviceToHost),
                "cudaMemcpy D2H d_A");
@@ -135,7 +136,7 @@ void RunTsqrWyTest(int m, double tol) {
     AssertCuda(cudaMemcpy(h_W.data(), d_W, wy_bytes, cudaMemcpyDeviceToHost),
                "cudaMemcpy D2H d_W");
 
-    std::vector<float> h_Q_wy = ReconstructQFromWY(m, n, ldw, h_W, ldy, h_Y);
+    std::vector<T> h_Q_wy = ReconstructQFromWY(m, n, ldw, h_W, ldy, h_Y);
     const double wy_err = RelativeFrobeniusError(h_Q, h_Q_wy);
     EXPECT_LT(wy_err, tol);
 
@@ -152,9 +153,17 @@ void RunTsqrWyTest(int m, double tol) {
 }  // namespace
 
 TEST(TsqrWyTest, FloatSmallMatrix) {
-    RunTsqrWyTest(128, 1e-5);
+    RunTsqrWyTest<float>(128, 1e-5);
 }
 
 TEST(TsqrWyTest, FloatLargeMatrix) {
-    RunTsqrWyTest(32768, 1e-5);
+    RunTsqrWyTest<float>(32768, 1e-5);
+}
+
+TEST(TsqrWyTest, DoubleSmallMatrix) {
+    RunTsqrWyTest<double>(128, 1e-12);
+}
+
+TEST(TsqrWyTest, DoubleLargeMatrix) {
+    RunTsqrWyTest<double>(32768, 5e-11);
 }
