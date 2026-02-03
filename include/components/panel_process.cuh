@@ -3,6 +3,7 @@
 #include <type_traits>
 
 #include "utils/cublas_gemm_traits.cuh"
+#include "panel_wy_generate.cuh"
 
 template <typename T>
 static __inline__ __device__ T warp_all_reduce_sum(T val) {
