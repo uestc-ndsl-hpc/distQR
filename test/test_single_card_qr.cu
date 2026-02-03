@@ -48,6 +48,22 @@ int main() {
                         panel_w_raw_pointer, lda, nullptr);
             // write back R to A
             write_back_R2A(b, b, r_raw_pointer, b, panel_raw_pointer, lda, nullptr);
+
+            // update next panel
+            if (inner_index + b >= nb) break;
+            auto next_panel_raw_pointer = panel_raw_pointer + b * lda;
+            auto work_t_raw_pointer = r_raw_pointer;
+            float one = 1.0f;
+            float zero = 0.0f;
+            float minus_one = -1.0f;
+            CublasGemmTraits<float>::Gemm(
+                cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, b, b, panel_height, &one,
+                panel_y_raw_pointer, lda, next_panel_raw_pointer, lda, &zero, work_t_raw_pointer,
+                b);
+            CublasGemmTraits<float>::Gemm(
+                cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_height, b, b, &minus_one,
+                panel_w_raw_pointer, lda, work_t_raw_pointer, b, &one, next_panel_raw_pointer,
+                lda);
         }
     }
 }
