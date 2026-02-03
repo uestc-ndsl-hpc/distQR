@@ -152,9 +152,9 @@ void RunTsqrWyTest(int m, double tol) {
 }  // namespace
 
 TEST(TsqrWyTest, FloatSmallMatrix) {
-    RunTsqrWyTest(128, 2e-4);
+    RunTsqrWyTest(128, 1e-5);
 }
 
 TEST(TsqrWyTest, FloatLargeMatrix) {
-    RunTsqrWyTest(1024, 5e-4);
+    RunTsqrWyTest(32768, 1e-5);
 }
