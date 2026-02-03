@@ -37,11 +37,17 @@ int main() {
         // inner loop for inner update
         for (auto inner_index = outer_index; inner_index < nb; inner_index += b) {
             // tsqr
+            auto panel_height = m - inner_index;
             auto panel_raw_pointer = device_matrix_raw_pointer + inner_index * lda + inner_index;
-            tsqr<float>(cublas_handle, m - inner_index, panel_raw_pointer, lda, r_raw_pointer, b,
-                        tsqr_work_space_raw_pointer, tsqr_work_elems<float>(m - inner_index));
-
-            // generate WY for update
+            auto panel_w_raw_pointer = w_raw_pointer + inner_index * lda + inner_index;
+            auto panel_y_raw_pointer = y_raw_pointer + inner_index * lda + inner_index;
+            tsqr<float>(cublas_handle, panel_height, panel_raw_pointer, lda, r_raw_pointer, b,
+                        tsqr_work_space_raw_pointer, tsqr_work_elems<float>(panel_height), nullptr);
+            // generate WY for next panel
+            generate_wy(panel_height, b, panel_raw_pointer, lda, panel_y_raw_pointer, lda,
+                        panel_w_raw_pointer, lda, nullptr);
+            // write back R to A
+            write_back_R2A(b, b, r_raw_pointer, b, panel_raw_pointer, lda, nullptr);
         }
     }
 }

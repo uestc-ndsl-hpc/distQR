@@ -341,7 +341,7 @@ __global__ void generate_wy_double_kernel(
 }
 
 template <typename T>
-void generate_wy(int m, int n, T* A, int lda, T* Y, int ldy, T* W, int ldw) {
+void generate_wy(int m, int n, T* A, int lda, T* Y, int ldy, T* W, int ldw, cudaStream_t stream) {
     constexpr int columns_per_warp = 4;
     constexpr int warps_per_block = tsqr_n32_n / columns_per_warp;
     constexpr int row_tile = tsqr_n32_n * 4;
@@ -356,11 +356,11 @@ void generate_wy(int m, int n, T* A, int lda, T* Y, int ldy, T* W, int ldw) {
     }
     dim3 grid_dim(row_blocks);
     if constexpr (std::is_same_v<T, float>) {
-        generate_wy_float_kernel<<<grid_dim, block_dim>>>(m, n, A, lda, Y, ldy, W, ldw);
+        generate_wy_float_kernel<<<grid_dim, block_dim, 0, stream>>>(m, n, A, lda, Y, ldy, W, ldw);
     } else if constexpr (std::is_same_v<T, double>) {
-        generate_wy_double_kernel<<<grid_dim, block_dim>>>(m, n, A, lda, Y, ldy, W, ldw);
+        generate_wy_double_kernel<<<grid_dim, block_dim, 0, stream>>>(m, n, A, lda, Y, ldy, W, ldw);
     } else {
         throw std::runtime_error("Unsupported type: unknown");
     }
-    cudaDeviceSynchronize();
+    cudaStreamSynchronize(stream);
 }

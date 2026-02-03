@@ -337,7 +337,7 @@ R and batched GEMM to apply the stacked Q to each block.
 */
 template <typename T>
 void tsqr(
-    cublasHandle_t cublas_handle, int m, T* A, int lda, T* R, int ldr, T* work, size_t work_elems) {
+    cublasHandle_t cublas_handle, int m, T* A, int lda, T* R, int ldr, T* work, size_t work_elems, cudaStream_t stream) {
     const int tsqr_n32_block_size = tsqr_block_size<T>();
     constexpr int tsqr_n32_n = 32;
     constexpr int warp_size = 32;
@@ -351,9 +351,9 @@ void tsqr(
 
     if (m <= tsqr_n32_block_size) {
         if constexpr (std::is_same_v<T, float>) {
-            tsqr_n32_float<<<1, block>>>(m, A, lda, R, ldr);
+            tsqr_n32_float<<<1, block, 0, stream>>>(m, A, lda, R, ldr);
         } else if constexpr (std::is_same_v<T, double>) {
-            tsqr_n32_double<<<1, block>>>(m, A, lda, R, ldr);
+            tsqr_n32_double<<<1, block, 0, stream>>>(m, A, lda, R, ldr);
         } else {
             static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                           "tsqr_recursive only supports float and double.");
@@ -370,16 +370,16 @@ void tsqr(
     const int ldwork = stack_rows;
 
     if constexpr (std::is_same_v<T, float>) {
-        tsqr_n32_float<<<block_num, block>>>(m, A, lda, work, ldwork);
+        tsqr_n32_float<<<block_num, block, 0, stream>>>(m, A, lda, work, ldwork);
     } else if constexpr (std::is_same_v<T, double>) {
-        tsqr_n32_double<<<block_num, block>>>(m, A, lda, work, ldwork);
+        tsqr_n32_double<<<block_num, block, 0, stream>>>(m, A, lda, work, ldwork);
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                       "tsqr_recursive only supports float and double.");
     }
 
     tsqr(cublas_handle, stack_rows, work, ldwork, R, ldr, work + stack_elems,
-         work_elems - stack_elems);
+         work_elems - stack_elems, stream);
 
     const T one = static_cast<T>(1);
     const T zero = static_cast<T>(0);
