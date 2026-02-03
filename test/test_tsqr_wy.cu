@@ -117,11 +117,11 @@ void RunTsqrWyTest(int m, double tol) {
     cublasHandle_t handle;
     AssertCublas(cublasCreate(&handle), "cublasCreate");
 
-    tsqr(handle, m, d_A, lda, d_R, ldr, d_work, work_elems);
+    tsqr(handle, m, d_A, lda, d_R, ldr, d_work, work_elems, nullptr);
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize tsqr");
     AssertCuda(cudaGetLastError(), "cudaGetLastError tsqr");
 
-    generate_wy(m, n, d_A, lda, d_Y, ldy, d_W, ldw);
+    generate_wy(m, n, d_A, lda, d_Y, ldy, d_W, ldw, nullptr);
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize generate_wy");
     AssertCuda(cudaGetLastError(), "cudaGetLastError generate_wy");
 

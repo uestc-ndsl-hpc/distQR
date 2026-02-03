@@ -144,7 +144,7 @@ void RunTsqrTest(int m, double tol_recon, double tol_ortho,
     cublasHandle_t handle;
     AssertCublas(cublasCreate(&handle), "cublasCreate");
 
-    tsqr(handle, m, d_A, lda, d_R, ldr, d_work, work_elems);
+    tsqr(handle, m, d_A, lda, d_R, ldr, d_work, work_elems, nullptr);
 
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
     AssertCuda(cudaGetLastError(), "cudaGetLastError");
