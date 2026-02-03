@@ -213,7 +213,7 @@ int main(int argc, char** argv) {
                            "cudaMemcpy D2D tsqr");
             },
             [&]() {
-                tsqr(cublas_handle, m, d_A_tsqr, lda, d_R, ldr, d_work_tsqr, work_elems);
+                tsqr(cublas_handle, m, d_A_tsqr, lda, d_R, ldr, d_work_tsqr, work_elems, nullptr);
                 AssertCuda(cudaGetLastError(), "tsqr launch");
             },
             opts.iters);
@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
                            "cudaMemcpy D2D tsqr");
             },
             [&]() {
-                tsqr(cublas_handle, m, d_A_tsqr, lda, d_R, ldr, d_work_tsqr, work_elems);
+                tsqr(cublas_handle, m, d_A_tsqr, lda, d_R, ldr, d_work_tsqr, work_elems, nullptr);
                 AssertCuda(cudaGetLastError(), "tsqr launch");
             },
             opts.iters);
