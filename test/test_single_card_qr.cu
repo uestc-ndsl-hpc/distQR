@@ -34,8 +34,9 @@ int main() {
 
     // outer loop for large update
     for (auto outer_index = 0; outer_index < n; outer_index += nb) {
+        auto end = std::min(outer_index + nb, n);
         // inner loop for inner update
-        for (auto inner_index = outer_index; inner_index < nb; inner_index += b) {
+        for (auto inner_index = outer_index; inner_index < end; inner_index += b) {
             // tsqr
             auto panel_height = m - inner_index;
             auto panel_raw_pointer = device_matrix_raw_pointer + inner_index * lda + inner_index;
@@ -50,20 +51,19 @@ int main() {
             write_back_R2A(b, b, r_raw_pointer, b, panel_raw_pointer, lda, nullptr);
 
             // update next panel
-            if (inner_index + b >= nb) break;
+            if (inner_index + b >= end) break;
             auto next_panel_raw_pointer = panel_raw_pointer + b * lda;
             auto work_t_raw_pointer = r_raw_pointer;
             float one = 1.0f;
             float zero = 0.0f;
             float minus_one = -1.0f;
-            CublasGemmTraits<float>::Gemm(
-                cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, b, b, panel_height, &one,
-                panel_y_raw_pointer, lda, next_panel_raw_pointer, lda, &zero, work_t_raw_pointer,
-                b);
-            CublasGemmTraits<float>::Gemm(
-                cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_height, b, b, &minus_one,
-                panel_w_raw_pointer, lda, work_t_raw_pointer, b, &one, next_panel_raw_pointer,
-                lda);
+            CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, b, b,
+                                          panel_height, &one, panel_w_raw_pointer, lda,
+                                          next_panel_raw_pointer, lda, &zero, work_t_raw_pointer,
+                                          b);
+            CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_height, b,
+                                          b, &minus_one, panel_y_raw_pointer, lda,
+                                          work_t_raw_pointer, b, &one, next_panel_raw_pointer, lda);
         }
     }
 }
