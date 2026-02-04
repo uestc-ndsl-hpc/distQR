@@ -18,5 +18,5 @@ target_include_directories(test_nccl_init PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_nccl_init PRIVATE CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL)
 
 add_executable(test_single_card_qr test_single_card_qr.cu)
-target_link_libraries(test_single_card_qr PRIVATE CUDA::cublas CUDA::curand CUDA::cudart spdlog::spdlog)
+target_link_libraries(test_single_card_qr PRIVATE GTest::gtest_main CUDA::cublas CUDA::curand CUDA::cudart spdlog::spdlog)
 target_include_directories(test_single_card_qr PRIVATE ${CMAKE_SOURCE_DIR}/include)
