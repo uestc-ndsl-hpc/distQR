@@ -17,6 +17,10 @@ namespace {
 
 constexpr int kPanelWidth = 32;
 
+static inline size_t Idx2D(int row, int col, int ld) {
+    return static_cast<size_t>(row) + static_cast<size_t>(col) * static_cast<size_t>(ld);
+}
+
 void AssertCuda(cudaError_t status, const char* context) {
     ASSERT_EQ(status, cudaSuccess) << context << ": " << cudaGetErrorString(status);
 }
@@ -156,14 +160,14 @@ void SingleCardBlockedQrFactorize(float* d_Afact,
         const int end = std::min(outer_index + nb, n);
         const int kb = end - outer_index;
         const int m_sub = m - outer_index;
-        auto w_big = d_W + outer_index * lda + outer_index;
-        auto y_big = d_Y + outer_index * lda + outer_index;
+        auto w_big = d_W + Idx2D(outer_index, outer_index, lda);
+        auto y_big = d_Y + Idx2D(outer_index, outer_index, lda);
 
         for (int inner_index = outer_index; inner_index < end; inner_index += kPanelWidth) {
             const int panel_height = m - inner_index;
-            auto panel_A = d_Afact + inner_index * lda + inner_index;
-            auto panel_W = d_W + inner_index * lda + inner_index;
-            auto panel_Y = d_Y + inner_index * lda + inner_index;
+            auto panel_A = d_Afact + Idx2D(inner_index, inner_index, lda);
+            auto panel_W = d_W + Idx2D(inner_index, inner_index, lda);
+            auto panel_Y = d_Y + Idx2D(inner_index, inner_index, lda);
 
             tsqr<float>(cublas_handle, panel_height, panel_A, lda, d_rtmp, kPanelWidth, d_tsqr_work,
                         tsqr_work_elems_m, nullptr);
@@ -195,7 +199,7 @@ void SingleCardBlockedQrFactorize(float* d_Afact,
                 const int k_prev = inner_index - outer_index;
                 auto w_prev = w_big;                                   // (m_sub x k_prev)
                 auto y_prev = y_big;                                   // (m_sub x k_prev)
-                auto w_i_sub = d_W + inner_index * lda + outer_index;  // (m_sub x b)
+                auto w_i_sub = d_W + Idx2D(outer_index, inner_index, lda);  // (m_sub x b)
 
                 // tmp (k_prev x b) = Y_prev^T * W_i, stored in d_rtmp with leading dimension nb.
                 CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, k_prev,
@@ -212,10 +216,10 @@ void SingleCardBlockedQrFactorize(float* d_Afact,
         // A(outer:m, end:n) <- Q_block^T * A = A - Y_big * (W_big^T * A)
         const int n_trail = n - end;
         if (n_trail > 0) {
-            auto a_trail = d_Afact + end * lda + outer_index;  // (m_sub x n_trail)
+            auto a_trail = d_Afact + Idx2D(outer_index, end, lda);  // (m_sub x n_trail)
             for (int col0 = 0; col0 < n_trail; col0 += nb) {
                 const int tile = std::min(nb, n_trail - col0);
-                auto a_tile = a_trail + static_cast<size_t>(col0) * lda;  // (m_sub x tile)
+                auto a_tile = a_trail + static_cast<size_t>(col0) * static_cast<size_t>(lda);  // (m_sub x tile)
 
                 // work (kb x tile) = W_big^T * A_tile, stored in d_rtmp
                 CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, tile,
@@ -248,13 +252,13 @@ void ApplyAllOuterBlocksQT(float* d_A0,
         const int kb = end - outer_index;
         const int m_sub = m - outer_index;
         const int n_sub = n - outer_index;
-        auto w_big = d_W + outer_index * lda + outer_index;
-        auto y_big = d_Y + outer_index * lda + outer_index;
-        auto a_sub = d_A0 + outer_index * lda + outer_index;  // (m_sub x n_sub)
+        auto w_big = d_W + Idx2D(outer_index, outer_index, lda);
+        auto y_big = d_Y + Idx2D(outer_index, outer_index, lda);
+        auto a_sub = d_A0 + Idx2D(outer_index, outer_index, lda);  // (m_sub x n_sub)
 
         for (int col0 = 0; col0 < n_sub; col0 += nb) {
             const int tile = std::min(nb, n_sub - col0);
-            auto a_tile = a_sub + static_cast<size_t>(col0) * lda;  // (m_sub x tile)
+            auto a_tile = a_sub + static_cast<size_t>(col0) * static_cast<size_t>(lda);  // (m_sub x tile)
             CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, tile, m_sub,
                                           &one, w_big, lda, a_tile, lda, &zero, d_rtmp, kb);
             CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub, tile, kb,
@@ -358,12 +362,16 @@ static void RunQrCase(const QrCase& test_case,
     // Factorize Afact to get WY (and R in Afact's upper triangle).
     SingleCardBlockedQrFactorize(d_Afact.ptr, m, n, nb, handle, d_W.ptr, d_Y.ptr, d_rtmp.ptr,
                                  d_tsqr.ptr, elems_tsqr);
+    AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after factorize");
+    AssertCuda(cudaGetLastError(), "cudaGetLastError after factorize");
 
     const double norm_A0 = Nrm2Large(handle, d_A0.ptr, elems_A);
     ASSERT_GT(norm_A0, 0.0);
 
     // Apply Q^T (from WY) to A0: A0 <- Q^T * A0.
     ApplyAllOuterBlocksQT(d_A0.ptr, m, n, nb, handle, d_W.ptr, d_Y.ptr, d_rtmp.ptr);
+    AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after apply Q^T");
+    AssertCuda(cudaGetLastError(), "cudaGetLastError after apply Q^T");
 
     // Norm checks via cublasNrm2 on packed nb*nb blocks.
     const dim3 block_dim(16, 16);
@@ -373,8 +381,8 @@ static void RunQrCase(const QrCase& test_case,
     double sumsq_upper_diff = 0.0;
     for (int j0 = 0; j0 < n; j0 += nb) {
         for (int i0 = 0; i0 < n; i0 += nb) {
-            const float* a_block = d_A0.ptr + i0 + j0 * m;
-            const float* r_block = d_Afact.ptr + i0 + j0 * m;
+            const float* a_block = d_A0.ptr + Idx2D(i0, j0, m);
+            const float* r_block = d_Afact.ptr + Idx2D(i0, j0, m);
 
             if (i0 > j0) {
                 PackFullBlockKernel<<<grid_dim, block_dim>>>(nb, a_block, m, d_pack.ptr, nb);
