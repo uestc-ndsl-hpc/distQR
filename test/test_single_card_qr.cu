@@ -87,7 +87,9 @@ struct ReusableNormalRng {
 };
 
 double Nrm2Large(cublasHandle_t handle, const float* d_x, size_t n) {
-    const size_t kMaxChunk = static_cast<size_t>(std::numeric_limits<int>::max());
+    // Even though the API takes `int n`, very large `n` near INT_MAX can fail on some systems
+    // (observed as CUBLAS_STATUS_EXECUTION_FAILED). Use a conservative chunk size.
+    constexpr size_t kMaxChunk = static_cast<size_t>(1) << 26;  // 67,108,864 elements
     double sumsq = 0.0;
     size_t offset = 0;
     while (offset < n) {
