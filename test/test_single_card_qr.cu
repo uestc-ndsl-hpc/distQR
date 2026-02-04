@@ -272,13 +272,13 @@ struct QrCase {
 };
 
 void ApplyAllOuterBlocksQTToMatrix(float* d_X,
-                                  int rows,
-                                  int cols,
-                                  int nb,
-                                  cublasHandle_t cublas_handle,
-                                  const float* d_W,
-                                  const float* d_Y,
-                                  float* d_rtmp) {
+                                   int rows,
+                                   int cols,
+                                   int nb,
+                                   cublasHandle_t cublas_handle,
+                                   const float* d_W,
+                                   const float* d_Y,
+                                   float* d_rtmp) {
     const int lda = rows;
     const float one = 1.0f;
     const float zero = 0.0f;
@@ -304,13 +304,13 @@ void ApplyAllOuterBlocksQTToMatrix(float* d_X,
 }
 
 void ApplyAllOuterBlocksQToMatrix(float* d_X,
-                                 int rows,
-                                 int cols,
-                                 int nb,
-                                 cublasHandle_t cublas_handle,
-                                 const float* d_W,
-                                 const float* d_Y,
-                                 float* d_rtmp) {
+                                  int rows,
+                                  int cols,
+                                  int nb,
+                                  cublasHandle_t cublas_handle,
+                                  const float* d_W,
+                                  const float* d_Y,
+                                  float* d_rtmp) {
     const int lda = rows;
     const float one = 1.0f;
     const float zero = 0.0f;
@@ -483,8 +483,10 @@ static void RunQrCase(const QrCase& test_case,
     const double norm_QtQX_minus_X = Nrm2Large(handle, d_X.ptr, elems_X);
     const double rel_norm_preserve = std::abs(norm_QX - norm_X) / norm_X;
     const double rel_ortho = norm_QtQX_minus_X / norm_X;
-    spdlog::info("N={} NB={} Q-orth: ||X||2={:.6e}, ||QX||2={:.6e} (rel {:.3e}), ||Q^TQX-X||2={:.6e} (rel {:.3e})",
-                 n, nb, norm_X, norm_QX, rel_norm_preserve, norm_QtQX_minus_X, rel_ortho);
+    spdlog::info(
+        "N={} NB={} Q-orth: ||X||2={:.6e}, ||QX||2={:.6e} (rel {:.3e}), ||Q^TQX-X||2={:.6e} (rel "
+        "{:.3e})",
+        n, nb, norm_X, norm_QX, rel_norm_preserve, norm_QtQX_minus_X, rel_ortho);
     EXPECT_LT(rel_norm_preserve, 1e-4);
     EXPECT_LT(rel_ortho, 1e-4);
 
