@@ -56,10 +56,9 @@ void FillDeviceRandom(T* device_data, size_t count, unsigned long long seed) {
     AssertCurand(curandSetPseudoRandomGeneratorSeed(gen, seed),
                  "curandSetPseudoRandomGeneratorSeed");
     if constexpr (std::is_same_v<T, float>) {
-        AssertCurand(curandGenerateUniform(gen, device_data, static_cast<int>(count)),
-                     "curandGenerateUniform");
+        AssertCurand(curandGenerateUniform(gen, device_data, count), "curandGenerateUniform");
     } else if constexpr (std::is_same_v<T, double>) {
-        AssertCurand(curandGenerateUniformDouble(gen, device_data, static_cast<int>(count)),
+        AssertCurand(curandGenerateUniformDouble(gen, device_data, count),
                      "curandGenerateUniformDouble");
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
@@ -136,38 +135,39 @@ void BlockedQrFactorize(cublasHandle_t cublas_handle,
 
             tsqr<T>(cublas_handle, panel_height, panel_A, lda, d_rtmp, kPanelWidth, d_tsqr_work,
                     tsqr_work_elems_m, stream);
-            generate_wy(panel_height, kPanelWidth, panel_A, lda, panel_Y, lda, panel_W, lda, stream);
+            generate_wy(panel_height, kPanelWidth, panel_A, lda, panel_Y, lda, panel_W, lda,
+                        stream);
             write_back_R2A(kPanelWidth, kPanelWidth, d_rtmp, kPanelWidth, panel_A, lda, stream);
 
             const int n_remain_in_block = end - (inner_index + kPanelWidth);
             if (n_remain_in_block > 0) {
                 T* a_remain = panel_A + kPanelWidth * lda;
                 T* work = d_rtmp;  // (b x n_remain)
-                AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                                      kPanelWidth, n_remain_in_block, panel_height,
-                                                      &one, panel_W, lda, a_remain, lda, &zero,
-                                                      work, kPanelWidth),
-                             "in-block W^T*A");
-                AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                                      panel_height, n_remain_in_block, kPanelWidth,
-                                                      &minus_one, panel_Y, lda, work, kPanelWidth,
-                                                      &one, a_remain, lda),
-                             "in-block A -= Y*work");
+                AssertCublas(
+                    CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kPanelWidth,
+                                              n_remain_in_block, panel_height, &one, panel_W, lda,
+                                              a_remain, lda, &zero, work, kPanelWidth),
+                    "in-block W^T*A");
+                AssertCublas(
+                    CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_height,
+                                              n_remain_in_block, kPanelWidth, &minus_one, panel_Y,
+                                              lda, work, kPanelWidth, &one, a_remain, lda),
+                    "in-block A -= Y*work");
             }
 
             if (inner_index > outer_index) {
                 const int k_prev = inner_index - outer_index;
-                T* w_prev = w_big;  // (m_sub x k_prev)
-                T* y_prev = y_big;  // (m_sub x k_prev)
+                T* w_prev = w_big;                                        // (m_sub x k_prev)
+                T* y_prev = y_big;                                        // (m_sub x k_prev)
                 T* w_i_sub = d_W + Idx2D(outer_index, inner_index, lda);  // (m_sub x b)
 
                 AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                                                      k_prev, kPanelWidth, m_sub, &one, y_prev,
-                                                      lda, w_i_sub, lda, &zero, d_rtmp, nb),
+                                                       k_prev, kPanelWidth, m_sub, &one, y_prev,
+                                                       lda, w_i_sub, lda, &zero, d_rtmp, nb),
                              "WY tmp = Y_prev^T * W_i");
-                AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
-                                                      kPanelWidth, k_prev, &minus_one, w_prev, lda,
-                                                      d_rtmp, nb, &one, w_i_sub, lda),
+                AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                                       m_sub, kPanelWidth, k_prev, &minus_one,
+                                                       w_prev, lda, d_rtmp, nb, &one, w_i_sub, lda),
                              "WY W_i -= W_prev*tmp");
             }
         }
@@ -179,12 +179,12 @@ void BlockedQrFactorize(cublasHandle_t cublas_handle,
                 const int tile = std::min(nb, n_trail - col0);
                 T* a_tile = a_trail + static_cast<size_t>(col0) * static_cast<size_t>(lda);
                 AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
-                                                      tile, m_sub, &one, w_big, lda, a_tile, lda,
-                                                      &zero, d_rtmp, kb),
+                                                       tile, m_sub, &one, w_big, lda, a_tile, lda,
+                                                       &zero, d_rtmp, kb),
                              "trail work = W^T*A");
-                AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
-                                                      tile, kb, &minus_one, y_big, lda, d_rtmp, kb,
-                                                      &one, a_tile, lda),
+                AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                                       m_sub, tile, kb, &minus_one, y_big, lda,
+                                                       d_rtmp, kb, &one, a_tile, lda),
                              "trail A -= Y*work");
             }
         }
@@ -225,7 +225,9 @@ Options ParseArgs(int argc, char** argv) {
 }
 
 template <typename T>
-void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandle_t cusolver_handle) {
+void RunBench(const Options& opts,
+              cublasHandle_t cublas_handle,
+              cusolverDnHandle_t cusolver_handle) {
     const int m = opts.m;
     const int n = opts.n;
     const int nb = opts.nb;
@@ -259,7 +261,8 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
 
     // warmup with one iteration (not timed)
     for (int i = 0; i < opts.warmup; ++i) {
-        AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice), "cudaMemcpy D2D warmup");
+        AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                   "cudaMemcpy D2D warmup");
         AssertCuda(cudaMemset(d_W, 0, wy_bytes), "cudaMemset d_W warmup");
         AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y warmup");
         BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
@@ -269,7 +272,8 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
 
     const float blocked_ms = TimeKernelMs(
         [&]() {
-            AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice), "cudaMemcpy D2D A");
+            AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                       "cudaMemcpy D2D A");
             AssertCuda(cudaMemset(d_W, 0, wy_bytes), "cudaMemset d_W");
             AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y");
         },
@@ -294,11 +298,13 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
 
         int lwork = 0;
         if constexpr (std::is_same_v<T, float>) {
-            AssertCusolver(cusolverDnSgeqrf_bufferSize(cusolver_handle, m, n, d_A_geqrf, lda, &lwork),
-                           "cusolverDnSgeqrf_bufferSize");
+            AssertCusolver(
+                cusolverDnSgeqrf_bufferSize(cusolver_handle, m, n, d_A_geqrf, lda, &lwork),
+                "cusolverDnSgeqrf_bufferSize");
         } else {
-            AssertCusolver(cusolverDnDgeqrf_bufferSize(cusolver_handle, m, n, d_A_geqrf, lda, &lwork),
-                           "cusolverDnDgeqrf_bufferSize");
+            AssertCusolver(
+                cusolverDnDgeqrf_bufferSize(cusolver_handle, m, n, d_A_geqrf, lda, &lwork),
+                "cusolverDnDgeqrf_bufferSize");
         }
         if (lwork > 0) {
             AssertCuda(cudaMalloc(&d_work_geqrf, static_cast<size_t>(lwork) * sizeof(T)),
@@ -378,9 +384,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("QR bench: m=%d n=%d nb=%d b=%d iters=%d warmup=%d type=%s %s\n",
-                opts.m, opts.n, opts.nb, kPanelWidth, opts.iters, opts.warmup,
-                opts.use_double ? "double" : "float",
+    std::printf("QR bench: m=%d n=%d nb=%d b=%d iters=%d warmup=%d type=%s %s\n", opts.m, opts.n,
+                opts.nb, kPanelWidth, opts.iters, opts.warmup, opts.use_double ? "double" : "float",
                 opts.run_geqrf ? "" : "(no geqrf)");
 
     cublasHandle_t cublas_handle;
@@ -398,4 +403,3 @@ int main(int argc, char** argv) {
     AssertCublas(cublasDestroy(cublas_handle), "cublasDestroy");
     return 0;
 }
-

@@ -50,10 +50,10 @@ void FillDeviceRandom(T* device_data, size_t count, unsigned long long seed) {
     AssertCurand(curandSetPseudoRandomGeneratorSeed(gen, seed),
                  "curandSetPseudoRandomGeneratorSeed");
     if constexpr (std::is_same_v<T, float>) {
-        AssertCurand(curandGenerateUniform(gen, device_data, static_cast<int>(count)),
+        AssertCurand(curandGenerateUniform(gen, device_data, count),
                      "curandGenerateUniform");
     } else if constexpr (std::is_same_v<T, double>) {
-        AssertCurand(curandGenerateUniformDouble(gen, device_data, static_cast<int>(count)),
+        AssertCurand(curandGenerateUniformDouble(gen, device_data, count),
                      "curandGenerateUniformDouble");
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
