@@ -302,7 +302,28 @@ static void RunQrCase(const QrCase& test_case,
     // Two A's (A0 + Afact) + W + Y + rtmp + tsqr + pack(nb*nb).
     const size_t bytes_needed = (elems_A * 4 + elems_rtmp * 2 + elems_tsqr) * sizeof(float);
 
-    if (bytes_needed > static_cast<size_t>(static_cast<double>(free_bytes) * 0.85)) {
+    auto release_all = [&]() {
+        d_A0.Release();
+        d_Afact.Release();
+        d_W.Release();
+        d_Y.Release();
+        d_rtmp.Release();
+        d_tsqr.Release();
+        d_pack.Release();
+    };
+
+    auto have_enough_mem = [&](size_t free_b) {
+        return bytes_needed <= static_cast<size_t>(static_cast<double>(free_b) * 0.85);
+    };
+
+    if (!have_enough_mem(free_bytes)) {
+        // If previous tests left buffers allocated, free them and re-check.
+        release_all();
+        AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after Release");
+        AssertCuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo after Release");
+    }
+
+    if (!have_enough_mem(free_bytes)) {
         GTEST_SKIP() << "Insufficient free GPU memory. Need ~"
                      << (bytes_needed / (1024.0 * 1024.0 * 1024.0)) << " GiB, have ~"
                      << (free_bytes / (1024.0 * 1024.0 * 1024.0)) << " GiB free.";
