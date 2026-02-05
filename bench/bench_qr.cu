@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <type_traits>
 
@@ -19,6 +20,15 @@ constexpr int kPanelWidth = 32;
 
 static inline size_t Idx2D(int row, int col, int ld) {
     return static_cast<size_t>(row) + static_cast<size_t>(col) * static_cast<size_t>(ld);
+}
+
+template <typename T>
+__global__ void SetIdentityKernel(int m, int n, T* A, int lda) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row < m && col < n) {
+        A[row + col * lda] = (row == col) ? static_cast<T>(1) : static_cast<T>(0);
+    }
 }
 
 void AssertCuda(cudaError_t status, const char* context) {
@@ -101,6 +111,111 @@ double FlopsToTflops(double flops, float ms) {
         return 0.0;
     }
     return flops / (static_cast<double>(ms) * 1e-3) / 1e12;
+}
+
+template <typename T>
+void ApplyAllOuterBlocksQToMatrix(cublasHandle_t cublas_handle,
+                                  int m,
+                                  int k_reflectors,
+                                  int cols,
+                                  int nb,
+                                  const T* d_W,
+                                  const T* d_Y,
+                                  T* d_X,
+                                  T* d_rtmp) {
+    const int lda = m;
+    const T one = static_cast<T>(1);
+    const T zero = static_cast<T>(0);
+    const T minus_one = static_cast<T>(-1);
+
+    // Q is the reverse product of block Q_i (factorization applies Q_i^T in increasing outer_index).
+    const int last_block = ((k_reflectors + nb - 1) / nb - 1) * nb;
+    for (int outer_index = last_block; outer_index >= 0; outer_index -= nb) {
+        const int end = std::min(outer_index + nb, k_reflectors);
+        const int kb = end - outer_index;
+        const int m_sub = m - outer_index;
+        const T* w_big = d_W + Idx2D(outer_index, outer_index, lda);
+        const T* y_big = d_Y + Idx2D(outer_index, outer_index, lda);
+        T* x_sub = d_X + Idx2D(outer_index, 0, lda);  // (m_sub x cols)
+
+        for (int col0 = 0; col0 < cols; col0 += nb) {
+            const int tile = std::min(nb, cols - col0);
+            T* x_tile = x_sub + static_cast<size_t>(col0) * static_cast<size_t>(lda);
+            // work = Y^T * X_tile (kb x tile), stored in d_rtmp with leading dimension kb.
+            AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
+                                                   tile, m_sub, &one, y_big, lda, x_tile, lda,
+                                                   &zero, d_rtmp, kb),
+                         "applyQ work = Y^T * X");
+            // X_tile -= W * work
+            AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
+                                                   tile, kb, &minus_one, w_big, lda, d_rtmp, kb,
+                                                   &one, x_tile, lda),
+                         "applyQ X -= W*work");
+        }
+    }
+}
+
+template <typename T>
+void GenerateExplicitQFromWY(int m,
+                             int n,
+                             int nb,
+                             const T* d_W,
+                             const T* d_Y,
+                             T* d_Q,
+                             T* d_work,
+                             size_t work_elems,
+                             cublasHandle_t cublas_handle) {
+    if (m < n || nb <= 0) {
+        std::fprintf(stderr, "GenerateExplicitQFromWY: invalid args (m=%d n=%d nb=%d)\n", m, n, nb);
+        std::exit(1);
+    }
+
+    // Q starts from I(m,n).
+    {
+        const dim3 block(16, 16);
+        const dim3 grid((m + block.x - 1) / block.x, (n + block.y - 1) / block.y);
+        SetIdentityKernel<T><<<grid, block>>>(m, n, d_Q, m);
+        AssertCuda(cudaGetLastError(), "SetIdentityKernel explicit Q");
+    }
+
+    const T alpha = static_cast<T>(1);
+    const T beta0 = static_cast<T>(0);
+    const T negalpha = static_cast<T>(-1);
+
+    const int num_blocks = (n + nb - 1) / nb;
+    for (int k = num_blocks - 1; k >= 0; --k) {
+        const int start = k * nb;
+        if (start >= n) {
+            continue;
+        }
+        const int end = std::min(start + nb, n);
+        const int kb = end - start;
+        const int m_sub = m - start;
+        const int cols_sub = n - start;
+
+        const size_t need = static_cast<size_t>(kb) * static_cast<size_t>(cols_sub);
+        if (work_elems < need) {
+            std::fprintf(stderr,
+                         "GenerateExplicitQFromWY: work too small (need=%zu have=%zu)\n", need,
+                         work_elems);
+            std::exit(1);
+        }
+
+        const T* W_k = d_W + Idx2D(start, start, m);  // (m_sub x kb)
+        const T* Y_k = d_Y + Idx2D(start, start, m);  // (m_sub x kb)
+        T* Q_k = d_Q + Idx2D(start, start, m);        // (m_sub x cols_sub)
+
+        // work (kb x cols_sub) = Y_k^T (kb x m_sub) * Q_k (m_sub x cols_sub)
+        AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
+                                               cols_sub, m_sub, &alpha, Y_k, m, Q_k, m, &beta0,
+                                               d_work, kb),
+                     "explicitQ work = Y^T * Q");
+        // Q_k -= W_k * work
+        AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
+                                               cols_sub, kb, &negalpha, W_k, m, d_work, kb, &alpha,
+                                               Q_k, m),
+                     "explicitQ Q -= W*work");
+    }
 }
 
 template <typename T>
@@ -199,6 +314,7 @@ struct Options {
     int warmup = 2;
     bool use_double = false;
     bool run_geqrf = true;
+    bool with_q = false;
 };
 
 Options ParseArgs(int argc, char** argv) {
@@ -219,6 +335,8 @@ Options ParseArgs(int argc, char** argv) {
             opts.use_double = (type == "double" || type == "fp64");
         } else if (std::strcmp(argv[i], "--no-geqrf") == 0) {
             opts.run_geqrf = false;
+        } else if (std::strcmp(argv[i], "--with-q") == 0) {
+            opts.with_q = true;
         }
     }
     return opts;
@@ -287,7 +405,12 @@ void RunBench(const Options& opts,
     const double blocked_tflops = FlopsToTflops(qr_flops, blocked_ms);
     std::printf("BlockedQR avg: %.3f ms (%.3f TFLOPS)\n", blocked_ms, blocked_tflops);
 
-    if (opts.run_geqrf) {
+    if (opts.with_q && !opts.run_geqrf) {
+        std::fprintf(stderr, "Invalid args: --with-q requires cuSOLVER (--no-geqrf not allowed)\n");
+        std::exit(1);
+    }
+
+    if (opts.run_geqrf || opts.with_q) {
         T* d_A_geqrf = nullptr;
         T* d_tau = nullptr;
         T* d_work_geqrf = nullptr;
@@ -305,6 +428,28 @@ void RunBench(const Options& opts,
             AssertCusolver(
                 cusolverDnDgeqrf_bufferSize(cusolver_handle, m, n, d_A_geqrf, lda, &lwork),
                 "cusolverDnDgeqrf_bufferSize");
+        }
+
+        int lwork_orgqr = 0;
+        if (opts.with_q) {
+            if constexpr (std::is_same_v<T, float>) {
+                AssertCusolver(cusolverDnSorgqr_bufferSize(cusolver_handle, m, n, n, d_A_geqrf, lda,
+                                                           d_tau, &lwork_orgqr),
+                               "cusolverDnSorgqr_bufferSize");
+            } else {
+                AssertCusolver(cusolverDnDorgqr_bufferSize(cusolver_handle, m, n, n, d_A_geqrf, lda,
+                                                           d_tau, &lwork_orgqr),
+                               "cusolverDnDorgqr_bufferSize");
+            }
+        }
+        lwork = std::max(lwork, lwork_orgqr);
+        if (opts.with_q) {
+            const size_t work_q_elems = static_cast<size_t>(nb) * static_cast<size_t>(n);
+            if (work_q_elems > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                std::fprintf(stderr, "Invalid args: nb*n too large\n");
+                std::exit(1);
+            }
+            lwork = std::max(lwork, static_cast<int>(work_q_elems));
         }
         if (lwork > 0) {
             AssertCuda(cudaMalloc(&d_work_geqrf, static_cast<size_t>(lwork) * sizeof(T)),
@@ -348,6 +493,123 @@ void RunBench(const Options& opts,
         const double geqrf_tflops = FlopsToTflops(qr_flops, geqrf_ms);
         std::printf("GEQRF avg:    %.3f ms (%.3f TFLOPS)\n", geqrf_ms, geqrf_tflops);
 
+        if (opts.with_q) {
+            // End-to-end explicit Q: WY(factorize + apply to I) vs cuSOLVER(geqrf + orgqr).
+            auto wy_q_setup = [&]() {
+                AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D wyQ");
+                AssertCuda(cudaMemset(d_W, 0, wy_bytes), "cudaMemset d_W wyQ");
+                AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y wyQ");
+            };
+            auto wy_q_fn = [&]() {
+                BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp,
+                                      d_work_tsqr, tsqr_work_elems_m, nullptr);
+                GenerateExplicitQFromWY<T>(m, n, nb, d_W, d_Y, d_A, d_work_geqrf,
+                                           static_cast<size_t>(lwork), cublas_handle);
+            };
+
+            auto orgqr_setup = [&]() {
+                AssertCuda(cudaMemcpy(d_A_geqrf, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D orgqr");
+            };
+            auto orgqr_fn = [&]() {
+                if constexpr (std::is_same_v<T, float>) {
+                    AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A_geqrf, lda, d_tau,
+                                                    d_work_geqrf, lwork, d_info),
+                                   "cusolverDnSgeqrf orgqr");
+                    AssertCusolver(cusolverDnSorgqr(cusolver_handle, m, n, n, d_A_geqrf, lda, d_tau,
+                                                    d_work_geqrf, lwork, d_info),
+                                   "cusolverDnSorgqr");
+                } else {
+                    AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A_geqrf, lda, d_tau,
+                                                    d_work_geqrf, lwork, d_info),
+                                   "cusolverDnDgeqrf orgqr");
+                    AssertCusolver(cusolverDnDorgqr(cusolver_handle, m, n, n, d_A_geqrf, lda, d_tau,
+                                                    d_work_geqrf, lwork, d_info),
+                                   "cusolverDnDorgqr");
+                }
+            };
+
+            for (int i = 0; i < opts.warmup; ++i) {
+                wy_q_setup();
+                wy_q_fn();
+                AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize wyQ warmup");
+            }
+            for (int i = 0; i < opts.warmup; ++i) {
+                orgqr_setup();
+                orgqr_fn();
+                AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize orgqr warmup");
+            }
+
+            const float wy_q_ms = TimeKernelMs(wy_q_setup, wy_q_fn, opts.iters);
+            const float orgqr_ms = TimeKernelMs(orgqr_setup, orgqr_fn, opts.iters);
+
+            // Q-only: WY(apply to I) vs cuSOLVER(orgqr) on a reflector snapshot.
+            // Precompute WY once.
+            AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                       "cudaMemcpy D2D WY precompute");
+            AssertCuda(cudaMemset(d_W, 0, wy_bytes), "cudaMemset d_W WY precompute");
+            AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y WY precompute");
+            BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
+                                  tsqr_work_elems_m, nullptr);
+            AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize WY precompute");
+
+            auto wy_apply_setup = [&]() {
+                // no-op
+            };
+            auto wy_apply_fn = [&]() {
+                GenerateExplicitQFromWY<T>(m, n, nb, d_W, d_Y, d_A, d_work_geqrf,
+                                           static_cast<size_t>(lwork), cublas_handle);
+            };
+
+            // Precompute reflectors once. Reuse d_A0 as the snapshot buffer to keep memory down.
+            if constexpr (std::is_same_v<T, float>) {
+                AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A0, lda, d_tau,
+                                                d_work_geqrf, lwork, d_info),
+                               "cusolverDnSgeqrf snapshot");
+            } else {
+                AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A0, lda, d_tau,
+                                                d_work_geqrf, lwork, d_info),
+                               "cusolverDnDgeqrf snapshot");
+            }
+            AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize geqrf snapshot");
+
+            auto orgqr_only_setup = [&]() {
+                AssertCuda(cudaMemcpy(d_A_geqrf, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D reflectors copy");
+            };
+            auto orgqr_only_fn = [&]() {
+                if constexpr (std::is_same_v<T, float>) {
+                    AssertCusolver(cusolverDnSorgqr(cusolver_handle, m, n, n, d_A_geqrf, lda, d_tau,
+                                                    d_work_geqrf, lwork, d_info),
+                                   "cusolverDnSorgqr only");
+                } else {
+                    AssertCusolver(cusolverDnDorgqr(cusolver_handle, m, n, n, d_A_geqrf, lda, d_tau,
+                                                    d_work_geqrf, lwork, d_info),
+                                   "cusolverDnDorgqr only");
+                }
+            };
+
+            for (int i = 0; i < opts.warmup; ++i) {
+                wy_apply_setup();
+                wy_apply_fn();
+                AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize WY apply warmup");
+            }
+            for (int i = 0; i < opts.warmup; ++i) {
+                orgqr_only_setup();
+                orgqr_only_fn();
+                AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize orgqr-only warmup");
+            }
+
+            const float wy_apply_ms = TimeKernelMs(wy_apply_setup, wy_apply_fn, opts.iters);
+            const float orgqr_only_ms = TimeKernelMs(orgqr_only_setup, orgqr_only_fn, opts.iters);
+
+            std::printf("WY->Q avg:   %.3f ms\n", wy_q_ms);
+            std::printf("ORGQR avg:   %.3f ms\n", orgqr_ms);
+            std::printf("WY applyQ:   %.3f ms\n", wy_apply_ms);
+            std::printf("ORGQR only:  %.3f ms\n", orgqr_only_ms);
+        }
+
         if (d_work_geqrf) {
             AssertCuda(cudaFree(d_work_geqrf), "cudaFree d_work_geqrf");
         }
@@ -384,9 +646,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("QR bench: m=%d n=%d nb=%d b=%d iters=%d warmup=%d type=%s %s\n", opts.m, opts.n,
+    std::printf("QR bench: m=%d n=%d nb=%d b=%d iters=%d warmup=%d type=%s %s %s\n", opts.m, opts.n,
                 opts.nb, kPanelWidth, opts.iters, opts.warmup, opts.use_double ? "double" : "float",
-                opts.run_geqrf ? "" : "(no geqrf)");
+                opts.run_geqrf ? "" : "(no geqrf)", opts.with_q ? "(with Q)" : "");
+
+    int device_count = 0;
+    cudaError_t st = cudaGetDeviceCount(&device_count);
+    if (st != cudaSuccess || device_count <= 0) {
+        std::fprintf(stderr, "No CUDA device available.\n");
+        return 0;
+    }
+    AssertCuda(cudaSetDevice(0), "cudaSetDevice(0)");
+    // Force runtime init so library handles can be created reliably.
+    AssertCuda(cudaFree(nullptr), "cudaFree(nullptr)");
 
     cublasHandle_t cublas_handle;
     cusolverDnHandle_t cusolver_handle;
