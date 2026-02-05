@@ -106,6 +106,27 @@ double QrFlops(int m, int n) {
     return 2.0 * md * nd * nd - (2.0 / 3.0) * nd * nd * nd;
 }
 
+double OrgqrFlops(int m, int n) {
+    // Forming explicit Q from Householder vectors has the same leading cost as GEQRF for m>=n.
+    // (This matches LAPACK's dorgqr flop model up to lower-order terms.)
+    return QrFlops(m, n);
+}
+
+double ExplicitQFromWYFlops(int m, int n, int nb) {
+    // This matches GenerateExplicitQFromWY():
+    // For each block (start,kb): work = Y^T*Q and Q -= W*work,
+    // so 2 GEMMs => 4*kb*(m-start)*(n-start) flops (counting 2*m*n*k per GEMM).
+    double sum = 0.0;
+    for (int start = 0; start < n; start += nb) {
+        const int kb = std::min(nb, n - start);
+        const int m_sub = m - start;
+        const int cols_sub = n - start;
+        sum += 4.0 * static_cast<double>(kb) * static_cast<double>(m_sub) *
+               static_cast<double>(cols_sub);
+    }
+    return sum;
+}
+
 double FlopsToTflops(double flops, float ms) {
     if (ms <= 0.0f) {
         return 0.0;
@@ -351,6 +372,8 @@ void RunBench(const Options& opts,
     const int nb = opts.nb;
     const int lda = m;
     const double qr_flops = QrFlops(m, n);
+    const double orgqr_flops = OrgqrFlops(m, n);
+    const double wy_q_flops = ExplicitQFromWYFlops(m, n, nb);
 
     const size_t a_elems = static_cast<size_t>(m) * static_cast<size_t>(n);
     const size_t a_bytes = a_elems * sizeof(T);
@@ -544,6 +567,9 @@ void RunBench(const Options& opts,
             const float wy_q_ms = TimeKernelMs(wy_q_setup, wy_q_fn, opts.iters);
             const float orgqr_ms = TimeKernelMs(orgqr_setup, orgqr_fn, opts.iters);
 
+            const double wy_q_tflops = FlopsToTflops(qr_flops + wy_q_flops, wy_q_ms);
+            const double orgqr_tflops = FlopsToTflops(qr_flops + orgqr_flops, orgqr_ms);
+
             // Q-only: WY(apply to I) vs cuSOLVER(orgqr) on a reflector snapshot.
             // Precompute WY once.
             AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
@@ -604,10 +630,13 @@ void RunBench(const Options& opts,
             const float wy_apply_ms = TimeKernelMs(wy_apply_setup, wy_apply_fn, opts.iters);
             const float orgqr_only_ms = TimeKernelMs(orgqr_only_setup, orgqr_only_fn, opts.iters);
 
-            std::printf("WY->Q avg:   %.3f ms\n", wy_q_ms);
-            std::printf("ORGQR avg:   %.3f ms\n", orgqr_ms);
-            std::printf("WY applyQ:   %.3f ms\n", wy_apply_ms);
-            std::printf("ORGQR only:  %.3f ms\n", orgqr_only_ms);
+            const double wy_apply_tflops = FlopsToTflops(wy_q_flops, wy_apply_ms);
+            const double orgqr_only_tflops = FlopsToTflops(orgqr_flops, orgqr_only_ms);
+
+            std::printf("WY->Q avg:   %.3f ms (%.3f TFLOPS)\n", wy_q_ms, wy_q_tflops);
+            std::printf("ORGQR avg:   %.3f ms (%.3f TFLOPS)\n", orgqr_ms, orgqr_tflops);
+            std::printf("WY applyQ:   %.3f ms (%.3f TFLOPS)\n", wy_apply_ms, wy_apply_tflops);
+            std::printf("ORGQR only:  %.3f ms (%.3f TFLOPS)\n", orgqr_only_ms, orgqr_only_tflops);
         }
 
         if (d_work_geqrf) {
