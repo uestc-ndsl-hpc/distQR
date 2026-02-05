@@ -11,6 +11,8 @@
 #include <string>
 #include <type_traits>
 
+#include <spdlog/spdlog.h>
+
 #include "components/panel_process.cuh"
 #include "utils/cublas_gemm_traits.cuh"
 
@@ -33,28 +35,28 @@ __global__ void SetIdentityKernel(int m, int n, T* A, int lda) {
 
 void AssertCuda(cudaError_t status, const char* context) {
     if (status != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", context, cudaGetErrorString(status));
+        spdlog::error("{}: {}", context, cudaGetErrorString(status));
         std::exit(1);
     }
 }
 
 void AssertCublas(cublasStatus_t status, const char* context) {
     if (status != CUBLAS_STATUS_SUCCESS) {
-        std::fprintf(stderr, "%s: cublas error %d\n", context, static_cast<int>(status));
+        spdlog::error("{}: cublas error {}", context, static_cast<int>(status));
         std::exit(1);
     }
 }
 
 void AssertCusolver(cusolverStatus_t status, const char* context) {
     if (status != CUSOLVER_STATUS_SUCCESS) {
-        std::fprintf(stderr, "%s: cusolver error %d\n", context, static_cast<int>(status));
+        spdlog::error("{}: cusolver error {}", context, static_cast<int>(status));
         std::exit(1);
     }
 }
 
 void AssertCurand(curandStatus_t status, const char* context) {
     if (status != CURAND_STATUS_SUCCESS) {
-        std::fprintf(stderr, "%s: curand error %d\n", context, static_cast<int>(status));
+        spdlog::error("{}: curand error {}", context, static_cast<int>(status));
         std::exit(1);
     }
 }
@@ -149,7 +151,8 @@ void ApplyAllOuterBlocksQToMatrix(cublasHandle_t cublas_handle,
     const T zero = static_cast<T>(0);
     const T minus_one = static_cast<T>(-1);
 
-    // Q is the reverse product of block Q_i (factorization applies Q_i^T in increasing outer_index).
+    // Q is the reverse product of block Q_i (factorization applies Q_i^T in increasing
+    // outer_index).
     const int last_block = ((k_reflectors + nb - 1) / nb - 1) * nb;
     for (int outer_index = last_block; outer_index >= 0; outer_index -= nb) {
         const int end = std::min(outer_index + nb, k_reflectors);
@@ -163,15 +166,15 @@ void ApplyAllOuterBlocksQToMatrix(cublasHandle_t cublas_handle,
             const int tile = std::min(nb, cols - col0);
             T* x_tile = x_sub + static_cast<size_t>(col0) * static_cast<size_t>(lda);
             // work = Y^T * X_tile (kb x tile), stored in d_rtmp with leading dimension kb.
-            AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
-                                                   tile, m_sub, &one, y_big, lda, x_tile, lda,
-                                                   &zero, d_rtmp, kb),
-                         "applyQ work = Y^T * X");
+            AssertCublas(
+                CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, tile, m_sub,
+                                          &one, y_big, lda, x_tile, lda, &zero, d_rtmp, kb),
+                "applyQ work = Y^T * X");
             // X_tile -= W * work
-            AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
-                                                   tile, kb, &minus_one, w_big, lda, d_rtmp, kb,
-                                                   &one, x_tile, lda),
-                         "applyQ X -= W*work");
+            AssertCublas(
+                CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub, tile, kb,
+                                          &minus_one, w_big, lda, d_rtmp, kb, &one, x_tile, lda),
+                "applyQ X -= W*work");
         }
     }
 }
@@ -187,7 +190,7 @@ void GenerateExplicitQFromWY(int m,
                              size_t work_elems,
                              cublasHandle_t cublas_handle) {
     if (m < n || nb <= 0) {
-        std::fprintf(stderr, "GenerateExplicitQFromWY: invalid args (m=%d n=%d nb=%d)\n", m, n, nb);
+        spdlog::error("GenerateExplicitQFromWY: invalid args (m={} n={} nb={})", m, n, nb);
         std::exit(1);
     }
 
@@ -216,9 +219,8 @@ void GenerateExplicitQFromWY(int m,
 
         const size_t need = static_cast<size_t>(kb) * static_cast<size_t>(cols_sub);
         if (work_elems < need) {
-            std::fprintf(stderr,
-                         "GenerateExplicitQFromWY: work too small (need=%zu have=%zu)\n", need,
-                         work_elems);
+            spdlog::error("GenerateExplicitQFromWY: work too small (need={} have={})", need,
+                          work_elems);
             std::exit(1);
         }
 
@@ -227,15 +229,15 @@ void GenerateExplicitQFromWY(int m,
         T* Q_k = d_Q + Idx2D(start, start, m);        // (m_sub x cols_sub)
 
         // work (kb x cols_sub) = Y_k^T (kb x m_sub) * Q_k (m_sub x cols_sub)
-        AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
-                                               cols_sub, m_sub, &alpha, Y_k, m, Q_k, m, &beta0,
-                                               d_work, kb),
-                     "explicitQ work = Y^T * Q");
+        AssertCublas(
+            CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, cols_sub, m_sub,
+                                      &alpha, Y_k, m, Q_k, m, &beta0, d_work, kb),
+            "explicitQ work = Y^T * Q");
         // Q_k -= W_k * work
-        AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
-                                               cols_sub, kb, &negalpha, W_k, m, d_work, kb, &alpha,
-                                               Q_k, m),
-                     "explicitQ Q -= W*work");
+        AssertCublas(
+            CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub, cols_sub, kb,
+                                      &negalpha, W_k, m, d_work, kb, &alpha, Q_k, m),
+            "explicitQ Q -= W*work");
     }
 }
 
@@ -339,6 +341,23 @@ struct Options {
 };
 
 Options ParseArgs(int argc, char** argv) {
+    auto parse_bool = [](const char* s, bool* out) -> bool {
+        if (!s || !out) return false;
+        if (std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0 ||
+            std::strcmp(s, "True") == 0 || std::strcmp(s, "TRUE") == 0 ||
+            std::strcmp(s, "yes") == 0 || std::strcmp(s, "on") == 0) {
+            *out = true;
+            return true;
+        }
+        if (std::strcmp(s, "0") == 0 || std::strcmp(s, "false") == 0 ||
+            std::strcmp(s, "False") == 0 || std::strcmp(s, "FALSE") == 0 ||
+            std::strcmp(s, "no") == 0 || std::strcmp(s, "off") == 0) {
+            *out = false;
+            return true;
+        }
+        return false;
+    };
+
     Options opts;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--m") == 0 && i + 1 < argc) {
@@ -354,6 +373,16 @@ Options ParseArgs(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
             std::string type = argv[++i];
             opts.use_double = (type == "double" || type == "fp64");
+        } else if ((std::strcmp(argv[i], "--run_geqrf") == 0 ||
+                    std::strcmp(argv[i], "--run-geqrf") == 0) &&
+                   i + 1 < argc) {
+            bool v = opts.run_geqrf;
+            if (!parse_bool(argv[i + 1], &v)) {
+                spdlog::error("Invalid value for {}: {}", argv[i], argv[i + 1]);
+                std::exit(1);
+            }
+            opts.run_geqrf = v;
+            ++i;
         } else if (std::strcmp(argv[i], "--no-geqrf") == 0) {
             opts.run_geqrf = false;
         } else if (std::strcmp(argv[i], "--with-q") == 0) {
@@ -373,7 +402,8 @@ void RunBench(const Options& opts,
     const int lda = m;
     const double qr_flops = QrFlops(m, n);
     const double orgqr_flops = OrgqrFlops(m, n);
-    const double wy_q_flops = ExplicitQFromWYFlops(m, n, nb);
+    const double wy_q_flops = ExplicitQFromWYFlops(m, n, nb);  // for reference/debug only
+    const double e2e_q_flops_norm = qr_flops + orgqr_flops;    // normalize to GEQRF+ORGQR model
 
     const size_t a_elems = static_cast<size_t>(m) * static_cast<size_t>(n);
     const size_t a_bytes = a_elems * sizeof(T);
@@ -426,98 +456,104 @@ void RunBench(const Options& opts,
         opts.iters);
 
     const double blocked_tflops = FlopsToTflops(qr_flops, blocked_ms);
-    std::printf("BlockedQR avg: %.3f ms (%.3f TFLOPS)\n", blocked_ms, blocked_tflops);
+    spdlog::info("BlockedQR avg: {:.3f} ms ({:.3f} TFLOPS)", blocked_ms, blocked_tflops);
 
     if (opts.with_q && !opts.run_geqrf) {
-        std::fprintf(stderr, "Invalid args: --with-q requires cuSOLVER (--no-geqrf not allowed)\n");
-        std::exit(1);
+        spdlog::warn("--with-q with --run_geqrf false: skip cuSOLVER (GEQRF/ORGQR) timings");
     }
 
     if (opts.run_geqrf || opts.with_q) {
-        T* d_A_geqrf = nullptr;
         T* d_tau = nullptr;
         T* d_work_geqrf = nullptr;
         int* d_info = nullptr;
-        AssertCuda(cudaMalloc(&d_A_geqrf, a_bytes), "cudaMalloc d_A_geqrf");
-        AssertCuda(cudaMalloc(&d_tau, static_cast<size_t>(n) * sizeof(T)), "cudaMalloc d_tau");
-        AssertCuda(cudaMalloc(&d_info, sizeof(int)), "cudaMalloc d_info");
-
         int lwork = 0;
-        if constexpr (std::is_same_v<T, float>) {
-            AssertCusolver(
-                cusolverDnSgeqrf_bufferSize(cusolver_handle, m, n, d_A_geqrf, lda, &lwork),
-                "cusolverDnSgeqrf_bufferSize");
-        } else {
-            AssertCusolver(
-                cusolverDnDgeqrf_bufferSize(cusolver_handle, m, n, d_A_geqrf, lda, &lwork),
-                "cusolverDnDgeqrf_bufferSize");
-        }
 
-        int lwork_orgqr = 0;
-        if (opts.with_q) {
+        if (opts.run_geqrf) {
+            AssertCuda(cudaMalloc(&d_tau, static_cast<size_t>(n) * sizeof(T)), "cudaMalloc d_tau");
+            AssertCuda(cudaMalloc(&d_info, sizeof(int)), "cudaMalloc d_info");
+
+            int lwork_geqrf = 0;
             if constexpr (std::is_same_v<T, float>) {
-                AssertCusolver(cusolverDnSorgqr_bufferSize(cusolver_handle, m, n, n, d_A_geqrf, lda,
-                                                           d_tau, &lwork_orgqr),
-                               "cusolverDnSorgqr_bufferSize");
+                AssertCusolver(
+                    cusolverDnSgeqrf_bufferSize(cusolver_handle, m, n, d_A, lda, &lwork_geqrf),
+                    "cusolverDnSgeqrf_bufferSize");
             } else {
-                AssertCusolver(cusolverDnDorgqr_bufferSize(cusolver_handle, m, n, n, d_A_geqrf, lda,
-                                                           d_tau, &lwork_orgqr),
-                               "cusolverDnDorgqr_bufferSize");
+                AssertCusolver(
+                    cusolverDnDgeqrf_bufferSize(cusolver_handle, m, n, d_A, lda, &lwork_geqrf),
+                    "cusolverDnDgeqrf_bufferSize");
+            }
+            lwork = std::max(lwork, lwork_geqrf);
+
+            if (opts.with_q) {
+                int lwork_orgqr = 0;
+                if constexpr (std::is_same_v<T, float>) {
+                    AssertCusolver(cusolverDnSorgqr_bufferSize(cusolver_handle, m, n, n, d_A, lda,
+                                                               d_tau, &lwork_orgqr),
+                                   "cusolverDnSorgqr_bufferSize");
+                } else {
+                    AssertCusolver(cusolverDnDorgqr_bufferSize(cusolver_handle, m, n, n, d_A, lda,
+                                                               d_tau, &lwork_orgqr),
+                                   "cusolverDnDorgqr_bufferSize");
+                }
+                lwork = std::max(lwork, lwork_orgqr);
             }
         }
-        lwork = std::max(lwork, lwork_orgqr);
+
         if (opts.with_q) {
             const size_t work_q_elems = static_cast<size_t>(nb) * static_cast<size_t>(n);
             if (work_q_elems > static_cast<size_t>(std::numeric_limits<int>::max())) {
-                std::fprintf(stderr, "Invalid args: nb*n too large\n");
+                spdlog::error("Invalid args: nb*n too large");
                 std::exit(1);
             }
             lwork = std::max(lwork, static_cast<int>(work_q_elems));
         }
         if (lwork > 0) {
             AssertCuda(cudaMalloc(&d_work_geqrf, static_cast<size_t>(lwork) * sizeof(T)),
-                       "cudaMalloc d_work_geqrf");
+                       "cudaMalloc d_work_geqrf/work_q");
         }
 
-        // warmup
-        for (int i = 0; i < opts.warmup; ++i) {
-            AssertCuda(cudaMemcpy(d_A_geqrf, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
-                       "cudaMemcpy D2D geqrf warmup");
-            if constexpr (std::is_same_v<T, float>) {
-                AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A_geqrf, lda, d_tau,
-                                                d_work_geqrf, lwork, d_info),
-                               "cusolverDnSgeqrf");
-            } else {
-                AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A_geqrf, lda, d_tau,
-                                                d_work_geqrf, lwork, d_info),
-                               "cusolverDnDgeqrf");
-            }
-            AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize geqrf warmup");
-        }
-
-        const float geqrf_ms = TimeKernelMs(
-            [&]() {
-                AssertCuda(cudaMemcpy(d_A_geqrf, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
-                           "cudaMemcpy D2D geqrf");
-            },
-            [&]() {
+        if (opts.run_geqrf) {
+            // warmup
+            for (int i = 0; i < opts.warmup; ++i) {
+                AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D geqrf warmup");
                 if constexpr (std::is_same_v<T, float>) {
-                    AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A_geqrf, lda, d_tau,
+                    AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A, lda, d_tau,
                                                     d_work_geqrf, lwork, d_info),
                                    "cusolverDnSgeqrf");
                 } else {
-                    AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A_geqrf, lda, d_tau,
+                    AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A, lda, d_tau,
                                                     d_work_geqrf, lwork, d_info),
                                    "cusolverDnDgeqrf");
                 }
-            },
-            opts.iters);
+                AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize geqrf warmup");
+            }
 
-        const double geqrf_tflops = FlopsToTflops(qr_flops, geqrf_ms);
-        std::printf("GEQRF avg:    %.3f ms (%.3f TFLOPS)\n", geqrf_ms, geqrf_tflops);
+            const float geqrf_ms = TimeKernelMs(
+                [&]() {
+                    AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                               "cudaMemcpy D2D geqrf");
+                },
+                [&]() {
+                    if constexpr (std::is_same_v<T, float>) {
+                        AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A, lda, d_tau,
+                                                        d_work_geqrf, lwork, d_info),
+                                       "cusolverDnSgeqrf");
+                    } else {
+                        AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A, lda, d_tau,
+                                                        d_work_geqrf, lwork, d_info),
+                                       "cusolverDnDgeqrf");
+                    }
+                },
+                opts.iters);
+
+            const double geqrf_tflops = FlopsToTflops(qr_flops, geqrf_ms);
+            spdlog::info("GEQRF avg:    {:.3f} ms ({:.3f} TFLOPS)", geqrf_ms, geqrf_tflops);
+        }
 
         if (opts.with_q) {
-            // End-to-end explicit Q: WY(factorize + apply to I) vs cuSOLVER(geqrf + orgqr).
+            // End-to-end explicit Q: WY(factorize + apply to I). Optionally compare against
+            // cuSOLVER.
             auto wy_q_setup = [&]() {
                 AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
                            "cudaMemcpy D2D wyQ");
@@ -531,44 +567,14 @@ void RunBench(const Options& opts,
                                            static_cast<size_t>(lwork), cublas_handle);
             };
 
-            auto orgqr_setup = [&]() {
-                AssertCuda(cudaMemcpy(d_A_geqrf, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
-                           "cudaMemcpy D2D orgqr");
-            };
-            auto orgqr_fn = [&]() {
-                if constexpr (std::is_same_v<T, float>) {
-                    AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A_geqrf, lda, d_tau,
-                                                    d_work_geqrf, lwork, d_info),
-                                   "cusolverDnSgeqrf orgqr");
-                    AssertCusolver(cusolverDnSorgqr(cusolver_handle, m, n, n, d_A_geqrf, lda, d_tau,
-                                                    d_work_geqrf, lwork, d_info),
-                                   "cusolverDnSorgqr");
-                } else {
-                    AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A_geqrf, lda, d_tau,
-                                                    d_work_geqrf, lwork, d_info),
-                                   "cusolverDnDgeqrf orgqr");
-                    AssertCusolver(cusolverDnDorgqr(cusolver_handle, m, n, n, d_A_geqrf, lda, d_tau,
-                                                    d_work_geqrf, lwork, d_info),
-                                   "cusolverDnDorgqr");
-                }
-            };
-
             for (int i = 0; i < opts.warmup; ++i) {
                 wy_q_setup();
                 wy_q_fn();
                 AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize wyQ warmup");
             }
-            for (int i = 0; i < opts.warmup; ++i) {
-                orgqr_setup();
-                orgqr_fn();
-                AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize orgqr warmup");
-            }
 
             const float wy_q_ms = TimeKernelMs(wy_q_setup, wy_q_fn, opts.iters);
-            const float orgqr_ms = TimeKernelMs(orgqr_setup, orgqr_fn, opts.iters);
-
-            const double wy_q_tflops = FlopsToTflops(qr_flops + wy_q_flops, wy_q_ms);
-            const double orgqr_tflops = FlopsToTflops(qr_flops + orgqr_flops, orgqr_ms);
+            const double wy_q_tflops = FlopsToTflops(e2e_q_flops_norm, wy_q_ms);
 
             // Q-only: WY(apply to I) vs cuSOLVER(orgqr) on a reflector snapshot.
             // Precompute WY once.
@@ -588,63 +594,105 @@ void RunBench(const Options& opts,
                                            static_cast<size_t>(lwork), cublas_handle);
             };
 
-            // Precompute reflectors once. Reuse d_A0 as the snapshot buffer to keep memory down.
-            if constexpr (std::is_same_v<T, float>) {
-                AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A0, lda, d_tau,
-                                                d_work_geqrf, lwork, d_info),
-                               "cusolverDnSgeqrf snapshot");
-            } else {
-                AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A0, lda, d_tau,
-                                                d_work_geqrf, lwork, d_info),
-                               "cusolverDnDgeqrf snapshot");
-            }
-            AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize geqrf snapshot");
-
-            auto orgqr_only_setup = [&]() {
-                AssertCuda(cudaMemcpy(d_A_geqrf, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
-                           "cudaMemcpy D2D reflectors copy");
-            };
-            auto orgqr_only_fn = [&]() {
-                if constexpr (std::is_same_v<T, float>) {
-                    AssertCusolver(cusolverDnSorgqr(cusolver_handle, m, n, n, d_A_geqrf, lda, d_tau,
-                                                    d_work_geqrf, lwork, d_info),
-                                   "cusolverDnSorgqr only");
-                } else {
-                    AssertCusolver(cusolverDnDorgqr(cusolver_handle, m, n, n, d_A_geqrf, lda, d_tau,
-                                                    d_work_geqrf, lwork, d_info),
-                                   "cusolverDnDorgqr only");
-                }
-            };
-
             for (int i = 0; i < opts.warmup; ++i) {
                 wy_apply_setup();
                 wy_apply_fn();
                 AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize WY apply warmup");
             }
-            for (int i = 0; i < opts.warmup; ++i) {
-                orgqr_only_setup();
-                orgqr_only_fn();
-                AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize orgqr-only warmup");
-            }
 
             const float wy_apply_ms = TimeKernelMs(wy_apply_setup, wy_apply_fn, opts.iters);
-            const float orgqr_only_ms = TimeKernelMs(orgqr_only_setup, orgqr_only_fn, opts.iters);
+            const double wy_apply_tflops = FlopsToTflops(orgqr_flops, wy_apply_ms);
 
-            const double wy_apply_tflops = FlopsToTflops(wy_q_flops, wy_apply_ms);
-            const double orgqr_only_tflops = FlopsToTflops(orgqr_flops, orgqr_only_ms);
+            spdlog::info("WY->Q avg:   {:.3f} ms ({:.3f} TFLOPS)", wy_q_ms, wy_q_tflops);
+            spdlog::info("WY applyQ:   {:.3f} ms ({:.3f} TFLOPS)", wy_apply_ms, wy_apply_tflops);
 
-            std::printf("WY->Q avg:   %.3f ms (%.3f TFLOPS)\n", wy_q_ms, wy_q_tflops);
-            std::printf("ORGQR avg:   %.3f ms (%.3f TFLOPS)\n", orgqr_ms, orgqr_tflops);
-            std::printf("WY applyQ:   %.3f ms (%.3f TFLOPS)\n", wy_apply_ms, wy_apply_tflops);
-            std::printf("ORGQR only:  %.3f ms (%.3f TFLOPS)\n", orgqr_only_ms, orgqr_only_tflops);
+            if (opts.run_geqrf) {
+                auto orgqr_setup = [&]() {
+                    AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                               "cudaMemcpy D2D orgqr");
+                };
+                auto orgqr_fn = [&]() {
+                    if constexpr (std::is_same_v<T, float>) {
+                        AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_A, lda, d_tau,
+                                                        d_work_geqrf, lwork, d_info),
+                                       "cusolverDnSgeqrf orgqr");
+                        AssertCusolver(cusolverDnSorgqr(cusolver_handle, m, n, n, d_A, lda, d_tau,
+                                                        d_work_geqrf, lwork, d_info),
+                                       "cusolverDnSorgqr");
+                    } else {
+                        AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_A, lda, d_tau,
+                                                        d_work_geqrf, lwork, d_info),
+                                       "cusolverDnDgeqrf orgqr");
+                        AssertCusolver(cusolverDnDorgqr(cusolver_handle, m, n, n, d_A, lda, d_tau,
+                                                        d_work_geqrf, lwork, d_info),
+                                       "cusolverDnDorgqr");
+                    }
+                };
+
+                for (int i = 0; i < opts.warmup; ++i) {
+                    orgqr_setup();
+                    orgqr_fn();
+                    AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize orgqr warmup");
+                }
+
+                const float orgqr_ms = TimeKernelMs(orgqr_setup, orgqr_fn, opts.iters);
+                const double orgqr_tflops = FlopsToTflops(e2e_q_flops_norm, orgqr_ms);
+                spdlog::info("ORGQR avg:   {:.3f} ms ({:.3f} TFLOPS)", orgqr_ms, orgqr_tflops);
+
+                // Precompute reflectors once, reusing d_W as the snapshot buffer (d_W no longer
+                // needed).
+                AssertCuda(cudaMemcpy(d_W, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D reflectors snapshot");
+                if constexpr (std::is_same_v<T, float>) {
+                    AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_W, lda, d_tau,
+                                                    d_work_geqrf, lwork, d_info),
+                                   "cusolverDnSgeqrf snapshot");
+                } else {
+                    AssertCusolver(cusolverDnDgeqrf(cusolver_handle, m, n, d_W, lda, d_tau,
+                                                    d_work_geqrf, lwork, d_info),
+                                   "cusolverDnDgeqrf snapshot");
+                }
+                AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize geqrf snapshot");
+
+                auto orgqr_only_setup = [&]() {
+                    AssertCuda(cudaMemcpy(d_A, d_W, a_bytes, cudaMemcpyDeviceToDevice),
+                               "cudaMemcpy D2D reflectors copy");
+                };
+                auto orgqr_only_fn = [&]() {
+                    if constexpr (std::is_same_v<T, float>) {
+                        AssertCusolver(cusolverDnSorgqr(cusolver_handle, m, n, n, d_A, lda, d_tau,
+                                                        d_work_geqrf, lwork, d_info),
+                                       "cusolverDnSorgqr only");
+                    } else {
+                        AssertCusolver(cusolverDnDorgqr(cusolver_handle, m, n, n, d_A, lda, d_tau,
+                                                        d_work_geqrf, lwork, d_info),
+                                       "cusolverDnDorgqr only");
+                    }
+                };
+
+                for (int i = 0; i < opts.warmup; ++i) {
+                    orgqr_only_setup();
+                    orgqr_only_fn();
+                    AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize orgqr-only warmup");
+                }
+
+                const float orgqr_only_ms =
+                    TimeKernelMs(orgqr_only_setup, orgqr_only_fn, opts.iters);
+                const double orgqr_only_tflops = FlopsToTflops(orgqr_flops, orgqr_only_ms);
+                spdlog::info("ORGQR only:  {:.3f} ms ({:.3f} TFLOPS)", orgqr_only_ms,
+                             orgqr_only_tflops);
+            }
         }
 
         if (d_work_geqrf) {
             AssertCuda(cudaFree(d_work_geqrf), "cudaFree d_work_geqrf");
         }
-        AssertCuda(cudaFree(d_A_geqrf), "cudaFree d_A_geqrf");
-        AssertCuda(cudaFree(d_tau), "cudaFree d_tau");
-        AssertCuda(cudaFree(d_info), "cudaFree d_info");
+        if (d_tau) {
+            AssertCuda(cudaFree(d_tau), "cudaFree d_tau");
+        }
+        if (d_info) {
+            AssertCuda(cudaFree(d_info), "cudaFree d_info");
+        }
     }
 
     AssertCuda(cudaFree(d_A0), "cudaFree d_A0");
@@ -663,28 +711,32 @@ int main(int argc, char** argv) {
     const Options opts = ParseArgs(argc, argv);
 
     if (opts.m <= 0 || opts.n <= 0 || opts.nb <= 0) {
-        std::fprintf(stderr, "Invalid args: require m,n,nb > 0\n");
+        spdlog::error("Invalid args: require m,n,nb > 0");
         return 1;
     }
     if (opts.m < opts.n) {
-        std::fprintf(stderr, "Invalid args: require m >= n\n");
+        spdlog::error("Invalid args: require m >= n");
         return 1;
     }
     if (opts.n % kPanelWidth != 0 || opts.nb % kPanelWidth != 0) {
-        std::fprintf(stderr, "Invalid args: require n and nb to be multiples of %d\n", kPanelWidth);
+        spdlog::error("Invalid args: require n and nb to be multiples of {}", kPanelWidth);
         return 1;
     }
 
-    std::printf("QR bench: m=%d n=%d nb=%d b=%d iters=%d warmup=%d type=%s %s %s\n", opts.m, opts.n,
-                opts.nb, kPanelWidth, opts.iters, opts.warmup, opts.use_double ? "double" : "float",
-                opts.run_geqrf ? "" : "(no geqrf)", opts.with_q ? "(with Q)" : "");
+    spdlog::info("QR bench: m={} n={} nb={} b={} iters={} warmup={} type={} {} {}",
+                 opts.m, opts.n, opts.nb, kPanelWidth, opts.iters, opts.warmup,
+                 opts.use_double ? "double" : "float",
+                 opts.run_geqrf ? "" : "(no geqrf)", opts.with_q ? "(with Q)" : "");
 
     int device_count = 0;
     cudaError_t st = cudaGetDeviceCount(&device_count);
     if (st != cudaSuccess || device_count <= 0) {
-        std::fprintf(stderr, "No CUDA device available.\n");
+        spdlog::warn("No CUDA device available.");
         return 0;
     }
+    // Avoid CPU spin while waiting in cudaDeviceSynchronize/cudaEventSynchronize.
+    // Must be set before the runtime initializes the device.
+    AssertCuda(cudaSetDeviceFlags(cudaDeviceScheduleSpin), "cudaSetDeviceFlags");
     AssertCuda(cudaSetDevice(0), "cudaSetDevice(0)");
     // Force runtime init so library handles can be created reliably.
     AssertCuda(cudaFree(nullptr), "cudaFree(nullptr)");
