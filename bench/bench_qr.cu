@@ -242,6 +242,121 @@ void GenerateExplicitQFromWY(int m,
 }
 
 template <typename T>
+void GenerateExplicitQFromWYStridedBatched(int m,
+                                           int n,
+                                           int nb,
+                                           const T* d_W,
+                                           const T* d_Y,
+                                           T* d_Q,
+                                           T* d_work,
+                                           size_t work_elems,
+                                           cublasHandle_t cublas_handle) {
+    if (m < n || nb <= 0) {
+        spdlog::error("GenerateExplicitQFromWYStridedBatched: invalid args (m={} n={} nb={})", m, n,
+                      nb);
+        std::exit(1);
+    }
+
+    // Q starts from I(m,n).
+    {
+        const dim3 block(16, 16);
+        const dim3 grid((m + block.x - 1) / block.x, (n + block.y - 1) / block.y);
+        SetIdentityKernel<T><<<grid, block>>>(m, n, d_Q, m);
+        AssertCuda(cudaGetLastError(), "SetIdentityKernel explicit Q (batched)");
+    }
+
+    const T alpha = static_cast<T>(1);
+    const T beta0 = static_cast<T>(0);
+    const T negalpha = static_cast<T>(-1);
+
+    const int tile = nb;  // keep tiles aligned with outer blocks
+    const int num_blocks = (n + nb - 1) / nb;
+
+    for (int k = num_blocks - 1; k >= 0; --k) {
+        const int start = k * nb;
+        if (start >= n) {
+            continue;
+        }
+        const int end = std::min(start + nb, n);
+        const int kb = end - start;
+        const int m_sub = m - start;
+        const int cols_sub = n - start;
+
+        const T* W_k = d_W + Idx2D(start, start, m);  // (m_sub x kb)
+        const T* Y_k = d_Y + Idx2D(start, start, m);  // (m_sub x kb)
+        T* Q_k = d_Q + Idx2D(start, start, m);        // (m_sub x cols_sub)
+
+        const int full_tiles = cols_sub / tile;
+        const int rem = cols_sub - full_tiles * tile;
+
+        // Each tile needs kb*tile workspace; process multiple tiles per batched call.
+        const size_t per_tile_work = static_cast<size_t>(kb) * static_cast<size_t>(tile);
+        if (per_tile_work == 0) {
+            continue;
+        }
+        const int max_batch = static_cast<int>(std::max<size_t>(1, work_elems / per_tile_work));
+
+        for (int t0 = 0; t0 < full_tiles; t0 += max_batch) {
+            const int batch = std::min(max_batch, full_tiles - t0);
+            const size_t need = per_tile_work * static_cast<size_t>(batch);
+            if (work_elems < need) {
+                spdlog::error(
+                    "GenerateExplicitQFromWYStridedBatched: work too small (need={} have={})", need,
+                    work_elems);
+                std::exit(1);
+            }
+
+            T* Q_batch =
+                Q_k + static_cast<size_t>(t0) * static_cast<size_t>(tile) * static_cast<size_t>(m);
+            // work batch laid out as [tile0, tile1, ...], each (kb x tile) column-major.
+            T* work_batch = d_work;
+
+            // work = Y^T * Q_tile  (kb x tile) for each tile
+            AssertCublas(
+                CublasGemmTraits<T>::GemmStridedBatched(
+                    cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, tile, m_sub, &alpha, Y_k, m,
+                    /*strideA=*/0, Q_batch, m,
+                    /*strideB=*/static_cast<long long>(tile) * static_cast<long long>(m), &beta0,
+                    work_batch, kb,
+                    /*strideC=*/static_cast<long long>(kb) * static_cast<long long>(tile), batch),
+                "explicitQ batched work = Y^T * Q");
+
+            // Q_tile -= W * work
+            AssertCublas(
+                CublasGemmTraits<T>::GemmStridedBatched(
+                    cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub, tile, kb, &negalpha, W_k, m,
+                    /*strideA=*/0, work_batch, kb,
+                    /*strideB=*/static_cast<long long>(kb) * static_cast<long long>(tile), &alpha,
+                    Q_batch, m,
+                    /*strideC=*/static_cast<long long>(tile) * static_cast<long long>(m), batch),
+                "explicitQ batched Q -= W*work");
+        }
+
+        // Remainder: fall back to GEMM.
+        if (rem > 0) {
+            const size_t need = static_cast<size_t>(kb) * static_cast<size_t>(rem);
+            if (work_elems < need) {
+                spdlog::error(
+                    "GenerateExplicitQFromWYStridedBatched(rem): work too small (need={} have={})",
+                    need, work_elems);
+                std::exit(1);
+            }
+            T* Q_rem = Q_k + static_cast<size_t>(full_tiles) * static_cast<size_t>(tile) *
+                                 static_cast<size_t>(m);
+            T* work = d_work;
+            AssertCublas(
+                CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, rem, m_sub,
+                                          &alpha, Y_k, m, Q_rem, m, &beta0, work, kb),
+                "explicitQ rem work = Y^T * Q");
+            AssertCublas(
+                CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub, rem, kb,
+                                          &negalpha, W_k, m, work, kb, &alpha, Q_rem, m),
+                "explicitQ rem Q -= W*work");
+        }
+    }
+}
+
+template <typename T>
 void BlockedQrFactorize(cublasHandle_t cublas_handle,
                         int m,
                         int n,
@@ -338,6 +453,7 @@ struct Options {
     bool use_double = false;
     bool run_geqrf = true;
     bool with_q = false;
+    bool with_q_batched = false;
 };
 
 Options ParseArgs(int argc, char** argv) {
@@ -387,6 +503,9 @@ Options ParseArgs(int argc, char** argv) {
             opts.run_geqrf = false;
         } else if (std::strcmp(argv[i], "--with-q") == 0) {
             opts.with_q = true;
+        } else if (std::strcmp(argv[i], "--with-q-batched") == 0) {
+            opts.with_q = true;
+            opts.with_q_batched = true;
         }
     }
     return opts;
@@ -606,6 +725,45 @@ void RunBench(const Options& opts,
             spdlog::info("WY->Q avg:   {:.3f} ms ({:.3f} TFLOPS)", wy_q_ms, wy_q_tflops);
             spdlog::info("WY applyQ:   {:.3f} ms ({:.3f} TFLOPS)", wy_apply_ms, wy_apply_tflops);
 
+            if (opts.with_q_batched) {
+                // End-to-end explicit Q using StridedBatchedGEMM (factorize + explicit-Q).
+                auto wy_q_batched_fn = [&]() {
+                    BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp,
+                                          d_work_tsqr, tsqr_work_elems_m, nullptr);
+                    GenerateExplicitQFromWYStridedBatched<T>(m, n, nb, d_W, d_Y, d_A, d_work_geqrf,
+                                                             static_cast<size_t>(lwork),
+                                                             cublas_handle);
+                };
+                for (int i = 0; i < opts.warmup; ++i) {
+                    wy_q_setup();
+                    wy_q_batched_fn();
+                    AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize wyQ batched warmup");
+                }
+                const float wy_q_batched_ms = TimeKernelMs(wy_q_setup, wy_q_batched_fn, opts.iters);
+                const double wy_q_batched_tflops = FlopsToTflops(e2e_q_flops_norm, wy_q_batched_ms);
+                spdlog::info("WY->Q(batched) avg: {:.3f} ms ({:.3f} TFLOPS)", wy_q_batched_ms,
+                             wy_q_batched_tflops);
+
+                // Q-only explicit Q using StridedBatchedGEMM.
+                auto wy_apply_batched_fn = [&]() {
+                    GenerateExplicitQFromWYStridedBatched<T>(m, n, nb, d_W, d_Y, d_A, d_work_geqrf,
+                                                             static_cast<size_t>(lwork),
+                                                             cublas_handle);
+                };
+                for (int i = 0; i < opts.warmup; ++i) {
+                    wy_apply_setup();
+                    wy_apply_batched_fn();
+                    AssertCuda(cudaDeviceSynchronize(),
+                               "cudaDeviceSynchronize WY apply batched warmup");
+                }
+                const float wy_apply_batched_ms =
+                    TimeKernelMs(wy_apply_setup, wy_apply_batched_fn, opts.iters);
+                const double wy_apply_batched_tflops =
+                    FlopsToTflops(orgqr_flops, wy_apply_batched_ms);
+                spdlog::info("WY applyQ(batched) avg: {:.3f} ms ({:.3f} TFLOPS)",
+                             wy_apply_batched_ms, wy_apply_batched_tflops);
+            }
+
             if (opts.run_geqrf) {
                 auto orgqr_setup = [&]() {
                     AssertCuda(cudaMemcpy(d_A, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
@@ -723,10 +881,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    spdlog::info("QR bench: m={} n={} nb={} b={} iters={} warmup={} type={} {} {}",
-                 opts.m, opts.n, opts.nb, kPanelWidth, opts.iters, opts.warmup,
-                 opts.use_double ? "double" : "float",
-                 opts.run_geqrf ? "" : "(no geqrf)", opts.with_q ? "(with Q)" : "");
+    spdlog::info("QR bench: m={} n={} nb={} b={} iters={} warmup={} type={} {} {}", opts.m, opts.n,
+                 opts.nb, kPanelWidth, opts.iters, opts.warmup,
+                 opts.use_double ? "double" : "float", opts.run_geqrf ? "" : "(no geqrf)",
+                 opts.with_q ? "(with Q)" : "");
+    if (opts.with_q_batched) {
+        spdlog::info(
+            "Extra: --with-q-batched enabled (adds StridedBatchedGEMM explicit-Q timings)");
+    }
 
     int device_count = 0;
     cudaError_t st = cudaGetDeviceCount(&device_count);
