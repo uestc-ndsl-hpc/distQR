@@ -222,7 +222,8 @@ void SingleCardBlockedQrFactorize(float* d_Afact,
                                   float* d_Y,
                                   float* d_rtmp,
                                   float* d_tsqr_work,
-                                  size_t tsqr_work_elems_m) {
+                                  size_t tsqr_work_elems_m,
+                                  bool trail_one_shot) {
     const int lda = m;
     const float one = 1.0f;
     const float zero = 0.0f;
@@ -289,19 +290,31 @@ void SingleCardBlockedQrFactorize(float* d_Afact,
         const int n_trail = n - end;
         if (n_trail > 0) {
             auto a_trail = d_Afact + Idx2D(outer_index, end, lda);  // (m_sub x n_trail)
-            for (int col0 = 0; col0 < n_trail; col0 += nb) {
-                const int tile = std::min(nb, n_trail - col0);
-                auto a_tile = a_trail + static_cast<size_t>(col0) *
-                                            static_cast<size_t>(lda);  // (m_sub x tile)
+            if (trail_one_shot) {
+                // One-shot update:
+                // work (kb x n_trail) = W_big^T * A_trail, with ld(work)=nb.
+                CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, n_trail,
+                                              m_sub, &one, w_big, lda, a_trail, lda, &zero, d_rtmp,
+                                              nb);
+                // A_trail -= Y_big * work
+                CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
+                                              n_trail, kb, &minus_one, y_big, lda, d_rtmp, nb,
+                                              &one, a_trail, lda);
+            } else {
+                for (int col0 = 0; col0 < n_trail; col0 += nb) {
+                    const int tile = std::min(nb, n_trail - col0);
+                    auto a_tile = a_trail + static_cast<size_t>(col0) *
+                                                static_cast<size_t>(lda);  // (m_sub x tile)
 
-                // work (kb x tile) = W_big^T * A_tile, stored in d_rtmp
-                CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, tile,
-                                              m_sub, &one, w_big, lda, a_tile, lda, &zero, d_rtmp,
-                                              kb);
-                // A_tile -= Y_big * work
-                CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub, tile,
-                                              kb, &minus_one, y_big, lda, d_rtmp, kb, &one, a_tile,
-                                              lda);
+                    // work (kb x tile) = W_big^T * A_tile, stored in d_rtmp
+                    CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
+                                                  tile, m_sub, &one, w_big, lda, a_tile, lda,
+                                                  &zero, d_rtmp, kb);
+                    // A_tile -= Y_big * work
+                    CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
+                                                  tile, kb, &minus_one, y_big, lda, d_rtmp, kb,
+                                                  &one, a_tile, lda);
+                }
             }
         }
     }
@@ -424,6 +437,7 @@ __global__ void SubVectorKernel(size_t n, float* y, const float* x) {
 }
 
 static void RunQrCase(const QrCase& test_case,
+                      bool trail_one_shot,
                       ReusableDeviceBufferF& d_A0,
                       ReusableDeviceBufferF& d_Afact,
                       ReusableDeviceBufferF& d_W,
@@ -455,7 +469,8 @@ static void RunQrCase(const QrCase& test_case,
     AssertCuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
 
     const size_t elems_A = static_cast<size_t>(m) * static_cast<size_t>(n);
-    const size_t elems_rtmp = static_cast<size_t>(nb) * static_cast<size_t>(nb);
+    const int max_trail_cols = trail_one_shot ? std::max(nb, n - nb) : nb;
+    const size_t elems_rtmp = static_cast<size_t>(nb) * static_cast<size_t>(max_trail_cols);
     const size_t elems_tsqr = std::max(tsqr_work_elems<float>(m), static_cast<size_t>(1));
     constexpr int kOrthoCols = 8;
     const size_t elems_X = static_cast<size_t>(m) * static_cast<size_t>(kOrthoCols);
@@ -519,7 +534,7 @@ static void RunQrCase(const QrCase& test_case,
 
     // Factorize Afact to get WY (and R in Afact's upper triangle).
     SingleCardBlockedQrFactorize(d_Afact.ptr, m, n, nb, handle, d_W.ptr, d_Y.ptr, d_rtmp.ptr,
-                                 d_tsqr.ptr, elems_tsqr);
+                                 d_tsqr.ptr, elems_tsqr, trail_one_shot);
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after factorize");
     AssertCuda(cudaGetLastError(), "cudaGetLastError after factorize");
 
@@ -626,6 +641,7 @@ static void RunQrCase(const QrCase& test_case,
 }
 
 static void RunOrgqrCompareCase(const QrCase& test_case,
+                                bool trail_one_shot,
                                 ReusableDeviceBufferF& d_A0,
                                 ReusableDeviceBufferF& d_Afact,
                                 ReusableDeviceBufferF& d_Ageqrf,
@@ -656,7 +672,8 @@ static void RunOrgqrCompareCase(const QrCase& test_case,
     ASSERT_EQ(n % nb, 0) << "This test assumes n is divisible by nb.";
 
     const size_t elems_A = static_cast<size_t>(m) * static_cast<size_t>(n);
-    const size_t elems_rtmp = static_cast<size_t>(nb) * static_cast<size_t>(nb);
+    const int max_trail_cols = trail_one_shot ? std::max(nb, n - nb) : nb;
+    const size_t elems_rtmp = static_cast<size_t>(nb) * static_cast<size_t>(max_trail_cols);
     const size_t elems_tsqr = std::max(tsqr_work_elems<float>(m), static_cast<size_t>(1));
     const size_t elems_tau = static_cast<size_t>(n);
 
@@ -704,7 +721,7 @@ static void RunOrgqrCompareCase(const QrCase& test_case,
 
     // WY factorization.
     SingleCardBlockedQrFactorize(d_Afact.ptr, m, n, nb, cublas_handle, d_W.ptr, d_Y.ptr, d_rtmp.ptr,
-                                 d_tsqr.ptr, elems_tsqr);
+                                 d_tsqr.ptr, elems_tsqr, trail_one_shot);
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after WY factorize");
     AssertCuda(cudaGetLastError(), "cudaGetLastError after WY factorize");
 
@@ -778,7 +795,8 @@ static void RunOrgqrCompareCase(const QrCase& test_case,
     const double norm_diff = Nrm2Large(cublas_handle, d_Qdiff.ptr, elems_A);
     const double norm_ref = Nrm2Large(cublas_handle, d_Qorgqr.ptr, elems_A);
     const double rel_err = (norm_ref > 0.0) ? (norm_diff / norm_ref) : norm_diff;
-    spdlog::info("N={} NB={} ||Q_wy - Q_orgqr||F / ||Q_orgqr||F = {:.3e}", n, nb, rel_err);
+    spdlog::info("N={} NB={} mode={} ||Q_wy - Q_orgqr||F / ||Q_orgqr||F = {:.3e}", n, nb,
+                 trail_one_shot ? "one-shot" : "tiled", rel_err);
     EXPECT_LT(rel_err, 1e-3);
 
     AssertCuda(cudaFree(d_info), "cudaFree d_info");
@@ -804,20 +822,33 @@ static ReusableDeviceBufferF g_cusolver_work;
 static ReusableNormalRng g_rng;
 
 TEST(SingleCardQrTest, Norms16384_NB1024) {
-    RunQrCase({16384, 1024}, g_A0, g_Afact, g_W, g_Y, g_rtmp, g_tsqr, g_pack, g_X, g_Xorig, g_rng);
+    RunQrCase({16384, 1024}, false, g_A0, g_Afact, g_W, g_Y, g_rtmp, g_tsqr, g_pack, g_X, g_Xorig,
+              g_rng);
 }
 
 TEST(SingleCardQrTest, Norms49152_NB1024) {
-    RunQrCase({49152, 1024}, g_A0, g_Afact, g_W, g_Y, g_rtmp, g_tsqr, g_pack, g_X, g_Xorig, g_rng);
+    RunQrCase({49152, 1024}, false, g_A0, g_Afact, g_W, g_Y, g_rtmp, g_tsqr, g_pack, g_X, g_Xorig,
+              g_rng);
 }
 
 TEST(SingleCardQrTest, Norms65536_NB1024) {
-    RunQrCase({65536, 1024}, g_A0, g_Afact, g_W, g_Y, g_rtmp, g_tsqr, g_pack, g_X, g_Xorig, g_rng);
+    RunQrCase({65536, 1024}, false, g_A0, g_Afact, g_W, g_Y, g_rtmp, g_tsqr, g_pack, g_X, g_Xorig,
+              g_rng);
 }
 
 TEST(SingleCardQrTest, WyVsOrgqr2048_NB256) {
-    RunOrgqrCompareCase({2048, 256}, g_A0, g_Afact, g_Ageqrf, g_W, g_Y, g_rtmp, g_tsqr, g_Qwy,
-                        g_Qorgqr, g_Qdiff, g_tau, g_cusolver_work, g_rng);
+    RunOrgqrCompareCase({2048, 256}, false, g_A0, g_Afact, g_Ageqrf, g_W, g_Y, g_rtmp, g_tsqr,
+                        g_Qwy, g_Qorgqr, g_Qdiff, g_tau, g_cusolver_work, g_rng);
+}
+
+TEST(SingleCardQrTest, Norms2048_NB256_OneShotTrail) {
+    RunQrCase({2048, 256}, true, g_A0, g_Afact, g_W, g_Y, g_rtmp, g_tsqr, g_pack, g_X, g_Xorig,
+              g_rng);
+}
+
+TEST(SingleCardQrTest, WyVsOrgqr2048_NB256_OneShotTrail) {
+    RunOrgqrCompareCase({2048, 256}, true, g_A0, g_Afact, g_Ageqrf, g_W, g_Y, g_rtmp, g_tsqr,
+                        g_Qwy, g_Qorgqr, g_Qdiff, g_tau, g_cusolver_work, g_rng);
 }
 
 }  // namespace
