@@ -298,8 +298,8 @@ void SingleCardBlockedQrFactorize(float* d_Afact,
                                               nb);
                 // A_trail -= Y_big * work
                 CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
-                                              n_trail, kb, &minus_one, y_big, lda, d_rtmp, nb,
-                                              &one, a_trail, lda);
+                                              n_trail, kb, &minus_one, y_big, lda, d_rtmp, nb, &one,
+                                              a_trail, lda);
             } else {
                 for (int col0 = 0; col0 < n_trail; col0 += nb) {
                     const int tile = std::min(nb, n_trail - col0);
@@ -307,9 +307,9 @@ void SingleCardBlockedQrFactorize(float* d_Afact,
                                                 static_cast<size_t>(lda);  // (m_sub x tile)
 
                     // work (kb x tile) = W_big^T * A_tile, stored in d_rtmp
-                    CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
-                                                  tile, m_sub, &one, w_big, lda, a_tile, lda,
-                                                  &zero, d_rtmp, kb);
+                    CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb, tile,
+                                                  m_sub, &one, w_big, lda, a_tile, lda, &zero,
+                                                  d_rtmp, kb);
                     // A_tile -= Y_big * work
                     CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m_sub,
                                                   tile, kb, &minus_one, y_big, lda, d_rtmp, kb,
@@ -847,8 +847,8 @@ TEST(SingleCardQrTest, Norms2048_NB256_OneShotTrail) {
 }
 
 TEST(SingleCardQrTest, WyVsOrgqr2048_NB256_OneShotTrail) {
-    RunOrgqrCompareCase({2048, 256}, true, g_A0, g_Afact, g_Ageqrf, g_W, g_Y, g_rtmp, g_tsqr,
-                        g_Qwy, g_Qorgqr, g_Qdiff, g_tau, g_cusolver_work, g_rng);
+    RunOrgqrCompareCase({2048, 256}, true, g_A0, g_Afact, g_Ageqrf, g_W, g_Y, g_rtmp, g_tsqr, g_Qwy,
+                        g_Qorgqr, g_Qdiff, g_tau, g_cusolver_work, g_rng);
 }
 
 }  // namespace
