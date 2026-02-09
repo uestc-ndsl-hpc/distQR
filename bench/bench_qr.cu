@@ -361,6 +361,7 @@ void BlockedQrFactorize(cublasHandle_t cublas_handle,
                         int m,
                         int n,
                         int nb,
+                        int trail_tile_cols,
                         T* d_A,
                         int lda,
                         T* d_W,
@@ -440,16 +441,16 @@ void BlockedQrFactorize(cublasHandle_t cublas_handle,
                                                        d_rtmp, nb, &one, a_trail, lda),
                              "trail one-shot A -= Y*work");
             } else {
-                for (int col0 = 0; col0 < n_trail; col0 += nb) {
-                    const int tile = std::min(nb, n_trail - col0);
+                for (int col0 = 0; col0 < n_trail; col0 += trail_tile_cols) {
+                    const int tile = std::min(trail_tile_cols, n_trail - col0);
                     T* a_tile = a_trail + static_cast<size_t>(col0) * static_cast<size_t>(lda);
                     AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                                            kb, tile, m_sub, &one, w_big, lda,
-                                                           a_tile, lda, &zero, d_rtmp, kb),
+                                                           a_tile, lda, &zero, d_rtmp, nb),
                                  "trail work = W^T*A");
                     AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                                            m_sub, tile, kb, &minus_one, y_big, lda,
-                                                           d_rtmp, kb, &one, a_tile, lda),
+                                                           d_rtmp, nb, &one, a_tile, lda),
                                  "trail A -= Y*work");
                 }
             }
@@ -468,6 +469,7 @@ struct Options {
     bool with_q = false;
     bool with_q_batched = false;
     bool trail_one_shot = false;
+    int trail_tile_cols = 0;
 };
 
 Options ParseArgs(int argc, char** argv) {
@@ -524,6 +526,8 @@ Options ParseArgs(int argc, char** argv) {
             opts.trail_one_shot = true;
         } else if (std::strcmp(argv[i], "--trail-tiled") == 0) {
             opts.trail_one_shot = false;
+        } else if (std::strcmp(argv[i], "--trail-tile-cols") == 0 && i + 1 < argc) {
+            opts.trail_tile_cols = std::atoi(argv[++i]);
         }
     }
     return opts;
@@ -536,6 +540,7 @@ void RunBench(const Options& opts,
     const int m = opts.m;
     const int n = opts.n;
     const int nb = opts.nb;
+    const int trail_tile_cols = (opts.trail_tile_cols > 0) ? opts.trail_tile_cols : nb;
     const int lda = m;
     const double qr_flops = QrFlops(m, n);
     const double orgqr_flops = OrgqrFlops(m, n);
@@ -545,7 +550,8 @@ void RunBench(const Options& opts,
     const size_t a_elems = static_cast<size_t>(m) * static_cast<size_t>(n);
     const size_t a_bytes = a_elems * sizeof(T);
     const size_t wy_bytes = a_bytes;
-    const int max_trail_cols = opts.trail_one_shot ? std::max(nb, n - nb) : nb;
+    const int max_trail_cols =
+        opts.trail_one_shot ? std::max(nb, n - nb) : std::max(nb, trail_tile_cols);
     const size_t rtmp_bytes =
         static_cast<size_t>(nb) * static_cast<size_t>(max_trail_cols) * sizeof(T);
     const size_t tsqr_work_elems_m = tsqr_work_elems<T>(m);
@@ -575,8 +581,8 @@ void RunBench(const Options& opts,
                    "cudaMemcpy D2D warmup");
         AssertCuda(cudaMemset(d_W, 0, wy_bytes), "cudaMemset d_W warmup");
         AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y warmup");
-        BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
-                              tsqr_work_elems_m, nullptr, opts.trail_one_shot);
+        BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W, d_Y, d_rtmp,
+                              d_work_tsqr, tsqr_work_elems_m, nullptr, opts.trail_one_shot);
         AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize warmup");
     }
 
@@ -588,8 +594,9 @@ void RunBench(const Options& opts,
             AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y");
         },
         [&]() {
-            BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
-                                  tsqr_work_elems_m, nullptr, opts.trail_one_shot);
+            BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W, d_Y,
+                                  d_rtmp, d_work_tsqr, tsqr_work_elems_m, nullptr,
+                                  opts.trail_one_shot);
             AssertCuda(cudaGetLastError(), "blocked qr launch");
         },
         opts.iters);
@@ -700,8 +707,9 @@ void RunBench(const Options& opts,
                 AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y wyQ");
             };
             auto wy_q_fn = [&]() {
-                BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp,
-                                      d_work_tsqr, tsqr_work_elems_m, nullptr, opts.trail_one_shot);
+                BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W, d_Y,
+                                      d_rtmp, d_work_tsqr, tsqr_work_elems_m, nullptr,
+                                      opts.trail_one_shot);
                 GenerateExplicitQFromWY<T>(m, n, nb, d_W, d_Y, d_A, d_work_geqrf,
                                            static_cast<size_t>(lwork), cublas_handle);
             };
@@ -721,8 +729,9 @@ void RunBench(const Options& opts,
                        "cudaMemcpy D2D WY precompute");
             AssertCuda(cudaMemset(d_W, 0, wy_bytes), "cudaMemset d_W WY precompute");
             AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y WY precompute");
-            BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
-                                  tsqr_work_elems_m, nullptr, opts.trail_one_shot);
+            BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W, d_Y,
+                                  d_rtmp, d_work_tsqr, tsqr_work_elems_m, nullptr,
+                                  opts.trail_one_shot);
             AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize WY precompute");
 
             auto wy_apply_setup = [&]() {
@@ -748,8 +757,8 @@ void RunBench(const Options& opts,
             if (opts.with_q_batched) {
                 // End-to-end explicit Q using StridedBatchedGEMM (factorize + explicit-Q).
                 auto wy_q_batched_fn = [&]() {
-                    BlockedQrFactorize<T>(cublas_handle, m, n, nb, d_A, lda, d_W, d_Y, d_rtmp,
-                                          d_work_tsqr, tsqr_work_elems_m, nullptr,
+                    BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W,
+                                          d_Y, d_rtmp, d_work_tsqr, tsqr_work_elems_m, nullptr,
                                           opts.trail_one_shot);
                     GenerateExplicitQFromWYStridedBatched<T>(m, n, nb, d_W, d_Y, d_A, d_work_geqrf,
                                                              static_cast<size_t>(lwork),
@@ -901,12 +910,18 @@ int main(int argc, char** argv) {
         spdlog::error("Invalid args: require n and nb to be multiples of {}", kPanelWidth);
         return 1;
     }
+    if (opts.trail_tile_cols < 0) {
+        spdlog::error("Invalid args: require trail_tile_cols > 0");
+        return 1;
+    }
 
     spdlog::info("QR bench: m={} n={} nb={} b={} iters={} warmup={} type={} {} {}", opts.m, opts.n,
                  opts.nb, kPanelWidth, opts.iters, opts.warmup,
                  opts.use_double ? "double" : "float", opts.run_geqrf ? "" : "(no geqrf)",
                  opts.with_q ? "(with Q)" : "");
     spdlog::info("Trailing update mode: {}", opts.trail_one_shot ? "one-shot GEMM" : "tiled GEMM");
+    spdlog::info("Trailing tiled cols: {}",
+                 opts.trail_tile_cols > 0 ? opts.trail_tile_cols : opts.nb);
     if (opts.with_q_batched) {
         spdlog::info(
             "Extra: --with-q-batched enabled (adds StridedBatchedGEMM explicit-Q timings)");
