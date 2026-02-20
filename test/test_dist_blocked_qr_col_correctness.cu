@@ -86,7 +86,8 @@ void ApplyAllOuterPanelsQTToA(float* d_A,
 
     for (int panel_col = 0; panel_col < n; panel_col += distributed_qr_col::kPanelWidth) {
         const int panel_idx = panel_col / distributed_qr_col::kPanelWidth;
-        const int owner = distributed_qr_col::OwnerOfPanel(panel_idx, total_panels, part.world_size);
+        const int owner =
+            distributed_qr_col::OwnerOfPanel(panel_idx, total_panels, part.world_size);
         const int local_panel_col = panel_col - part.col_start;
         const bool owner_has_panel =
             (owner == part.rank) && (local_panel_col >= 0) &&
@@ -95,22 +96,20 @@ void ApplyAllOuterPanelsQTToA(float* d_A,
 
         if (owner_has_panel) {
             distributed_qr_col::AssertCuda(
-                cudaMemcpy2DAsync(d_panel_w + panel_col, static_cast<size_t>(m) * sizeof(float),
-                                  d_W_local + static_cast<size_t>(local_panel_col) * lda_local +
-                                      panel_col,
-                                  static_cast<size_t>(lda_local) * sizeof(float),
-                                  static_cast<size_t>(panel_rows) * sizeof(float),
-                                  distributed_qr_col::kPanelWidth, cudaMemcpyDeviceToDevice,
-                                  compute_stream),
+                cudaMemcpy2DAsync(
+                    d_panel_w + panel_col, static_cast<size_t>(m) * sizeof(float),
+                    d_W_local + static_cast<size_t>(local_panel_col) * lda_local + panel_col,
+                    static_cast<size_t>(lda_local) * sizeof(float),
+                    static_cast<size_t>(panel_rows) * sizeof(float),
+                    distributed_qr_col::kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
                 "cudaMemcpy2DAsync local panel W -> scratch");
             distributed_qr_col::AssertCuda(
-                cudaMemcpy2DAsync(d_panel_y + panel_col, static_cast<size_t>(m) * sizeof(float),
-                                  d_Y_local + static_cast<size_t>(local_panel_col) * lda_local +
-                                      panel_col,
-                                  static_cast<size_t>(lda_local) * sizeof(float),
-                                  static_cast<size_t>(panel_rows) * sizeof(float),
-                                  distributed_qr_col::kPanelWidth, cudaMemcpyDeviceToDevice,
-                                  compute_stream),
+                cudaMemcpy2DAsync(
+                    d_panel_y + panel_col, static_cast<size_t>(m) * sizeof(float),
+                    d_Y_local + static_cast<size_t>(local_panel_col) * lda_local + panel_col,
+                    static_cast<size_t>(lda_local) * sizeof(float),
+                    static_cast<size_t>(panel_rows) * sizeof(float),
+                    distributed_qr_col::kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
                 "cudaMemcpy2DAsync local panel Y -> scratch");
         }
 
@@ -143,16 +142,14 @@ void ApplyAllOuterPanelsQTToA(float* d_A,
                 CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                                               distributed_qr_col::kPanelWidth, width, panel_rows,
                                               &one, d_panel_w + panel_col, m, a_tile_sub, lda_local,
-                                              &zero, d_tmp,
-                                              distributed_qr_col::kPanelWidth),
+                                              &zero, d_tmp, distributed_qr_col::kPanelWidth),
                 "tmp = W^T * A_tile");
 
             distributed_qr_col::AssertCublas(
-                CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_rows,
-                                              width, distributed_qr_col::kPanelWidth, &minus_one,
-                                              d_panel_y + panel_col, m, d_tmp,
-                                              distributed_qr_col::kPanelWidth, &one, a_tile_sub,
-                                              lda_local),
+                CublasGemmTraits<float>::Gemm(
+                    cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_rows, width,
+                    distributed_qr_col::kPanelWidth, &minus_one, d_panel_y + panel_col, m, d_tmp,
+                    distributed_qr_col::kPanelWidth, &one, a_tile_sub, lda_local),
                 "A_tile -= Y * tmp");
         }
     }
@@ -209,9 +206,8 @@ TEST(DistBlockedQrColCorrectnessTest, FactorizedAEqualsQtA0) {
     ws.tmp_elems = static_cast<size_t>(distributed_qr_col::kPanelWidth) * tile_cols;
 
     distributed_qr_col::AssertCuda(
-        cudaMalloc(&ws.d_r_panel,
-                   static_cast<size_t>(distributed_qr_col::kPanelWidth) *
-                       distributed_qr_col::kPanelWidth * sizeof(float)),
+        cudaMalloc(&ws.d_r_panel, static_cast<size_t>(distributed_qr_col::kPanelWidth) *
+                                      distributed_qr_col::kPanelWidth * sizeof(float)),
         "cudaMalloc ws.d_r_panel");
     distributed_qr_col::AssertCuda(
         cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(float)),
@@ -224,8 +220,10 @@ TEST(DistBlockedQrColCorrectnessTest, FactorizedAEqualsQtA0) {
         cudaMalloc(&ws.d_panel_y,
                    static_cast<size_t>(m) * distributed_qr_col::kPanelWidth * sizeof(float)),
         "cudaMalloc ws.d_panel_y");
-    distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_tmp, ws.tmp_elems * sizeof(float)),
-                                   "cudaMalloc ws.d_tmp");
+    distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(float)),
+                                   "cudaMalloc ws.d_tmp0");
+    distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_tmp1, ws.tmp_elems * sizeof(float)),
+                                   "cudaMalloc ws.d_tmp1");
 
     float* d_panel_w = nullptr;
     float* d_panel_y = nullptr;
@@ -239,7 +237,8 @@ TEST(DistBlockedQrColCorrectnessTest, FactorizedAEqualsQtA0) {
                    static_cast<size_t>(m) * distributed_qr_col::kPanelWidth * sizeof(float)),
         "cudaMalloc d_panel_y");
     distributed_qr_col::AssertCuda(
-        cudaMalloc(&d_tmp, static_cast<size_t>(distributed_qr_col::kPanelWidth) * nb * sizeof(float)),
+        cudaMalloc(&d_tmp,
+                   static_cast<size_t>(distributed_qr_col::kPanelWidth) * nb * sizeof(float)),
         "cudaMalloc d_tmp");
 
     cudaStream_t compute_stream = nullptr;
@@ -324,7 +323,8 @@ TEST(DistBlockedQrColCorrectnessTest, FactorizedAEqualsQtA0) {
     distributed_qr_col::AssertCuda(cudaFree(ws.d_tsqr_work_panel), "cudaFree ws.d_tsqr_work_panel");
     distributed_qr_col::AssertCuda(cudaFree(ws.d_panel_w), "cudaFree ws.d_panel_w");
     distributed_qr_col::AssertCuda(cudaFree(ws.d_panel_y), "cudaFree ws.d_panel_y");
-    distributed_qr_col::AssertCuda(cudaFree(ws.d_tmp), "cudaFree ws.d_tmp");
+    distributed_qr_col::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
+    distributed_qr_col::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
 
     distributed_qr_col::AssertCuda(cudaFree(d_panel_w), "cudaFree d_panel_w");
     distributed_qr_col::AssertCuda(cudaFree(d_panel_y), "cudaFree d_panel_y");

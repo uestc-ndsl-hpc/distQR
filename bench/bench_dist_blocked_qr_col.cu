@@ -156,8 +156,10 @@ int main(int argc, char** argv) {
     distributed_qr_col::AssertCuda(
         cudaMalloc(&ws.d_panel_y, static_cast<size_t>(opts.m) * kPanelWidth * sizeof(float)),
         "cudaMalloc ws.d_panel_y");
-    distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_tmp, ws.tmp_elems * sizeof(float)),
-                                   "cudaMalloc ws.d_tmp");
+    distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(float)),
+                                   "cudaMalloc ws.d_tmp0");
+    distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_tmp1, ws.tmp_elems * sizeof(float)),
+                                   "cudaMalloc ws.d_tmp1");
 
     cudaStream_t compute_stream = nullptr;
     cudaStream_t comm_stream = nullptr;
@@ -263,7 +265,8 @@ int main(int argc, char** argv) {
     distributed_qr_col::AssertCuda(cudaFree(ws.d_tsqr_work_panel), "cudaFree ws.d_tsqr_work_panel");
     distributed_qr_col::AssertCuda(cudaFree(ws.d_panel_w), "cudaFree ws.d_panel_w");
     distributed_qr_col::AssertCuda(cudaFree(ws.d_panel_y), "cudaFree ws.d_panel_y");
-    distributed_qr_col::AssertCuda(cudaFree(ws.d_tmp), "cudaFree ws.d_tmp");
+    distributed_qr_col::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
+    distributed_qr_col::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
 
     distributed_qr_col::AssertCuda(cudaFree(d_A0), "cudaFree d_A0");
     distributed_qr_col::AssertCuda(cudaFree(d_A), "cudaFree d_A");
