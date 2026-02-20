@@ -261,8 +261,10 @@ int main(int argc, char** argv) {
 
     if (env.rank == 0) {
         const int effective_tile = (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile;
-        spdlog::info("Distributed blocked QR (float): m={} n={} nb={} tile={} np={} avg {:.3f} ms",
-                     opts.m, opts.n, opts.nb, effective_tile, env.size, max_ms);
+        spdlog::info(
+            "Distributed blocked QR [row-partition] (float): m={} n={} nb={} tile={} np={} avg "
+            "{:.3f} ms",
+            opts.m, opts.n, opts.nb, effective_tile, env.size, max_ms);
         if (total_bad > 0) {
             spdlog::error("Detected {} non-finite values after factorization.", total_bad);
         }

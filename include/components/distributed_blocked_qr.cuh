@@ -1,4 +1,5 @@
 #pragma once
+// Row-partitioned distributed blocked QR implementation.
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
