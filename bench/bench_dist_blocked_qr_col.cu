@@ -121,6 +121,15 @@ int main(int argc, char** argv) {
         finalize_mpi_if_needed(env);
         return 1;
     }
+    if (opts.warmup < 0 || opts.iters <= 0) {
+        if (env.rank == 0) {
+            spdlog::error("Invalid args: require warmup >= 0 and iters > 0 (got warmup={} iters={})",
+                          opts.warmup, opts.iters);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
 
     const auto part = distributed_qr_col::MakeColPartition(opts.n, env.size, env.rank);
     const int lda_local = std::max(opts.m, 1);
@@ -202,9 +211,14 @@ int main(int argc, char** argv) {
                                        "cudaStreamSynchronize warmup comm");
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    const double t0_global = MPI_Wtime();
-    const double t0_local = MPI_Wtime();
+    cudaEvent_t timed_start = nullptr;
+    cudaEvent_t timed_stop = nullptr;
+    cudaEvent_t timed_comm_done = nullptr;
+    distributed_qr_col::AssertCuda(cudaEventCreate(&timed_start), "cudaEventCreate timed_start");
+    distributed_qr_col::AssertCuda(cudaEventCreate(&timed_stop), "cudaEventCreate timed_stop");
+    distributed_qr_col::AssertCuda(
+        cudaEventCreateWithFlags(&timed_comm_done, cudaEventDisableTiming),
+        "cudaEventCreate timed_comm_done");
     std::vector<cudaEvent_t> comm_start_events;
     std::vector<cudaEvent_t> comm_end_events;
     std::vector<unsigned long long> comm_bytes_per_iter;
@@ -220,6 +234,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    float timed_total_ms = 0.0f;
     for (int i = 0; i < opts.iters; ++i) {
         distributed_qr_col::AssertCuda(cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(float),
                                                        cudaMemcpyDeviceToDevice, compute_stream),
@@ -235,6 +250,8 @@ int main(int argc, char** argv) {
             distributed_qr_col::AssertCuda(cudaEventRecord(comm_start_events[i], comm_stream),
                                            "cudaEventRecord comm_start");
         }
+        distributed_qr_col::AssertCuda(cudaEventRecord(timed_start, compute_stream),
+                                       "cudaEventRecord timed_start");
         distributed_qr_col::distributed_blocked_qr_factorize_col<float>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
@@ -244,20 +261,21 @@ int main(int argc, char** argv) {
                                            "cudaEventRecord comm_end");
             comm_bytes_per_iter[i] = static_cast<unsigned long long>(comm_profile.bytes);
         }
+        distributed_qr_col::AssertCuda(cudaEventRecord(timed_comm_done, comm_stream),
+                                       "cudaEventRecord timed_comm_done");
+        distributed_qr_col::AssertCuda(cudaStreamWaitEvent(compute_stream, timed_comm_done, 0),
+                                       "cudaStreamWaitEvent compute <- timed_comm_done");
+        distributed_qr_col::AssertCuda(cudaEventRecord(timed_stop, compute_stream),
+                                       "cudaEventRecord timed_stop");
+        distributed_qr_col::AssertCuda(cudaEventSynchronize(timed_stop),
+                                       "cudaEventSynchronize timed_stop");
+        float iter_ms = 0.0f;
+        distributed_qr_col::AssertCuda(cudaEventElapsedTime(&iter_ms, timed_start, timed_stop),
+                                       "cudaEventElapsedTime timed");
+        timed_total_ms += iter_ms;
     }
-
-    distributed_qr_col::AssertCuda(cudaStreamSynchronize(compute_stream),
-                                   "cudaStreamSynchronize timed compute");
-    distributed_qr_col::AssertCuda(cudaStreamSynchronize(comm_stream),
-                                   "cudaStreamSynchronize timed comm");
-
-    const double t1_local = MPI_Wtime();
-    MPI_Barrier(MPI_COMM_WORLD);
-    const double t1_global = MPI_Wtime();
-
-    const double local_ms = (t1_global - t0_global) * 1000.0 / static_cast<double>(opts.iters);
-    const double local_ms_no_barrier =
-        (t1_local - t0_local) * 1000.0 / static_cast<double>(opts.iters);
+    const double local_ms = static_cast<double>(timed_total_ms) / static_cast<double>(opts.iters);
+    const double local_ms_no_barrier = local_ms;
     double local_comm_ms = 0.0;
     unsigned long long local_comm_bytes = 0ULL;
     if (opts.print_comm_bw) {
@@ -272,6 +290,10 @@ int main(int argc, char** argv) {
         local_comm_ms /= static_cast<double>(opts.iters);
         local_comm_bytes /= static_cast<unsigned long long>(opts.iters);
     }
+    distributed_qr_col::AssertCuda(cudaEventDestroy(timed_start), "cudaEventDestroy timed_start");
+    distributed_qr_col::AssertCuda(cudaEventDestroy(timed_stop), "cudaEventDestroy timed_stop");
+    distributed_qr_col::AssertCuda(cudaEventDestroy(timed_comm_done),
+                                   "cudaEventDestroy timed_comm_done");
     double max_ms = 0.0;
     MPI_Reduce(&local_ms, &max_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     std::vector<double> all_local_ms;
