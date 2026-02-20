@@ -286,12 +286,13 @@ int main(int argc, char** argv) {
         all_local_comm_ms.resize(env.size, 0.0);
         all_local_comm_bytes.resize(env.size, 0ULL);
     }
-    MPI_Gather(&local_ms, 1, MPI_DOUBLE,
-               (opts.print_per_rank && env.rank == 0) ? all_local_ms.data() : nullptr, 1,
-               MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    MPI_Gather(&local_ms_no_barrier, 1, MPI_DOUBLE,
-               (opts.print_per_rank && env.rank == 0) ? all_local_ms_no_barrier.data() : nullptr, 1,
-               MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    if (opts.print_per_rank) {
+        MPI_Gather(&local_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_local_ms.data() : nullptr, 1,
+                   MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Gather(&local_ms_no_barrier, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_ms_no_barrier.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+    }
     if (opts.print_comm_bw) {
         MPI_Gather(&local_comm_ms, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_local_comm_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
