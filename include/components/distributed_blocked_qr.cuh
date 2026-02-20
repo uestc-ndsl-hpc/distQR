@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <cstdlib>
 #include <type_traits>
-#include <vector>
 
 #include "panel_process.cuh"
 #include "utils/cublas_gemm_traits.cuh"
@@ -137,38 +136,6 @@ __global__ void write_r_panel_to_local_a_kernel(int panel_col_begin,
     const int global_col = panel_col_begin + col;
     const T value = (row <= col) ? R[row + col * ldr] : static_cast<T>(0);
     A_local[local_row + global_col * lda_local] = value;
-}
-
-template <typename T>
-__global__ void unpack_padded_allgather_panel_kernel(int world_size,
-                                                     int max_rows_per_rank,
-                                                     int panel_cols,
-                                                     int panel_rows_global,
-                                                     const T* gathered_padded_panel,
-                                                     const int* rows_per_rank,
-                                                     const int* row_offsets,
-                                                     T* panel_global) {
-    const int rank_id = blockIdx.z;
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    const int col = blockIdx.y * blockDim.y + threadIdx.y;
-    if (rank_id >= world_size || col >= panel_cols) {
-        return;
-    }
-
-    const int rows_this_rank = rows_per_rank[rank_id];
-    if (row >= rows_this_rank) {
-        return;
-    }
-
-    const size_t block_elems =
-        static_cast<size_t>(max_rows_per_rank) * static_cast<size_t>(panel_cols);
-    const size_t src_base = static_cast<size_t>(rank_id) * block_elems;
-    const size_t src =
-        src_base + static_cast<size_t>(row) + static_cast<size_t>(col) * max_rows_per_rank;
-
-    const int dst_row = row_offsets[rank_id] + row;
-    panel_global[static_cast<size_t>(dst_row) + static_cast<size_t>(col) * panel_rows_global] =
-        gathered_padded_panel[src];
 }
 
 template <typename T>
@@ -334,36 +301,25 @@ void distributed_blocked_qr_factorize(cublasHandle_t cublas_handle,
 
     AssertCublas(cublasSetStream(cublas_handle, compute_stream), "cublasSetStream(compute_stream)");
 
-    std::vector<RowPartition> rank_parts(static_cast<size_t>(part.world_size));
-    int max_rows_per_rank = 0;
-    for (int r = 0; r < part.world_size; ++r) {
-        rank_parts[static_cast<size_t>(r)] = MakeRowPartition(m, part.world_size, r);
-        max_rows_per_rank =
-            std::max(max_rows_per_rank, rank_parts[static_cast<size_t>(r)].local_rows);
-    }
+    const int local_rows_capacity = std::max(part.local_rows, 1);
+    const int compact_rows_capacity = local_rows_capacity + kPanelWidth;
 
     struct PersistentScratch {
         bool events_initialized = false;
-        int world_size = -1;
         int m_global = -1;
-        int max_rows_per_rank = -1;
+        int compact_rows_capacity = -1;
 
-        T* d_panel_padded = nullptr;
-        T* d_panel_allgather = nullptr;
-        T* d_panel_global = nullptr;
-        T* d_panel_w_global = nullptr;
-        T* d_panel_y_global = nullptr;
-        int* d_rows_per_rank = nullptr;
-        int* d_row_offsets = nullptr;
+        T* d_panel_top = nullptr;        // [kPanelWidth x kPanelWidth]
+        T* d_panel_compact = nullptr;    // [compact_rows_capacity x kPanelWidth]
+        T* d_panel_w_compact = nullptr;  // [compact_rows_capacity x kPanelWidth]
+        T* d_panel_y_compact = nullptr;  // [compact_rows_capacity x kPanelWidth]
 
         cudaEvent_t tsqr_done = {};
         cudaEvent_t allgather_done = {};
-        cudaEvent_t stage2_done = {};
-        cudaEvent_t bcast_done = {};
         cudaEvent_t tmp_local_done = {};
         cudaEvent_t tmp_allreduce_done = {};
-        cudaEvent_t panel_pack_done = {};
-        cudaEvent_t panel_allgather_done = {};
+        cudaEvent_t panel_top_pack_done = {};
+        cudaEvent_t panel_top_allreduce_done = {};
     };
     static PersistentScratch scratch;
 
@@ -372,79 +328,54 @@ void distributed_blocked_qr_factorize(cublasHandle_t cublas_handle,
                    "cudaEventCreate tsqr_done");
         AssertCuda(cudaEventCreateWithFlags(&scratch.allgather_done, cudaEventDisableTiming),
                    "cudaEventCreate allgather_done");
-        AssertCuda(cudaEventCreateWithFlags(&scratch.stage2_done, cudaEventDisableTiming),
-                   "cudaEventCreate stage2_done");
-        AssertCuda(cudaEventCreateWithFlags(&scratch.bcast_done, cudaEventDisableTiming),
-                   "cudaEventCreate bcast_done");
         AssertCuda(cudaEventCreateWithFlags(&scratch.tmp_local_done, cudaEventDisableTiming),
                    "cudaEventCreate tmp_local_done");
         AssertCuda(cudaEventCreateWithFlags(&scratch.tmp_allreduce_done, cudaEventDisableTiming),
                    "cudaEventCreate tmp_allreduce_done");
-        AssertCuda(cudaEventCreateWithFlags(&scratch.panel_pack_done, cudaEventDisableTiming),
-                   "cudaEventCreate panel_pack_done");
-        AssertCuda(cudaEventCreateWithFlags(&scratch.panel_allgather_done, cudaEventDisableTiming),
-                   "cudaEventCreate panel_allgather_done");
+        AssertCuda(cudaEventCreateWithFlags(&scratch.panel_top_pack_done, cudaEventDisableTiming),
+                   "cudaEventCreate panel_top_pack_done");
+        AssertCuda(
+            cudaEventCreateWithFlags(&scratch.panel_top_allreduce_done, cudaEventDisableTiming),
+            "cudaEventCreate panel_top_allreduce_done");
         scratch.events_initialized = true;
     }
 
-    if (scratch.world_size != part.world_size || scratch.m_global != m ||
-        scratch.max_rows_per_rank < max_rows_per_rank) {
-        if (scratch.d_panel_padded) {
-            AssertCuda(cudaFree(scratch.d_panel_padded), "cudaFree scratch.d_panel_padded");
-            AssertCuda(cudaFree(scratch.d_panel_allgather), "cudaFree scratch.d_panel_allgather");
-            AssertCuda(cudaFree(scratch.d_panel_global), "cudaFree scratch.d_panel_global");
-            AssertCuda(cudaFree(scratch.d_panel_w_global), "cudaFree scratch.d_panel_w_global");
-            AssertCuda(cudaFree(scratch.d_panel_y_global), "cudaFree scratch.d_panel_y_global");
-            AssertCuda(cudaFree(scratch.d_rows_per_rank), "cudaFree scratch.d_rows_per_rank");
-            AssertCuda(cudaFree(scratch.d_row_offsets), "cudaFree scratch.d_row_offsets");
+    if (scratch.m_global != m || scratch.compact_rows_capacity < compact_rows_capacity) {
+        if (scratch.d_panel_top) {
+            AssertCuda(cudaFree(scratch.d_panel_top), "cudaFree scratch.d_panel_top");
+            AssertCuda(cudaFree(scratch.d_panel_compact), "cudaFree scratch.d_panel_compact");
+            AssertCuda(cudaFree(scratch.d_panel_w_compact), "cudaFree scratch.d_panel_w_compact");
+            AssertCuda(cudaFree(scratch.d_panel_y_compact), "cudaFree scratch.d_panel_y_compact");
         }
 
-        const size_t padded_panel_elems =
-            static_cast<size_t>(std::max(max_rows_per_rank, 1)) * kPanelWidth;
-        const size_t gathered_panel_elems =
-            static_cast<size_t>(part.world_size) * padded_panel_elems;
-        const size_t global_panel_elems = static_cast<size_t>(m) * kPanelWidth;
+        const size_t panel_top_elems = static_cast<size_t>(kPanelWidth) * kPanelWidth;
+        const size_t panel_compact_elems = static_cast<size_t>(compact_rows_capacity) * kPanelWidth;
 
-        AssertCuda(cudaMalloc(&scratch.d_panel_padded, padded_panel_elems * sizeof(T)),
-                   "cudaMalloc scratch.d_panel_padded");
-        AssertCuda(cudaMalloc(&scratch.d_panel_allgather, gathered_panel_elems * sizeof(T)),
-                   "cudaMalloc scratch.d_panel_allgather");
-        AssertCuda(cudaMalloc(&scratch.d_panel_global, global_panel_elems * sizeof(T)),
-                   "cudaMalloc scratch.d_panel_global");
-        AssertCuda(cudaMalloc(&scratch.d_panel_w_global, global_panel_elems * sizeof(T)),
-                   "cudaMalloc scratch.d_panel_w_global");
-        AssertCuda(cudaMalloc(&scratch.d_panel_y_global, global_panel_elems * sizeof(T)),
-                   "cudaMalloc scratch.d_panel_y_global");
-        AssertCuda(cudaMalloc(&scratch.d_rows_per_rank,
-                              static_cast<size_t>(part.world_size) * sizeof(int)),
-                   "cudaMalloc scratch.d_rows_per_rank");
-        AssertCuda(
-            cudaMalloc(&scratch.d_row_offsets, static_cast<size_t>(part.world_size) * sizeof(int)),
-            "cudaMalloc scratch.d_row_offsets");
+        AssertCuda(cudaMalloc(&scratch.d_panel_top, panel_top_elems * sizeof(T)),
+                   "cudaMalloc scratch.d_panel_top");
+        AssertCuda(cudaMalloc(&scratch.d_panel_compact, panel_compact_elems * sizeof(T)),
+                   "cudaMalloc scratch.d_panel_compact");
+        AssertCuda(cudaMalloc(&scratch.d_panel_w_compact, panel_compact_elems * sizeof(T)),
+                   "cudaMalloc scratch.d_panel_w_compact");
+        AssertCuda(cudaMalloc(&scratch.d_panel_y_compact, panel_compact_elems * sizeof(T)),
+                   "cudaMalloc scratch.d_panel_y_compact");
 
-        scratch.world_size = part.world_size;
         scratch.m_global = m;
-        scratch.max_rows_per_rank = max_rows_per_rank;
+        scratch.compact_rows_capacity = compact_rows_capacity;
     }
 
-    T* d_panel_padded = scratch.d_panel_padded;
-    T* d_panel_allgather = scratch.d_panel_allgather;
-    T* d_panel_global = scratch.d_panel_global;
-    T* d_panel_w_global = scratch.d_panel_w_global;
-    T* d_panel_y_global = scratch.d_panel_y_global;
-    int* d_rows_per_rank = scratch.d_rows_per_rank;
-    int* d_row_offsets = scratch.d_row_offsets;
-    const int padded_rows = std::max(scratch.max_rows_per_rank, 1);
-    const size_t padded_panel_elems = static_cast<size_t>(padded_rows) * kPanelWidth;
+    T* d_panel_top = scratch.d_panel_top;
+    T* d_panel_compact = scratch.d_panel_compact;
+    T* d_panel_w_compact = scratch.d_panel_w_compact;
+    T* d_panel_y_compact = scratch.d_panel_y_compact;
+    const size_t panel_top_elems = static_cast<size_t>(kPanelWidth) * kPanelWidth;
 
     cudaEvent_t tsqr_done = scratch.tsqr_done;
     cudaEvent_t allgather_done = scratch.allgather_done;
-    cudaEvent_t stage2_done = scratch.stage2_done;
-    cudaEvent_t bcast_done = scratch.bcast_done;
     cudaEvent_t tmp_local_done = scratch.tmp_local_done;
     cudaEvent_t tmp_allreduce_done = scratch.tmp_allreduce_done;
-    cudaEvent_t panel_pack_done = scratch.panel_pack_done;
-    cudaEvent_t panel_allgather_done = scratch.panel_allgather_done;
+    cudaEvent_t panel_top_pack_done = scratch.panel_top_pack_done;
+    cudaEvent_t panel_top_allreduce_done = scratch.panel_top_allreduce_done;
 
     for (int outer = 0; outer < n; outer += nb) {
         const int end = std::min(outer + nb, n);
@@ -507,18 +438,6 @@ void distributed_blocked_qr_factorize(cublasHandle_t cublas_handle,
             tsqr<T>(cublas_handle, stack_rows, ws->d_r_stack, stack_rows, ws->d_r_global,
                     kPanelWidth, ws->d_tsqr_work_stack, ws->tsqr_work_stack_elems, compute_stream);
 
-            AssertCuda(cudaEventRecord(stage2_done, compute_stream), "cudaEventRecord stage2_done");
-            AssertCuda(cudaStreamWaitEvent(comm_stream, stage2_done, 0),
-                       "cudaStreamWaitEvent comm_stream <- stage2_done");
-
-            AssertNccl(ncclBroadcast(ws->d_r_global, ws->d_r_global,
-                                     static_cast<size_t>(kPanelWidth) * kPanelWidth, nccl_type, 0,
-                                     nccl_comm, comm_stream),
-                       "ncclBroadcast R_global");
-            AssertCuda(cudaEventRecord(bcast_done, comm_stream), "cudaEventRecord bcast_done");
-            AssertCuda(cudaStreamWaitEvent(compute_stream, bcast_done, 0),
-                       "cudaStreamWaitEvent compute_stream <- bcast_done");
-
             if (panel_rows_local > 0) {
                 T* q2_block = ws->d_r_stack + static_cast<size_t>(part.rank) * kPanelWidth;
                 AssertCublas(CublasGemmTraits<T>::Gemm(
@@ -534,81 +453,89 @@ void distributed_blocked_qr_factorize(cublasHandle_t cublas_handle,
                            "cudaMemcpy2DAsync panel tmp -> panel_A");
             }
 
-            std::vector<int> h_rows_per_rank(static_cast<size_t>(part.world_size), 0);
-            std::vector<int> h_row_offsets(static_cast<size_t>(part.world_size), 0);
-            int panel_rows_global = 0;
-            for (int r = 0; r < part.world_size; ++r) {
-                int unused_row_offset = 0;
-                int rows_this_rank = 0;
-                LocalSubRows(inner, m, rank_parts[static_cast<size_t>(r)], &unused_row_offset,
-                             &rows_this_rank);
-                h_rows_per_rank[static_cast<size_t>(r)] = rows_this_rank;
-                h_row_offsets[static_cast<size_t>(r)] = panel_rows_global;
-                panel_rows_global += rows_this_rank;
+            const int panel_global_begin = std::max(inner, part.row_start);
+            const int panel_row_idx_begin = panel_global_begin - inner;
+            int top_local_count = 0;
+            if (panel_rows_local > 0 && panel_row_idx_begin < kPanelWidth) {
+                top_local_count = std::min(panel_rows_local, kPanelWidth - panel_row_idx_begin);
+            }
+            const int below_local_count = panel_rows_local - top_local_count;
+            const int panel_compact_rows = kPanelWidth + below_local_count;
+
+            AssertCuda(cudaMemsetAsync(d_panel_top, 0, panel_top_elems * sizeof(T), compute_stream),
+                       "cudaMemsetAsync d_panel_top");
+            if (top_local_count > 0) {
+                AssertCuda(cudaMemcpy2DAsync(d_panel_top + panel_row_idx_begin,
+                                             static_cast<size_t>(kPanelWidth) * sizeof(T), panel_A,
+                                             static_cast<size_t>(lda_local) * sizeof(T),
+                                             static_cast<size_t>(top_local_count) * sizeof(T),
+                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
+                           "cudaMemcpy2DAsync panel_A(top) -> d_panel_top");
             }
 
-            AssertCuda(cudaMemcpyAsync(d_rows_per_rank, h_rows_per_rank.data(),
-                                       static_cast<size_t>(part.world_size) * sizeof(int),
-                                       cudaMemcpyHostToDevice, compute_stream),
-                       "cudaMemcpyAsync h_rows_per_rank -> d_rows_per_rank");
-            AssertCuda(cudaMemcpyAsync(d_row_offsets, h_row_offsets.data(),
-                                       static_cast<size_t>(part.world_size) * sizeof(int),
-                                       cudaMemcpyHostToDevice, compute_stream),
-                       "cudaMemcpyAsync h_row_offsets -> d_row_offsets");
+            AssertCuda(cudaEventRecord(panel_top_pack_done, compute_stream),
+                       "cudaEventRecord panel_top_pack_done");
+            AssertCuda(cudaStreamWaitEvent(comm_stream, panel_top_pack_done, 0),
+                       "cudaStreamWaitEvent comm_stream <- panel_top_pack_done");
 
-            AssertCuda(
-                cudaMemsetAsync(d_panel_padded, 0, padded_panel_elems * sizeof(T), compute_stream),
-                "cudaMemsetAsync d_panel_padded");
-            if (panel_rows_local > 0) {
-                AssertCuda(
-                    cudaMemcpy2DAsync(d_panel_padded, static_cast<size_t>(padded_rows) * sizeof(T),
-                                      panel_A, static_cast<size_t>(lda_local) * sizeof(T),
-                                      static_cast<size_t>(panel_rows_local) * sizeof(T),
-                                      kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
-                    "cudaMemcpy2DAsync panel_A -> d_panel_padded");
+            AssertNccl(ncclAllReduce(d_panel_top, d_panel_top,
+                                     static_cast<size_t>(kPanelWidth) * kPanelWidth, nccl_type,
+                                     ncclSum, nccl_comm, comm_stream),
+                       "ncclAllReduce panel top 32x32");
+            AssertCuda(cudaEventRecord(panel_top_allreduce_done, comm_stream),
+                       "cudaEventRecord panel_top_allreduce_done");
+            AssertCuda(cudaStreamWaitEvent(compute_stream, panel_top_allreduce_done, 0),
+                       "cudaStreamWaitEvent compute_stream <- panel_top_allreduce_done");
+
+            AssertCuda(cudaMemcpy2DAsync(d_panel_compact,
+                                         static_cast<size_t>(panel_compact_rows) * sizeof(T),
+                                         d_panel_top, static_cast<size_t>(kPanelWidth) * sizeof(T),
+                                         static_cast<size_t>(kPanelWidth) * sizeof(T), kPanelWidth,
+                                         cudaMemcpyDeviceToDevice, compute_stream),
+                       "cudaMemcpy2DAsync d_panel_top -> d_panel_compact");
+            if (below_local_count > 0) {
+                AssertCuda(cudaMemcpy2DAsync(d_panel_compact + kPanelWidth,
+                                             static_cast<size_t>(panel_compact_rows) * sizeof(T),
+                                             panel_A + top_local_count,
+                                             static_cast<size_t>(lda_local) * sizeof(T),
+                                             static_cast<size_t>(below_local_count) * sizeof(T),
+                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
+                           "cudaMemcpy2DAsync panel_A(below) -> d_panel_compact");
             }
 
-            AssertCuda(cudaEventRecord(panel_pack_done, compute_stream),
-                       "cudaEventRecord panel_pack_done");
-            AssertCuda(cudaStreamWaitEvent(comm_stream, panel_pack_done, 0),
-                       "cudaStreamWaitEvent comm_stream <- panel_pack_done");
+            generate_wy(panel_compact_rows, kPanelWidth, d_panel_compact, panel_compact_rows,
+                        d_panel_y_compact, panel_compact_rows, d_panel_w_compact,
+                        panel_compact_rows, compute_stream);
 
-            AssertNccl(ncclAllGather(d_panel_padded, d_panel_allgather, padded_panel_elems,
-                                     nccl_type, nccl_comm, comm_stream),
-                       "ncclAllGather panel padded");
-            AssertCuda(cudaEventRecord(panel_allgather_done, comm_stream),
-                       "cudaEventRecord panel_allgather_done");
-            AssertCuda(cudaStreamWaitEvent(compute_stream, panel_allgather_done, 0),
-                       "cudaStreamWaitEvent compute_stream <- panel_allgather_done");
-
-            {
-                const dim3 block_dim(16, 8, 1);
-                const dim3 grid_dim((padded_rows + block_dim.x - 1) / block_dim.x,
-                                    (kPanelWidth + block_dim.y - 1) / block_dim.y, part.world_size);
-                unpack_padded_allgather_panel_kernel<<<grid_dim, block_dim, 0, compute_stream>>>(
-                    part.world_size, padded_rows, kPanelWidth, panel_rows_global, d_panel_allgather,
-                    d_rows_per_rank, d_row_offsets, d_panel_global);
-                AssertCuda(cudaGetLastError(), "unpack_padded_allgather_panel_kernel launch");
-            }
-
-            generate_wy(panel_rows_global, kPanelWidth, d_panel_global, panel_rows_global,
-                        d_panel_y_global, panel_rows_global, d_panel_w_global, panel_rows_global,
-                        compute_stream);
-
-            if (panel_rows_local > 0) {
-                const int panel_rank_row_offset = h_row_offsets[static_cast<size_t>(part.rank)];
+            if (top_local_count > 0) {
                 AssertCuda(cudaMemcpy2DAsync(panel_Y, static_cast<size_t>(lda_local) * sizeof(T),
-                                             d_panel_y_global + panel_rank_row_offset,
-                                             static_cast<size_t>(panel_rows_global) * sizeof(T),
-                                             static_cast<size_t>(panel_rows_local) * sizeof(T),
+                                             d_panel_y_compact + panel_row_idx_begin,
+                                             static_cast<size_t>(panel_compact_rows) * sizeof(T),
+                                             static_cast<size_t>(top_local_count) * sizeof(T),
                                              kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
-                           "cudaMemcpy2DAsync d_panel_y_global -> panel_Y");
+                           "cudaMemcpy2DAsync d_panel_y_compact(top) -> panel_Y");
                 AssertCuda(cudaMemcpy2DAsync(panel_W, static_cast<size_t>(lda_local) * sizeof(T),
-                                             d_panel_w_global + panel_rank_row_offset,
-                                             static_cast<size_t>(panel_rows_global) * sizeof(T),
-                                             static_cast<size_t>(panel_rows_local) * sizeof(T),
+                                             d_panel_w_compact + panel_row_idx_begin,
+                                             static_cast<size_t>(panel_compact_rows) * sizeof(T),
+                                             static_cast<size_t>(top_local_count) * sizeof(T),
                                              kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
-                           "cudaMemcpy2DAsync d_panel_w_global -> panel_W");
+                           "cudaMemcpy2DAsync d_panel_w_compact(top) -> panel_W");
+            }
+            if (below_local_count > 0) {
+                AssertCuda(cudaMemcpy2DAsync(panel_Y + top_local_count,
+                                             static_cast<size_t>(lda_local) * sizeof(T),
+                                             d_panel_y_compact + kPanelWidth,
+                                             static_cast<size_t>(panel_compact_rows) * sizeof(T),
+                                             static_cast<size_t>(below_local_count) * sizeof(T),
+                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
+                           "cudaMemcpy2DAsync d_panel_y_compact(below) -> panel_Y");
+                AssertCuda(cudaMemcpy2DAsync(panel_W + top_local_count,
+                                             static_cast<size_t>(lda_local) * sizeof(T),
+                                             d_panel_w_compact + kPanelWidth,
+                                             static_cast<size_t>(panel_compact_rows) * sizeof(T),
+                                             static_cast<size_t>(below_local_count) * sizeof(T),
+                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
+                           "cudaMemcpy2DAsync d_panel_w_compact(below) -> panel_W");
             }
 
             {
