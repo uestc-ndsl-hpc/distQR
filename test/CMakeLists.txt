@@ -20,3 +20,11 @@ target_link_libraries(test_nccl_init PRIVATE CUDA::cudart MPI::MPI_CXX spdlog::s
 add_executable(test_single_card_qr test_single_card_qr.cu)
 target_link_libraries(test_single_card_qr PRIVATE GTest::gtest_main CUDA::cublas CUDA::cusolver CUDA::curand CUDA::cudart spdlog::spdlog)
 target_include_directories(test_single_card_qr PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+add_executable(test_dist_blocked_qr test_dist_blocked_qr.cu)
+target_include_directories(test_dist_blocked_qr PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_dist_blocked_qr PRIVATE CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL)
+
+add_executable(test_dist_blocked_qr_correctness test_dist_blocked_qr_correctness.cu)
+target_include_directories(test_dist_blocked_qr_correctness PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_dist_blocked_qr_correctness PRIVATE GTest::gtest CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL)
