@@ -12,6 +12,7 @@
 #include <cstring>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "components/distributed_blocked_qr_col.cuh"
 #include "components/resourse_initial.cuh"
@@ -66,6 +67,8 @@ struct Options {
     int warmup = 1;
     int iters = 3;
     int overlap_tile = 0;
+    bool print_per_rank = false;
+    bool print_comm_bw = false;
 };
 
 Options ParseArgs(int argc, char** argv) {
@@ -83,6 +86,10 @@ Options ParseArgs(int argc, char** argv) {
             opts.iters = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--overlap_tile") == 0 && i + 1 < argc) {
             opts.overlap_tile = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--print_per_rank") == 0) {
+            opts.print_per_rank = true;
+        } else if (std::strcmp(argv[i], "--print_comm_bw") == 0) {
+            opts.print_comm_bw = true;
         }
     }
     return opts;
@@ -142,6 +149,7 @@ int main(int argc, char** argv) {
     const int tile_cols = std::max(kPanelWidth, std::min(tile_target, opts.nb));
     distributed_qr_col::DistributedQrColWorkspace<float> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<float>(opts.m), static_cast<size_t>(1));
+    ws.panel_storage_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
     ws.tmp_elems = static_cast<size_t>(kPanelWidth) * static_cast<size_t>(tile_cols);
 
     distributed_qr_col::AssertCuda(
@@ -151,10 +159,10 @@ int main(int argc, char** argv) {
         cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(float)),
         "cudaMalloc ws.d_tsqr_work_panel");
     distributed_qr_col::AssertCuda(
-        cudaMalloc(&ws.d_panel_w, static_cast<size_t>(opts.m) * kPanelWidth * sizeof(float)),
+        cudaMalloc(&ws.d_panel_w, ws.panel_storage_elems * sizeof(float)),
         "cudaMalloc ws.d_panel_w");
     distributed_qr_col::AssertCuda(
-        cudaMalloc(&ws.d_panel_y, static_cast<size_t>(opts.m) * kPanelWidth * sizeof(float)),
+        cudaMalloc(&ws.d_panel_y, ws.panel_storage_elems * sizeof(float)),
         "cudaMalloc ws.d_panel_y");
     distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(float)),
                                    "cudaMalloc ws.d_tmp0");
@@ -195,7 +203,22 @@ int main(int argc, char** argv) {
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
-    const double t0 = MPI_Wtime();
+    const double t0_global = MPI_Wtime();
+    const double t0_local = MPI_Wtime();
+    std::vector<cudaEvent_t> comm_start_events;
+    std::vector<cudaEvent_t> comm_end_events;
+    std::vector<unsigned long long> comm_bytes_per_iter;
+    if (opts.print_comm_bw) {
+        comm_start_events.resize(opts.iters, nullptr);
+        comm_end_events.resize(opts.iters, nullptr);
+        comm_bytes_per_iter.resize(opts.iters, 0ULL);
+        for (int i = 0; i < opts.iters; ++i) {
+            distributed_qr_col::AssertCuda(cudaEventCreate(&comm_start_events[i]),
+                                           "cudaEventCreate comm_start");
+            distributed_qr_col::AssertCuda(cudaEventCreate(&comm_end_events[i]),
+                                           "cudaEventCreate comm_end");
+        }
+    }
 
     for (int i = 0; i < opts.iters; ++i) {
         distributed_qr_col::AssertCuda(cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(float),
@@ -207,10 +230,20 @@ int main(int argc, char** argv) {
         distributed_qr_col::AssertCuda(
             cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(float), compute_stream),
             "cudaMemsetAsync timed Y");
-
+        distributed_qr_col::CommProfile comm_profile{};
+        if (opts.print_comm_bw) {
+            distributed_qr_col::AssertCuda(cudaEventRecord(comm_start_events[i], comm_stream),
+                                           "cudaEventRecord comm_start");
+        }
         distributed_qr_col::distributed_blocked_qr_factorize_col<float>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
-            &ws, compute_stream, comm_stream, opts.overlap_tile);
+            &ws, compute_stream, comm_stream, opts.overlap_tile,
+            opts.print_comm_bw ? &comm_profile : nullptr);
+        if (opts.print_comm_bw) {
+            distributed_qr_col::AssertCuda(cudaEventRecord(comm_end_events[i], comm_stream),
+                                           "cudaEventRecord comm_end");
+            comm_bytes_per_iter[i] = static_cast<unsigned long long>(comm_profile.bytes);
+        }
     }
 
     distributed_qr_col::AssertCuda(cudaStreamSynchronize(compute_stream),
@@ -218,12 +251,55 @@ int main(int argc, char** argv) {
     distributed_qr_col::AssertCuda(cudaStreamSynchronize(comm_stream),
                                    "cudaStreamSynchronize timed comm");
 
+    const double t1_local = MPI_Wtime();
     MPI_Barrier(MPI_COMM_WORLD);
-    const double t1 = MPI_Wtime();
+    const double t1_global = MPI_Wtime();
 
-    const double local_ms = (t1 - t0) * 1000.0 / static_cast<double>(opts.iters);
+    const double local_ms = (t1_global - t0_global) * 1000.0 / static_cast<double>(opts.iters);
+    const double local_ms_no_barrier =
+        (t1_local - t0_local) * 1000.0 / static_cast<double>(opts.iters);
+    double local_comm_ms = 0.0;
+    unsigned long long local_comm_bytes = 0ULL;
+    if (opts.print_comm_bw) {
+        for (int i = 0; i < opts.iters; ++i) {
+            float ms = 0.0f;
+            distributed_qr_col::AssertCuda(
+                cudaEventElapsedTime(&ms, comm_start_events[i], comm_end_events[i]),
+                "cudaEventElapsedTime comm");
+            local_comm_ms += static_cast<double>(ms);
+            local_comm_bytes += comm_bytes_per_iter[i];
+        }
+        local_comm_ms /= static_cast<double>(opts.iters);
+        local_comm_bytes /= static_cast<unsigned long long>(opts.iters);
+    }
     double max_ms = 0.0;
     MPI_Reduce(&local_ms, &max_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    std::vector<double> all_local_ms;
+    std::vector<double> all_local_ms_no_barrier;
+    std::vector<double> all_local_comm_ms;
+    std::vector<unsigned long long> all_local_comm_bytes;
+    if (opts.print_per_rank && env.rank == 0) {
+        all_local_ms.resize(env.size, 0.0);
+        all_local_ms_no_barrier.resize(env.size, 0.0);
+    }
+    if (opts.print_comm_bw && env.rank == 0) {
+        all_local_comm_ms.resize(env.size, 0.0);
+        all_local_comm_bytes.resize(env.size, 0ULL);
+    }
+    MPI_Gather(&local_ms, 1, MPI_DOUBLE,
+               (opts.print_per_rank && env.rank == 0) ? all_local_ms.data() : nullptr, 1,
+               MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gather(&local_ms_no_barrier, 1, MPI_DOUBLE,
+               (opts.print_per_rank && env.rank == 0) ? all_local_ms_no_barrier.data() : nullptr, 1,
+               MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    if (opts.print_comm_bw) {
+        MPI_Gather(&local_comm_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_comm_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_bytes, 1, MPI_UNSIGNED_LONG_LONG,
+                   (env.rank == 0) ? all_local_comm_bytes.data() : nullptr, 1,
+                   MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+    }
 
     unsigned long long* d_bad = nullptr;
     distributed_qr_col::AssertCuda(cudaMalloc(&d_bad, sizeof(unsigned long long)),
@@ -250,8 +326,35 @@ int main(int argc, char** argv) {
             "Distributed blocked QR [col-partition] (float): m={} n={} nb={} tile={} np={} avg "
             "{:.3f} ms",
             opts.m, opts.n, opts.nb, effective_tile, env.size, max_ms);
+        if (opts.print_per_rank) {
+            for (int r = 0; r < env.size; ++r) {
+                spdlog::info("Per-rank time: rank {} -> {:.3f} ms (no-barrier {:.3f} ms)", r,
+                             all_local_ms[r], all_local_ms_no_barrier[r]);
+            }
+        }
+        if (opts.print_comm_bw) {
+            for (int r = 0; r < env.size; ++r) {
+                const double bytes_gb = static_cast<double>(all_local_comm_bytes[r]) / 1.0e9;
+                const double bw_gbps = (all_local_comm_ms[r] > 0.0)
+                                           ? (bytes_gb / (all_local_comm_ms[r] / 1000.0))
+                                           : 0.0;
+                spdlog::info("Per-rank comm(event): rank {} -> {:.3f} ms, {:.3f} MiB, {:.3f} GB/s",
+                             r, all_local_comm_ms[r],
+                             static_cast<double>(all_local_comm_bytes[r]) / (1024.0 * 1024.0),
+                             bw_gbps);
+            }
+        }
         if (total_bad > 0) {
             spdlog::error("Detected {} non-finite values after factorization.", total_bad);
+        }
+    }
+
+    if (opts.print_comm_bw) {
+        for (int i = 0; i < opts.iters; ++i) {
+            distributed_qr_col::AssertCuda(cudaEventDestroy(comm_start_events[i]),
+                                           "cudaEventDestroy comm_start");
+            distributed_qr_col::AssertCuda(cudaEventDestroy(comm_end_events[i]),
+                                           "cudaEventDestroy comm_end");
         }
     }
 
