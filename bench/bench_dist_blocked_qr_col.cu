@@ -224,11 +224,16 @@ int main(int argc, char** argv) {
     cudaEvent_t timed_start = nullptr;
     cudaEvent_t timed_stop = nullptr;
     cudaEvent_t timed_comm_done = nullptr;
+    cudaEvent_t inactive_event = nullptr;
     distributed_qr_col::AssertCuda(cudaEventCreate(&timed_start), "cudaEventCreate timed_start");
     distributed_qr_col::AssertCuda(cudaEventCreate(&timed_stop), "cudaEventCreate timed_stop");
     distributed_qr_col::AssertCuda(
         cudaEventCreateWithFlags(&timed_comm_done, cudaEventDisableTiming),
         "cudaEventCreate timed_comm_done");
+    if (opts.print_per_rank) {
+        distributed_qr_col::AssertCuda(cudaEventCreate(&inactive_event),
+                                       "cudaEventCreate inactive_event");
+    }
     std::vector<cudaEvent_t> comm_start_events;
     std::vector<cudaEvent_t> comm_end_events;
     std::vector<unsigned long long> comm_bytes_per_iter;
@@ -245,6 +250,7 @@ int main(int argc, char** argv) {
     }
 
     float timed_total_ms = 0.0f;
+    float inactive_total_ms = 0.0f;
     distributed_qr_col::ActivityProfile activity{};
     for (int i = 0; i < opts.iters; ++i) {
         distributed_qr_col::AssertCuda(cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(float),
@@ -264,6 +270,7 @@ int main(int argc, char** argv) {
         distributed_qr_col::AssertCuda(cudaEventRecord(timed_start, compute_stream),
                                        "cudaEventRecord timed_start");
         activity = distributed_qr_col::ActivityProfile{};
+        activity.inactive_event = inactive_event;
         distributed_qr_col::distributed_blocked_qr_factorize_col<float>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
@@ -285,9 +292,22 @@ int main(int argc, char** argv) {
         distributed_qr_col::AssertCuda(cudaEventElapsedTime(&iter_ms, timed_start, timed_stop),
                                        "cudaEventElapsedTime timed");
         timed_total_ms += iter_ms;
+        if (opts.print_per_rank && inactive_event) {
+            distributed_qr_col::AssertCuda(cudaEventSynchronize(inactive_event),
+                                           "cudaEventSynchronize inactive_event");
+            float iter_inactive_ms = 0.0f;
+            distributed_qr_col::AssertCuda(
+                cudaEventElapsedTime(&iter_inactive_ms, timed_start, inactive_event),
+                "cudaEventElapsedTime inactive");
+            inactive_total_ms += iter_inactive_ms;
+        }
     }
     const double local_ms = static_cast<double>(timed_total_ms) / static_cast<double>(opts.iters);
     const double local_ms_no_barrier = local_ms;
+    const double local_inactive_ms =
+        (opts.print_per_rank && inactive_event)
+            ? (static_cast<double>(inactive_total_ms) / static_cast<double>(opts.iters))
+            : 0.0;
     double local_comm_ms = 0.0;
     unsigned long long local_comm_bytes = 0ULL;
     if (opts.print_comm_bw) {
@@ -306,15 +326,21 @@ int main(int argc, char** argv) {
     distributed_qr_col::AssertCuda(cudaEventDestroy(timed_stop), "cudaEventDestroy timed_stop");
     distributed_qr_col::AssertCuda(cudaEventDestroy(timed_comm_done),
                                    "cudaEventDestroy timed_comm_done");
+    if (inactive_event) {
+        distributed_qr_col::AssertCuda(cudaEventDestroy(inactive_event),
+                                       "cudaEventDestroy inactive_event");
+    }
     double max_ms = 0.0;
     MPI_Reduce(&local_ms, &max_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     std::vector<double> all_local_ms;
     std::vector<double> all_local_ms_no_barrier;
+    std::vector<double> all_local_inactive_ms;
     std::vector<double> all_local_comm_ms;
     std::vector<unsigned long long> all_local_comm_bytes;
     if (opts.print_per_rank && env.rank == 0) {
         all_local_ms.resize(env.size, 0.0);
         all_local_ms_no_barrier.resize(env.size, 0.0);
+        all_local_inactive_ms.resize(env.size, 0.0);
     }
     std::vector<int> all_last_owner_panel;
     std::vector<int> all_last_recv_panel;
@@ -335,6 +361,9 @@ int main(int argc, char** argv) {
                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Gather(&local_ms_no_barrier, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_local_ms_no_barrier.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_inactive_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_inactive_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
         MPI_Gather(&activity.last_owner_panel, 1, MPI_INT,
                    (env.rank == 0) ? all_last_owner_panel.data() : nullptr, 1, MPI_INT, 0,
@@ -392,6 +421,8 @@ int main(int argc, char** argv) {
                     "last_inblock_update={}",
                     r, all_inactive_from_panel[r], all_last_owner_panel[r], all_last_recv_panel[r],
                     all_last_inblock_panel[r]);
+                spdlog::info("Per-rank inactive(gpu): rank {} -> {:.3f} ms", r,
+                             all_local_inactive_ms[r]);
             }
         }
         if (opts.print_comm_bw) {

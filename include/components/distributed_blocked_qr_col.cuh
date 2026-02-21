@@ -144,6 +144,10 @@ struct ActivityProfile {
     unsigned long long owner_panels = 0ULL;
     unsigned long long recv_panels = 0ULL;
     unsigned long long inblock_updates = 0ULL;
+    // Optional: if provided, record an event on compute_stream once this rank becomes inactive
+    // (i.e. once block_begin >= col_end). This is intended for benchmarking/diagnostics only.
+    cudaEvent_t inactive_event = nullptr;
+    bool inactive_event_recorded = false;
 };
 
 template <typename T>
@@ -489,6 +493,14 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
         activity_profile->inactive_from_panel = part.col_end / kPanelWidth;
     }
     for (int block_begin = 0; block_begin < n; block_begin += panel_block_cols) {
+        if (activity_profile && !activity_profile->inactive_event_recorded &&
+            block_begin >= part.col_end) {
+            if (activity_profile->inactive_event) {
+                AssertCuda(cudaEventRecord(activity_profile->inactive_event, compute_stream),
+                           "cudaEventRecord inactive_event");
+            }
+            activity_profile->inactive_event_recorded = true;
+        }
         if (allow_rank_early_exit && block_begin >= part.col_end) {
             // This rank owns no columns in/after this block and will never be an owner again.
             // It can return early to allow the application to schedule other GPU work.
@@ -791,6 +803,15 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
                                        cols_local, tile_cols, w_big, y_big, m, a_trail, lda_local,
                                        ws->d_tmp0, ws->d_tmp1);
         }
+    }
+    if (activity_profile && !activity_profile->inactive_event_recorded) {
+        // Ranks that own columns through the end of the matrix never hit block_begin >= col_end.
+        // Record at function end to provide a valid "inactive after done" timestamp.
+        if (activity_profile->inactive_event) {
+            AssertCuda(cudaEventRecord(activity_profile->inactive_event, compute_stream),
+                       "cudaEventRecord inactive_event(end)");
+        }
+        activity_profile->inactive_event_recorded = true;
     }
 }
 
