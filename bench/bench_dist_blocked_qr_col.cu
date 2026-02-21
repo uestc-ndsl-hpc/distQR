@@ -67,6 +67,7 @@ struct Options {
     int warmup = 1;
     int iters = 3;
     int overlap_tile = 0;
+    bool rank_early_exit = false;
     bool print_per_rank = false;
     bool print_comm_bw = false;
 };
@@ -86,6 +87,8 @@ Options ParseArgs(int argc, char** argv) {
             opts.iters = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--overlap_tile") == 0 && i + 1 < argc) {
             opts.overlap_tile = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--rank_early_exit") == 0) {
+            opts.rank_early_exit = true;
         } else if (std::strcmp(argv[i], "--print_per_rank") == 0) {
             opts.print_per_rank = true;
         } else if (std::strcmp(argv[i], "--print_comm_bw") == 0) {
@@ -123,8 +126,9 @@ int main(int argc, char** argv) {
     }
     if (opts.warmup < 0 || opts.iters <= 0) {
         if (env.rank == 0) {
-            spdlog::error("Invalid args: require warmup >= 0 and iters > 0 (got warmup={} iters={})",
-                          opts.warmup, opts.iters);
+            spdlog::error(
+                "Invalid args: require warmup >= 0 and iters > 0 (got warmup={} iters={})",
+                opts.warmup, opts.iters);
         }
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);
@@ -168,12 +172,10 @@ int main(int argc, char** argv) {
     distributed_qr_col::AssertCuda(
         cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(float)),
         "cudaMalloc ws.d_tsqr_work_panel");
-    distributed_qr_col::AssertCuda(
-        cudaMalloc(&ws.d_pack_w, ws.pack_elems * sizeof(float)),
-        "cudaMalloc ws.d_pack_w");
-    distributed_qr_col::AssertCuda(
-        cudaMalloc(&ws.d_pack_y, ws.pack_elems * sizeof(float)),
-        "cudaMalloc ws.d_pack_y");
+    distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_pack_w, ws.pack_elems * sizeof(float)),
+                                   "cudaMalloc ws.d_pack_w");
+    distributed_qr_col::AssertCuda(cudaMalloc(&ws.d_pack_y, ws.pack_elems * sizeof(float)),
+                                   "cudaMalloc ws.d_pack_y");
     distributed_qr_col::AssertCuda(
         cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(float)),
         "cudaMalloc ws.d_block_w");
@@ -211,7 +213,8 @@ int main(int argc, char** argv) {
 
         distributed_qr_col::distributed_blocked_qr_factorize_col<float>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
-            &ws, compute_stream, comm_stream, opts.overlap_tile);
+            &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.rank_early_exit,
+            nullptr);
         distributed_qr_col::AssertCuda(cudaStreamSynchronize(compute_stream),
                                        "cudaStreamSynchronize warmup compute");
         distributed_qr_col::AssertCuda(cudaStreamSynchronize(comm_stream),
@@ -242,6 +245,7 @@ int main(int argc, char** argv) {
     }
 
     float timed_total_ms = 0.0f;
+    distributed_qr_col::ActivityProfile activity{};
     for (int i = 0; i < opts.iters; ++i) {
         distributed_qr_col::AssertCuda(cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(float),
                                                        cudaMemcpyDeviceToDevice, compute_stream),
@@ -259,10 +263,11 @@ int main(int argc, char** argv) {
         }
         distributed_qr_col::AssertCuda(cudaEventRecord(timed_start, compute_stream),
                                        "cudaEventRecord timed_start");
+        activity = distributed_qr_col::ActivityProfile{};
         distributed_qr_col::distributed_blocked_qr_factorize_col<float>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
-            opts.print_comm_bw ? &comm_profile : nullptr);
+            opts.print_comm_bw ? &comm_profile : nullptr, opts.rank_early_exit, &activity);
         if (opts.print_comm_bw) {
             distributed_qr_col::AssertCuda(cudaEventRecord(comm_end_events[i], comm_stream),
                                            "cudaEventRecord comm_end");
@@ -311,6 +316,16 @@ int main(int argc, char** argv) {
         all_local_ms.resize(env.size, 0.0);
         all_local_ms_no_barrier.resize(env.size, 0.0);
     }
+    std::vector<int> all_last_owner_panel;
+    std::vector<int> all_last_recv_panel;
+    std::vector<int> all_last_inblock_panel;
+    std::vector<int> all_inactive_from_panel;
+    if (opts.print_per_rank && env.rank == 0) {
+        all_last_owner_panel.resize(env.size, -1);
+        all_last_recv_panel.resize(env.size, -1);
+        all_last_inblock_panel.resize(env.size, -1);
+        all_inactive_from_panel.resize(env.size, -1);
+    }
     if (opts.print_comm_bw && env.rank == 0) {
         all_local_comm_ms.resize(env.size, 0.0);
         all_local_comm_bytes.resize(env.size, 0ULL);
@@ -320,6 +335,18 @@ int main(int argc, char** argv) {
                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Gather(&local_ms_no_barrier, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_local_ms_no_barrier.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&activity.last_owner_panel, 1, MPI_INT,
+                   (env.rank == 0) ? all_last_owner_panel.data() : nullptr, 1, MPI_INT, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&activity.last_recv_panel, 1, MPI_INT,
+                   (env.rank == 0) ? all_last_recv_panel.data() : nullptr, 1, MPI_INT, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&activity.last_inblock_update_panel, 1, MPI_INT,
+                   (env.rank == 0) ? all_last_inblock_panel.data() : nullptr, 1, MPI_INT, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&activity.inactive_from_panel, 1, MPI_INT,
+                   (env.rank == 0) ? all_inactive_from_panel.data() : nullptr, 1, MPI_INT, 0,
                    MPI_COMM_WORLD);
     }
     if (opts.print_comm_bw) {
@@ -360,6 +387,11 @@ int main(int argc, char** argv) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms (no-barrier {:.3f} ms)", r,
                              all_local_ms[r], all_local_ms_no_barrier[r]);
+                spdlog::info(
+                    "Per-rank active(panels): rank {} inactive_from={} last_owner={} last_recv={} "
+                    "last_inblock_update={}",
+                    r, all_inactive_from_panel[r], all_last_owner_panel[r], all_last_recv_panel[r],
+                    all_last_inblock_panel[r]);
             }
         }
         if (opts.print_comm_bw) {

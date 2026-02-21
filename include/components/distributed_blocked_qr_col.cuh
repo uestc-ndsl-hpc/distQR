@@ -135,6 +135,17 @@ struct CommProfile {
     size_t bytes = 0;
 };
 
+struct ActivityProfile {
+    int last_owner_panel = -1;
+    int last_recv_panel = -1;
+    int last_inblock_update_panel = -1;
+    int inactive_from_panel = -1;
+    int inactive_from_inner = -1;
+    unsigned long long owner_panels = 0ULL;
+    unsigned long long recv_panels = 0ULL;
+    unsigned long long inblock_updates = 0ULL;
+};
+
 template <typename T>
 void panel_update_tile_pipeline(cublasHandle_t cublas_handle,
                                 cudaStream_t compute_stream,
@@ -272,16 +283,14 @@ void panel_update_one_shot(cublasHandle_t cublas_handle,
     const T minus_one = static_cast<T>(-1);
 
     T* a_sub = A_trail + panel_col;
-    AssertCublas(
-        CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kPanelWidth, cols_local,
-                                  panel_rows, &one, W, lda_wy, a_sub, lda_local, &zero, work,
-                                  kPanelWidth),
-        "in-block work = W^T * A");
-    AssertCublas(
-        CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_rows, cols_local,
-                                  kPanelWidth, &minus_one, Y, lda_wy, work, kPanelWidth, &one,
-                                  a_sub, lda_local),
-        "in-block A -= Y * work");
+    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kPanelWidth,
+                                           cols_local, panel_rows, &one, W, lda_wy, a_sub,
+                                           lda_local, &zero, work, kPanelWidth),
+                 "in-block work = W^T * A");
+    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_rows,
+                                           cols_local, kPanelWidth, &minus_one, Y, lda_wy, work,
+                                           kPanelWidth, &one, a_sub, lda_local),
+                 "in-block A -= Y * work");
 }
 
 template <typename T>
@@ -344,10 +353,10 @@ void block_update_tile_pipeline(cublasHandle_t cublas_handle,
 
         AssertCuda(cudaStreamWaitEvent(compute_stream, events.apply_done[idx], 0),
                    "cudaStreamWaitEvent compute_stream <- apply_done[idx]");
-        AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, k, width,
-                                               rows, &one, W, lda_wy, a_tile_sub, lda_local,
-                                               &zero, tmps[idx], k),
-                     "tmp = W^T * A_tile");
+        AssertCublas(
+            CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, k, width, rows, &one,
+                                      W, lda_wy, a_tile_sub, lda_local, &zero, tmps[idx], k),
+            "tmp = W^T * A_tile");
         AssertCuda(cudaEventRecord(events.gemm1_done[idx], compute_stream),
                    "cudaEventRecord gemm1_done[idx]");
 
@@ -359,11 +368,10 @@ void block_update_tile_pipeline(cublasHandle_t cublas_handle,
             T* a_prev_sub = a_tiles[prev] + row_offset;
             AssertCuda(cudaStreamWaitEvent(compute_stream, events.gemm1_done[prev], 0),
                        "cudaStreamWaitEvent compute_stream <- gemm1_done[prev]");
-            AssertCublas(
-                CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, rows,
-                                          widths[prev], k, &minus_one, Y, lda_wy, tmps[prev], k,
-                                          &one, a_prev_sub, lda_local),
-                "A_tile -= Y * tmp");
+            AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, rows,
+                                                   widths[prev], k, &minus_one, Y, lda_wy,
+                                                   tmps[prev], k, &one, a_prev_sub, lda_local),
+                         "A_tile -= Y * tmp");
             AssertCuda(cudaEventRecord(events.apply_done[prev], compute_stream),
                        "cudaEventRecord apply_done[prev]");
         }
@@ -375,8 +383,8 @@ void block_update_tile_pipeline(cublasHandle_t cublas_handle,
         AssertCuda(cudaStreamWaitEvent(compute_stream, events.gemm1_done[last], 0),
                    "cudaStreamWaitEvent compute_stream <- gemm1_done[last]");
         AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, rows,
-                                              widths[last], k, &minus_one, Y, lda_wy, tmps[last], k,
-                                              &one, a_last_sub, lda_local),
+                                               widths[last], k, &minus_one, Y, lda_wy, tmps[last],
+                                               k, &one, a_last_sub, lda_local),
                      "A_last -= Y * tmp");
         AssertCuda(cudaEventRecord(events.apply_done[last], compute_stream),
                    "cudaEventRecord apply_done[last]");
@@ -398,7 +406,9 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
                                           cudaStream_t compute_stream,
                                           cudaStream_t comm_stream,
                                           int overlap_tile_cols = 0,
-                                          CommProfile* comm_profile = nullptr) {
+                                          CommProfile* comm_profile = nullptr,
+                                          bool allow_rank_early_exit = false,
+                                          ActivityProfile* activity_profile = nullptr) {
     if (!ws) {
         spdlog::error("distributed_blocked_qr_factorize_col got null workspace.");
         std::exit(1);
@@ -467,16 +477,38 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
     }
 
     const int total_panels = n / kPanelWidth;
+    std::vector<int> col_end_by_rank;
+    if (part.world_size > 1) {
+        col_end_by_rank.resize(part.world_size, 0);
+        for (int r = 0; r < part.world_size; ++r) {
+            col_end_by_rank[r] = MakeColPartition(n, part.world_size, r).col_end;
+        }
+    }
+    if (activity_profile) {
+        activity_profile->inactive_from_inner = part.col_end;
+        activity_profile->inactive_from_panel = part.col_end / kPanelWidth;
+    }
     for (int block_begin = 0; block_begin < n; block_begin += panel_block_cols) {
+        if (allow_rank_early_exit && block_begin >= part.col_end) {
+            // This rank owns no columns in/after this block and will never be an owner again.
+            // It can return early to allow the application to schedule other GPU work.
+            //
+            // WARNING: after returning early, do not start new NCCL operations on the same
+            // ncclComm_t until all ranks are done with this QR, or you'll risk call-order mismatch.
+            return;
+        }
         const int block_end = std::min(block_begin + panel_block_cols, n);
         const int kb = block_end - block_begin;
 
-        // Even if this rank has no local columns in/after this block, it must still
-        // participate in panel broadcasts to match send/recv.
+        // Ranks with no local columns to the right of a panel do not need its W/Y and can
+        // skip receiving/scattering that panel entirely (they will never be owners later).
 
         // Build block-level WY factors in ws->d_block_{w,y} for this nb-block.
         // Only the rows [block_begin, m) are used by the block update.
         for (int inner = block_begin; inner < block_end; inner += kPanelWidth) {
+            if (allow_rank_early_exit && inner >= part.col_end) {
+                return;
+            }
             const int panel_idx = inner / kPanelWidth;
             const int owner = OwnerOfPanel(panel_idx, total_panels, part.world_size);
             const int panel_rows = m - inner;
@@ -487,10 +519,16 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
                 continue;
             }
 
-            // Owner computes the panel WY in packed form, then updates W_i using the current
-            // block WY (single-GPU style), then broadcasts packed W/Y to all ranks.
+            const bool self_needs_panel = (part.col_end > inner + kPanelWidth);
+
+            // Owner computes the panel WY in packed form, then updates W_i so that stacking
+            // within the block forms a single compact WY transform, then broadcasts packed W/Y.
             bool owner_prepared = false;
             if (part.rank == owner) {
+                if (activity_profile) {
+                    activity_profile->last_owner_panel = panel_idx;
+                    activity_profile->owner_panels += 1ULL;
+                }
                 const int local_panel_col = inner - part.col_start;
                 const bool owner_has_panel =
                     (local_panel_col >= 0) && (local_panel_col + kPanelWidth <= part.local_cols);
@@ -505,70 +543,24 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
                     generate_wy<T>(panel_rows, kPanelWidth, panel_A_sub, lda_local, ws->d_pack_y,
                                    panel_rows, ws->d_pack_w, panel_rows, compute_stream);
 
-                    // Update W_i in packed buffer so that stacking within the block forms a
-                    // single compact WY transform (same recurrence as row-partition/single GPU).
-                    if (k_prev > 0) {
-                        const T one = static_cast<T>(1);
-                        const T zero = static_cast<T>(0);
-                        const T minus_one = static_cast<T>(-1);
-
-                        const T* y_prev_sub =
-                            ws->d_block_y + static_cast<size_t>(inner) +
-                            static_cast<size_t>(0) * static_cast<size_t>(m);
-                        const T* w_prev_sub =
-                            ws->d_block_w + static_cast<size_t>(inner) +
-                            static_cast<size_t>(0) * static_cast<size_t>(m);
-
-                        // tmp = Y_prev^T * W_i  (k_prev x kPanelWidth)
-                        AssertCublas(CublasGemmTraits<T>::Gemm(
-                                         cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, k_prev,
-                                         kPanelWidth, panel_rows, &one, y_prev_sub, m,
-                                         ws->d_pack_w, panel_rows, &zero, ws->d_tmp0, k_prev),
-                                     "tmp = Y_prev^T * W_i");
-                        // W_i -= W_prev * tmp  (panel_rows x kPanelWidth)
-                        AssertCublas(CublasGemmTraits<T>::Gemm(
-                                         cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_rows,
-                                         kPanelWidth, k_prev, &minus_one, w_prev_sub, m, ws->d_tmp0,
-                                         k_prev, &one, ws->d_pack_w, panel_rows),
-                                     "W_i -= W_prev * tmp");
-                    }
-
                     if (d_Y_local) {
-                        AssertCuda(
-                            cudaMemcpy2DAsync(
-                                d_Y_local + static_cast<size_t>(local_panel_col) * lda_local + inner,
-                                static_cast<size_t>(lda_local) * sizeof(T), ws->d_pack_y,
-                                static_cast<size_t>(panel_rows) * sizeof(T),
-                                static_cast<size_t>(panel_rows) * sizeof(T), kPanelWidth,
-                                cudaMemcpyDeviceToDevice, compute_stream),
-                            "cudaMemcpy2DAsync pack_y -> d_Y_local");
+                        AssertCuda(cudaMemcpy2DAsync(
+                                       d_Y_local +
+                                           static_cast<size_t>(local_panel_col) * lda_local + inner,
+                                       static_cast<size_t>(lda_local) * sizeof(T), ws->d_pack_y,
+                                       static_cast<size_t>(panel_rows) * sizeof(T),
+                                       static_cast<size_t>(panel_rows) * sizeof(T), kPanelWidth,
+                                       cudaMemcpyDeviceToDevice, compute_stream),
+                                   "cudaMemcpy2DAsync pack_y -> d_Y_local");
                         const int zero_rows = inner - block_begin;
                         if (zero_rows > 0) {
                             T* z_y = d_Y_local + static_cast<size_t>(local_panel_col) * lda_local +
                                      block_begin;
-                            AssertCuda(cudaMemset2DAsync(z_y, static_cast<size_t>(lda_local) * sizeof(T),
-                                                         0, static_cast<size_t>(zero_rows) * sizeof(T),
-                                                         kPanelWidth, compute_stream),
-                                       "cudaMemset2DAsync zero d_Y_local top");
-                        }
-                    }
-                    if (d_W_local) {
-                        AssertCuda(
-                            cudaMemcpy2DAsync(
-                                d_W_local + static_cast<size_t>(local_panel_col) * lda_local + inner,
-                                static_cast<size_t>(lda_local) * sizeof(T), ws->d_pack_w,
-                                static_cast<size_t>(panel_rows) * sizeof(T),
-                                static_cast<size_t>(panel_rows) * sizeof(T), kPanelWidth,
-                                cudaMemcpyDeviceToDevice, compute_stream),
-                            "cudaMemcpy2DAsync pack_w -> d_W_local");
-                        const int zero_rows = inner - block_begin;
-                        if (zero_rows > 0) {
-                            T* z_w = d_W_local + static_cast<size_t>(local_panel_col) * lda_local +
-                                     block_begin;
-                            AssertCuda(cudaMemset2DAsync(z_w, static_cast<size_t>(lda_local) * sizeof(T),
-                                                         0, static_cast<size_t>(zero_rows) * sizeof(T),
-                                                         kPanelWidth, compute_stream),
-                                       "cudaMemset2DAsync zero d_W_local top");
+                            AssertCuda(
+                                cudaMemset2DAsync(z_y, static_cast<size_t>(lda_local) * sizeof(T),
+                                                  0, static_cast<size_t>(zero_rows) * sizeof(T),
+                                                  kPanelWidth, compute_stream),
+                                "cudaMemset2DAsync zero d_Y_local top");
                         }
                     }
 
@@ -592,67 +584,131 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
 
             const bool needs_comm = (part.world_size > 1);
             if (needs_comm) {
-                AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
                 if (part.rank == owner) {
+                    bool any_send = false;
                     for (int r = 0; r < part.world_size; ++r) {
                         if (r == owner) {
                             continue;
                         }
-                        AssertNccl(ncclSend(ws->d_pack_w, static_cast<size_t>(panel_rows) * kPanelWidth,
-                                            nccl_type, r, nccl_comm, comm_stream),
-                                   "ncclSend panel W");
-                        AssertNccl(ncclSend(ws->d_pack_y, static_cast<size_t>(panel_rows) * kPanelWidth,
-                                            nccl_type, r, nccl_comm, comm_stream),
-                                   "ncclSend panel Y");
+                        if (col_end_by_rank[r] <= inner + kPanelWidth) {
+                            continue;
+                        }
+                        any_send = true;
+                        break;
+                    }
+                    if (any_send) {
+                        AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
+                    }
+                    for (int r = 0; r < part.world_size; ++r) {
+                        if (r == owner) {
+                            continue;
+                        }
+                        if (col_end_by_rank[r] <= inner + kPanelWidth) {
+                            continue;
+                        }
+                        AssertNccl(
+                            ncclSend(ws->d_pack_w, static_cast<size_t>(panel_rows) * kPanelWidth,
+                                     nccl_type, r, nccl_comm, comm_stream),
+                            "ncclSend panel W");
+                        AssertNccl(
+                            ncclSend(ws->d_pack_y, static_cast<size_t>(panel_rows) * kPanelWidth,
+                                     nccl_type, r, nccl_comm, comm_stream),
+                            "ncclSend panel Y");
                         if (comm_profile) {
                             comm_profile->bytes +=
                                 2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
                         }
                     }
+                    if (any_send) {
+                        AssertNccl(ncclGroupEnd(), "ncclGroupEnd panel W/Y");
+                        AssertCuda(cudaEventRecord(events.w_ready, comm_stream),
+                                   "cudaEventRecord w_ready");
+                        AssertCuda(cudaEventRecord(events.y_ready, comm_stream),
+                                   "cudaEventRecord y_ready");
+                        AssertCuda(cudaStreamWaitEvent(compute_stream, events.w_ready, 0),
+                                   "cudaStreamWaitEvent compute_stream <- w_ready");
+                        AssertCuda(cudaStreamWaitEvent(compute_stream, events.y_ready, 0),
+                                   "cudaStreamWaitEvent compute_stream <- y_ready");
+                    }
                 } else {
-                    AssertNccl(ncclRecv(ws->d_pack_w, static_cast<size_t>(panel_rows) * kPanelWidth,
-                                        nccl_type, owner, nccl_comm, comm_stream),
-                               "ncclRecv panel W");
-                    AssertNccl(ncclRecv(ws->d_pack_y, static_cast<size_t>(panel_rows) * kPanelWidth,
-                                        nccl_type, owner, nccl_comm, comm_stream),
-                               "ncclRecv panel Y");
-                    if (comm_profile) {
-                        comm_profile->bytes +=
-                            2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
+                    if (self_needs_panel) {
+                        if (activity_profile) {
+                            activity_profile->last_recv_panel = panel_idx;
+                            activity_profile->recv_panels += 1ULL;
+                        }
+                        AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
+                        AssertNccl(
+                            ncclRecv(ws->d_pack_w, static_cast<size_t>(panel_rows) * kPanelWidth,
+                                     nccl_type, owner, nccl_comm, comm_stream),
+                            "ncclRecv panel W");
+                        AssertNccl(
+                            ncclRecv(ws->d_pack_y, static_cast<size_t>(panel_rows) * kPanelWidth,
+                                     nccl_type, owner, nccl_comm, comm_stream),
+                            "ncclRecv panel Y");
+                        AssertNccl(ncclGroupEnd(), "ncclGroupEnd panel W/Y");
+                        if (comm_profile) {
+                            comm_profile->bytes +=
+                                2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
+                        }
+                        AssertCuda(cudaEventRecord(events.w_ready, comm_stream),
+                                   "cudaEventRecord w_ready");
+                        AssertCuda(cudaEventRecord(events.y_ready, comm_stream),
+                                   "cudaEventRecord y_ready");
+                        AssertCuda(cudaStreamWaitEvent(compute_stream, events.w_ready, 0),
+                                   "cudaStreamWaitEvent compute_stream <- w_ready");
+                        AssertCuda(cudaStreamWaitEvent(compute_stream, events.y_ready, 0),
+                                   "cudaStreamWaitEvent compute_stream <- y_ready");
                     }
                 }
-                AssertNccl(ncclGroupEnd(), "ncclGroupEnd panel W/Y");
-                AssertCuda(cudaEventRecord(events.w_ready, comm_stream), "cudaEventRecord w_ready");
-                AssertCuda(cudaEventRecord(events.y_ready, comm_stream), "cudaEventRecord y_ready");
-                AssertCuda(cudaStreamWaitEvent(compute_stream, events.w_ready, 0),
-                           "cudaStreamWaitEvent compute_stream <- w_ready");
-                AssertCuda(cudaStreamWaitEvent(compute_stream, events.y_ready, 0),
-                           "cudaStreamWaitEvent compute_stream <- y_ready");
             } else {
                 // Ensure the in-block update pipeline can safely wait on these events.
-                AssertCuda(cudaEventRecord(events.w_ready, compute_stream),
-                           "cudaEventRecord w_ready(np1)");
-                AssertCuda(cudaEventRecord(events.y_ready, compute_stream),
-                           "cudaEventRecord y_ready(np1)");
+                if (self_needs_panel) {
+                    AssertCuda(cudaEventRecord(events.w_ready, compute_stream),
+                               "cudaEventRecord w_ready(np1)");
+                    AssertCuda(cudaEventRecord(events.y_ready, compute_stream),
+                               "cudaEventRecord y_ready(np1)");
+                }
+            }
+
+            // Apply this panel to local columns inside the current block using the original
+            // panel WY (before block-WY update), like the single-GPU blocked algorithm.
+            if (part.rank == owner || self_needs_panel) {
+                const int inblock_begin_global = std::max(inner + kPanelWidth, part.col_start);
+                const int inblock_end_global = std::min(block_end, part.col_end);
+                if (inblock_begin_global < inblock_end_global) {
+                    if (activity_profile) {
+                        activity_profile->last_inblock_update_panel = panel_idx;
+                        activity_profile->inblock_updates += 1ULL;
+                    }
+                    const int local_begin = inblock_begin_global - part.col_start;
+                    const int cols_local = inblock_end_global - inblock_begin_global;
+                    T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+
+                    panel_update_one_shot(cublas_handle, inner, panel_rows, cols_local,
+                                          ws->d_pack_w, ws->d_pack_y, panel_rows, a_trail,
+                                          lda_local, ws->d_tmp0, ws->tmp_elems);
+                }
             }
 
             // Scatter packed W/Y into block buffers at (row=inner, col=block_col_off).
             // Also zero the [block_begin, inner) region of these panel columns.
-            {
+            if (part.rank == owner || self_needs_panel) {
                 T* dst_w = ws->d_block_w + static_cast<size_t>(inner) +
                            static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
                 T* dst_y = ws->d_block_y + static_cast<size_t>(inner) +
                            static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
-                AssertCuda(cudaMemcpy2DAsync(dst_w, static_cast<size_t>(m) * sizeof(T), ws->d_pack_w,
-                                             static_cast<size_t>(panel_rows) * sizeof(T),
-                                             static_cast<size_t>(panel_rows) * sizeof(T),
-                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
-                           "cudaMemcpy2DAsync pack_w -> block_w");
-                AssertCuda(cudaMemcpy2DAsync(dst_y, static_cast<size_t>(m) * sizeof(T), ws->d_pack_y,
-                                             static_cast<size_t>(panel_rows) * sizeof(T),
-                                             static_cast<size_t>(panel_rows) * sizeof(T),
-                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
-                           "cudaMemcpy2DAsync pack_y -> block_y");
+                AssertCuda(
+                    cudaMemcpy2DAsync(dst_w, static_cast<size_t>(m) * sizeof(T), ws->d_pack_w,
+                                      static_cast<size_t>(panel_rows) * sizeof(T),
+                                      static_cast<size_t>(panel_rows) * sizeof(T), kPanelWidth,
+                                      cudaMemcpyDeviceToDevice, compute_stream),
+                    "cudaMemcpy2DAsync pack_w -> block_w");
+                AssertCuda(
+                    cudaMemcpy2DAsync(dst_y, static_cast<size_t>(m) * sizeof(T), ws->d_pack_y,
+                                      static_cast<size_t>(panel_rows) * sizeof(T),
+                                      static_cast<size_t>(panel_rows) * sizeof(T), kPanelWidth,
+                                      cudaMemcpyDeviceToDevice, compute_stream),
+                    "cudaMemcpy2DAsync pack_y -> block_y");
 
                 const int zero_rows = inner - block_begin;
                 if (zero_rows > 0) {
@@ -671,18 +727,52 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
                 }
             }
 
-            // Apply this panel transform to local columns inside the current block only
-            // (prepare later panels), like the single-GPU algorithm.
-            const int inblock_begin_global = std::max(inner + kPanelWidth, part.col_start);
-            const int inblock_end_global = std::min(block_end, part.col_end);
-            if (inblock_begin_global < inblock_end_global) {
-                const int local_begin = inblock_begin_global - part.col_start;
-                const int cols_local = inblock_end_global - inblock_begin_global;
-                T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+            // Now update W_i inside the block WY using the full block rows.
+            if (part.rank == owner || self_needs_panel) {
+                if (inner > block_begin) {
+                    const int block_rows = m - block_begin;
+                    const T one = static_cast<T>(1);
+                    const T zero = static_cast<T>(0);
+                    const T minus_one = static_cast<T>(-1);
 
-                panel_update_one_shot(cublas_handle, inner, panel_rows, cols_local, ws->d_pack_w,
-                                      ws->d_pack_y, panel_rows, a_trail, lda_local, ws->d_tmp0,
-                                      ws->tmp_elems);
+                    const T* y_prev_sub = ws->d_block_y + static_cast<size_t>(block_begin);
+                    const T* w_prev_sub = ws->d_block_w + static_cast<size_t>(block_begin);
+                    T* w_i_sub = ws->d_block_w + static_cast<size_t>(block_begin) +
+                                 static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
+
+                    AssertCublas(
+                        CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, k_prev,
+                                                  kPanelWidth, block_rows, &one, y_prev_sub, m,
+                                                  w_i_sub, m, &zero, ws->d_tmp0, k_prev),
+                        "tmp = Y_prev^T * W_i");
+                    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                                           block_rows, kPanelWidth, k_prev,
+                                                           &minus_one, w_prev_sub, m, ws->d_tmp0,
+                                                           k_prev, &one, w_i_sub, m),
+                                 "W_i -= W_prev * tmp");
+                }
+            }
+
+            if (part.rank == owner && d_W_local) {
+                const int local_panel_col = inner - part.col_start;
+                const bool owner_has_panel =
+                    (local_panel_col >= 0) && (local_panel_col + kPanelWidth <= part.local_cols);
+                if (!owner_has_panel) {
+                    spdlog::error("Owner rank {} missing panel col {} in local layout.", owner,
+                                  inner);
+                    std::exit(1);
+                }
+                const int block_rows = m - block_begin;
+                T* src_w = ws->d_block_w + static_cast<size_t>(block_begin) +
+                           static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
+                AssertCuda(
+                    cudaMemcpy2DAsync(
+                        d_W_local + static_cast<size_t>(local_panel_col) * lda_local + block_begin,
+                        static_cast<size_t>(lda_local) * sizeof(T), src_w,
+                        static_cast<size_t>(m) * sizeof(T),
+                        static_cast<size_t>(block_rows) * sizeof(T), kPanelWidth,
+                        cudaMemcpyDeviceToDevice, compute_stream),
+                    "cudaMemcpy2DAsync block_w -> d_W_local");
             }
         }
 
