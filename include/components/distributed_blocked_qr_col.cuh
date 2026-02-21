@@ -471,10 +471,8 @@ void distributed_blocked_qr_factorize_col(cublasHandle_t cublas_handle,
         const int block_end = std::min(block_begin + panel_block_cols, n);
         const int kb = block_end - block_begin;
 
-        // Early exit: rank has no columns at/after this block begin.
-        if (block_begin >= part.col_end) {
-            return;
-        }
+        // Even if this rank has no local columns in/after this block, it must still
+        // participate in panel broadcasts to match send/recv.
 
         // Build block-level WY factors in ws->d_block_{w,y} for this nb-block.
         // Only the rows [block_begin, m) are used by the block update.
