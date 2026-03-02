@@ -77,6 +77,8 @@ void ApplyAllOuterPanelsQTToA(
     distributed_qr_col_blockcyclic::AssertCublas(cublasSetStream(cublas_handle, compute_stream),
                                                  "cublasSetStream(compute_stream)");
     ASSERT_NE(ws, nullptr);
+    float* pack_w = ws->d_pack_w[0];
+    float* pack_y = ws->d_pack_y[0];
 
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
         const int block_end = std::min(block_begin + nb, n);
@@ -93,7 +95,7 @@ void ApplyAllOuterPanelsQTToA(
             if (owner_has_panel) {
                 distributed_qr_col_blockcyclic::AssertCuda(
                     cudaMemcpy2DAsync(
-                        ws->d_pack_w, static_cast<size_t>(rows) * sizeof(float),
+                        pack_w, static_cast<size_t>(rows) * sizeof(float),
                         d_W_local + static_cast<size_t>(local_panel_col) * lda_local + block_begin,
                         static_cast<size_t>(lda_local) * sizeof(float),
                         static_cast<size_t>(rows) * sizeof(float),
@@ -102,7 +104,7 @@ void ApplyAllOuterPanelsQTToA(
                     "cudaMemcpy2DAsync local W -> pack");
                 distributed_qr_col_blockcyclic::AssertCuda(
                     cudaMemcpy2DAsync(
-                        ws->d_pack_y, static_cast<size_t>(rows) * sizeof(float),
+                        pack_y, static_cast<size_t>(rows) * sizeof(float),
                         d_Y_local + static_cast<size_t>(local_panel_col) * lda_local + block_begin,
                         static_cast<size_t>(lda_local) * sizeof(float),
                         static_cast<size_t>(rows) * sizeof(float),
@@ -122,18 +124,18 @@ void ApplyAllOuterPanelsQTToA(
                         continue;
                     }
                     distributed_qr_col_blockcyclic::AssertNccl(
-                        ncclSend(ws->d_pack_w, msg_elems, nccl_type, r, nccl_comm, compute_stream),
+                        ncclSend(pack_w, msg_elems, nccl_type, r, nccl_comm, compute_stream),
                         "ncclSend panel W(pack)");
                     distributed_qr_col_blockcyclic::AssertNccl(
-                        ncclSend(ws->d_pack_y, msg_elems, nccl_type, r, nccl_comm, compute_stream),
+                        ncclSend(pack_y, msg_elems, nccl_type, r, nccl_comm, compute_stream),
                         "ncclSend panel Y(pack)");
                 }
             } else {
                 distributed_qr_col_blockcyclic::AssertNccl(
-                    ncclRecv(ws->d_pack_w, msg_elems, nccl_type, owner, nccl_comm, compute_stream),
+                    ncclRecv(pack_w, msg_elems, nccl_type, owner, nccl_comm, compute_stream),
                     "ncclRecv panel W(pack)");
                 distributed_qr_col_blockcyclic::AssertNccl(
-                    ncclRecv(ws->d_pack_y, msg_elems, nccl_type, owner, nccl_comm, compute_stream),
+                    ncclRecv(pack_y, msg_elems, nccl_type, owner, nccl_comm, compute_stream),
                     "ncclRecv panel Y(pack)");
             }
             distributed_qr_col_blockcyclic::AssertNccl(ncclGroupEnd(),
@@ -144,14 +146,14 @@ void ApplyAllOuterPanelsQTToA(
             float* dst_y = ws->d_block_y + static_cast<size_t>(block_begin) +
                            static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
             distributed_qr_col_blockcyclic::AssertCuda(
-                cudaMemcpy2DAsync(dst_w, static_cast<size_t>(m) * sizeof(float), ws->d_pack_w,
+                cudaMemcpy2DAsync(dst_w, static_cast<size_t>(m) * sizeof(float), pack_w,
                                   static_cast<size_t>(rows) * sizeof(float),
                                   static_cast<size_t>(rows) * sizeof(float),
                                   distributed_qr_col_blockcyclic::kPanelWidth,
                                   cudaMemcpyDeviceToDevice, compute_stream),
                 "cudaMemcpy2DAsync pack_w -> block_w");
             distributed_qr_col_blockcyclic::AssertCuda(
-                cudaMemcpy2DAsync(dst_y, static_cast<size_t>(m) * sizeof(float), ws->d_pack_y,
+                cudaMemcpy2DAsync(dst_y, static_cast<size_t>(m) * sizeof(float), pack_y,
                                   static_cast<size_t>(rows) * sizeof(float),
                                   static_cast<size_t>(rows) * sizeof(float),
                                   distributed_qr_col_blockcyclic::kPanelWidth,
@@ -239,9 +241,13 @@ TEST(DistBlockedQrColBlockCyclicCorrectnessTest, FactorizedAEqualsQtA0) {
         cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(float)),
         "cudaMalloc ws.d_tsqr_work_panel");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_w, ws.pack_elems * sizeof(float)), "cudaMalloc ws.d_pack_w");
+        cudaMalloc(&ws.d_pack_w[0], ws.pack_elems * sizeof(float)), "cudaMalloc ws.d_pack_w[0]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_y, ws.pack_elems * sizeof(float)), "cudaMalloc ws.d_pack_y");
+        cudaMalloc(&ws.d_pack_w[1], ws.pack_elems * sizeof(float)), "cudaMalloc ws.d_pack_w[1]");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_pack_y[0], ws.pack_elems * sizeof(float)), "cudaMalloc ws.d_pack_y[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_pack_y[1], ws.pack_elems * sizeof(float)), "cudaMalloc ws.d_pack_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(float)),
         "cudaMalloc ws.d_block_w");
@@ -358,8 +364,10 @@ TEST(DistBlockedQrColBlockCyclicCorrectnessTest, FactorizedAEqualsQtA0) {
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_r_panel), "cudaFree ws.d_r_panel");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tsqr_work_panel),
                                                "cudaFree ws.d_tsqr_work_panel");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w), "cudaFree ws.d_pack_w");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y), "cudaFree ws.d_pack_y");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[0]), "cudaFree ws.d_pack_w[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[1]), "cudaFree ws.d_pack_w[1]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[0]), "cudaFree ws.d_pack_y[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[1]), "cudaFree ws.d_pack_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w), "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y), "cudaFree ws.d_block_y");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_compact),

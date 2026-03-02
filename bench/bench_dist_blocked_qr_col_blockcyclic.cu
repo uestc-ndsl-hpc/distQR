@@ -187,11 +187,17 @@ int main(int argc, char** argv) {
         cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(float)),
         "cudaMalloc ws.d_tsqr_work_panel");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_w, ws.pack_elems * sizeof(float)),
-        "cudaMalloc ws.d_pack_w");
+        cudaMalloc(&ws.d_pack_w[0], ws.pack_elems * sizeof(float)),
+        "cudaMalloc ws.d_pack_w[0]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_y, ws.pack_elems * sizeof(float)),
-        "cudaMalloc ws.d_pack_y");
+        cudaMalloc(&ws.d_pack_w[1], ws.pack_elems * sizeof(float)),
+        "cudaMalloc ws.d_pack_w[1]");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_pack_y[0], ws.pack_elems * sizeof(float)),
+        "cudaMalloc ws.d_pack_y[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_pack_y[1], ws.pack_elems * sizeof(float)),
+        "cudaMalloc ws.d_pack_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(float)),
         "cudaMalloc ws.d_block_w");
@@ -436,8 +442,10 @@ int main(int argc, char** argv) {
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_r_panel), "cudaFree ws.d_r_panel");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tsqr_work_panel),
                                                "cudaFree ws.d_tsqr_work_panel");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w), "cudaFree ws.d_pack_w");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y), "cudaFree ws.d_pack_y");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[0]), "cudaFree ws.d_pack_w[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[1]), "cudaFree ws.d_pack_w[1]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[0]), "cudaFree ws.d_pack_y[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[1]), "cudaFree ws.d_pack_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w), "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y), "cudaFree ws.d_block_y");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_compact),
