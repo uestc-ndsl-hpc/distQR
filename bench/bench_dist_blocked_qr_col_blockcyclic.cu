@@ -220,8 +220,14 @@ int main(int argc, char** argv) {
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking),
         "cudaStreamCreate compute_stream");
+    int least_priority = 0;
+    int greatest_priority = 0;
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaStreamCreateWithFlags(&comm_stream, cudaStreamNonBlocking),
+        cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority),
+        "cudaDeviceGetStreamPriorityRange");
+    (void)least_priority;
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaStreamCreateWithPriority(&comm_stream, cudaStreamNonBlocking, greatest_priority),
         "cudaStreamCreate comm_stream");
 
     cublasHandle_t cublas_handle = nullptr;
