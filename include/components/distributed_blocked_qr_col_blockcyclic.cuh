@@ -196,6 +196,11 @@ struct CommProfile {
     size_t bytes = 0;
 };
 
+enum class PanelCommMode {
+    SendRecv = 0,
+    Broadcast = 1,
+};
+
 template <typename T>
 void panel_update_one_shot(cublasHandle_t cublas_handle,
                            int panel_col,
@@ -347,7 +352,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(cublasHandle_t cublas_hand
                                                       cudaStream_t compute_stream,
                                                       cudaStream_t comm_stream,
                                                       int overlap_tile_cols = 0,
-                                                      CommProfile* comm_profile = nullptr) {
+                                                      CommProfile* comm_profile = nullptr,
+                                                      PanelCommMode panel_comm_mode =
+                                                          PanelCommMode::SendRecv) {
     if (!ws) {
         spdlog::error("distributed_blocked_qr_factorize_col_blockcyclic got null workspace.");
         std::exit(1);
@@ -364,6 +371,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic(cublasHandle_t cublas_hand
     if (part.block_cols <= 0 || part.block_cols % nb != 0 || part.block_cols % kPanelWidth != 0) {
         spdlog::error("Require block_cols to be positive and multiple of nb and {} (got {}).",
                       kPanelWidth, part.block_cols);
+        std::exit(1);
+    }
+    if (panel_comm_mode != PanelCommMode::SendRecv &&
+        panel_comm_mode != PanelCommMode::Broadcast) {
+        spdlog::error("Unsupported panel_comm_mode value {}.",
+                      static_cast<int>(panel_comm_mode));
         std::exit(1);
     }
 
@@ -436,6 +449,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(cublasHandle_t cublas_hand
                "cudaEventRecord compute_done[1]");
 
     auto prefetch_recv = [&](int inner, int buf) {
+        if (panel_comm_mode != PanelCommMode::SendRecv) {
+            return;
+        }
         if (part.world_size <= 1) {
             return;
         }
@@ -482,6 +498,16 @@ void distributed_blocked_qr_factorize_col_blockcyclic(cublasHandle_t cublas_hand
             const int owner = OwnerOfPanel(inner, part);
             const int block_col_off = inner - block_begin;
             const bool self_needs_panel = RankHasColsAfter(part, part.rank, inner + kPanelWidth);
+            int active_receivers = 0;
+            for (int r = 0; r < part.world_size; ++r) {
+                if (r == owner) {
+                    continue;
+                }
+                if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
+                    continue;
+                }
+                ++active_receivers;
+            }
             T* d_pack_w = ws->d_pack_w[buf];
             T* d_pack_y = ws->d_pack_y[buf];
 
@@ -529,18 +555,24 @@ void distributed_blocked_qr_factorize_col_blockcyclic(cublasHandle_t cublas_hand
             }
 
             if (part.world_size > 1) {
-                if (part.rank == owner) {
-                    bool any_send = false;
-                    for (int r = 0; r < part.world_size; ++r) {
-                        if (r == owner) {
-                            continue;
-                        }
-                        if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
-                            continue;
-                        }
-                        any_send = true;
-                        break;
+                if (panel_comm_mode == PanelCommMode::Broadcast) {
+                    AssertNccl(ncclBroadcast(d_pack_w, d_pack_w,
+                                             static_cast<size_t>(panel_rows) * kPanelWidth,
+                                             nccl_type, owner, nccl_comm, comm_stream),
+                               "ncclBroadcast panel W");
+                    AssertNccl(ncclBroadcast(d_pack_y, d_pack_y,
+                                             static_cast<size_t>(panel_rows) * kPanelWidth,
+                                             nccl_type, owner, nccl_comm, comm_stream),
+                               "ncclBroadcast panel Y");
+                    if (comm_profile && active_receivers > 0) {
+                        comm_profile->bytes +=
+                            2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T) *
+                            static_cast<size_t>(active_receivers);
                     }
+                    AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
+                               "cudaEventRecord comm_done[buf](bcast)");
+                } else if (part.rank == owner) {
+                    const bool any_send = (active_receivers > 0);
                     if (any_send) {
                         AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
                     }

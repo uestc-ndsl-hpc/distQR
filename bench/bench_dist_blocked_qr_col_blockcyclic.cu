@@ -20,6 +20,7 @@
 namespace {
 
 using distributed_qr_col_blockcyclic::kPanelWidth;
+using distributed_qr_col_blockcyclic::PanelCommMode;
 
 void AssertCurand(curandStatus_t status, const char* context) {
     if (status != CURAND_STATUS_SUCCESS) {
@@ -70,7 +71,29 @@ struct Options {
     int block_cols = 0;
     bool print_per_rank = false;
     bool print_comm_bw = false;
+    PanelCommMode panel_comm_mode = PanelCommMode::SendRecv;
+    bool panel_comm_valid = true;
+    std::string panel_comm_value = "sendrecv";
 };
+
+bool ParsePanelCommMode(const char* mode, PanelCommMode* out_mode) {
+    if (std::strcmp(mode, "sendrecv") == 0 || std::strcmp(mode, "send_recv") == 0) {
+        *out_mode = PanelCommMode::SendRecv;
+        return true;
+    }
+    if (std::strcmp(mode, "broadcast") == 0) {
+        *out_mode = PanelCommMode::Broadcast;
+        return true;
+    }
+    return false;
+}
+
+const char* PanelCommModeToString(PanelCommMode mode) {
+    if (mode == PanelCommMode::Broadcast) {
+        return "broadcast";
+    }
+    return "sendrecv";
+}
 
 Options ParseArgs(int argc, char** argv) {
     Options opts;
@@ -93,6 +116,10 @@ Options ParseArgs(int argc, char** argv) {
             opts.print_per_rank = true;
         } else if (std::strcmp(argv[i], "--print_comm_bw") == 0) {
             opts.print_comm_bw = true;
+        } else if (std::strcmp(argv[i], "--panel-comm") == 0 && i + 1 < argc) {
+            opts.panel_comm_value = argv[++i];
+            opts.panel_comm_valid = ParsePanelCommMode(opts.panel_comm_value.c_str(),
+                                                       &opts.panel_comm_mode);
         }
     }
     return opts;
@@ -140,6 +167,16 @@ int main(int argc, char** argv) {
         if (env.rank == 0) {
             spdlog::error("Invalid args: require warmup >= 0 and iters > 0 (got warmup={} iters={})",
                           opts.warmup, opts.iters);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (!opts.panel_comm_valid) {
+        if (env.rank == 0) {
+            spdlog::error(
+                "Invalid --panel-comm value '{}'. Supported values: sendrecv, broadcast.",
+                opts.panel_comm_value);
         }
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);
@@ -249,7 +286,7 @@ int main(int argc, char** argv) {
 
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<float>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
-            &ws, compute_stream, comm_stream, opts.overlap_tile);
+            &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode);
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                    "cudaStreamSynchronize warmup compute");
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
@@ -303,7 +340,7 @@ int main(int argc, char** argv) {
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<float>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
-            opts.print_comm_bw ? &comm_profile : nullptr);
+            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode);
         if (opts.print_comm_bw) {
             distributed_qr_col_blockcyclic::AssertCuda(
                 cudaEventRecord(comm_end_events[i], comm_stream), "cudaEventRecord comm_end");
@@ -403,8 +440,9 @@ int main(int argc, char** argv) {
         const int effective_tile = (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile;
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic] (float): m={} n={} nb={} block_cols={} "
-            "tile={} np={} avg {:.3f} ms",
-            opts.m, opts.n, opts.nb, block_cols, effective_tile, env.size, max_ms);
+            "tile={} panel_comm={} np={} avg {:.3f} ms",
+            opts.m, opts.n, opts.nb, block_cols, effective_tile,
+            PanelCommModeToString(opts.panel_comm_mode), env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms (no-barrier {:.3f} ms)", r,
