@@ -1,5 +1,5 @@
 .clangd
 .cache
-build
-log
+build*
+log*
 AGENTS.md

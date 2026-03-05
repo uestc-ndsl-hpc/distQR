@@ -362,5 +362,4 @@ void generate_wy(int m, int n, T* A, int lda, T* Y, int ldy, T* W, int ldw, cuda
     } else {
         throw std::runtime_error("Unsupported type: unknown");
     }
-    cudaStreamSynchronize(stream);
 }
