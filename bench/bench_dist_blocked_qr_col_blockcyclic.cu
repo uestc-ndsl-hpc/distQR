@@ -61,6 +61,14 @@ __global__ void count_non_finite_kernel(const T* data,
     }
 }
 
+template <typename T>
+const char* DataTypeString() {
+    if constexpr (std::is_same_v<T, float>) {
+        return "float";
+    }
+    return "double";
+}
+
 struct Options {
     int m = 16384;
     int n = 1024;
@@ -71,6 +79,9 @@ struct Options {
     int block_cols = 0;
     bool print_per_rank = false;
     bool print_comm_bw = false;
+    bool use_double = false;
+    bool type_valid = true;
+    std::string type_value = "float";
     PanelCommMode panel_comm_mode = PanelCommMode::SendRecv;
     bool panel_comm_valid = true;
     std::string panel_comm_value = "sendrecv";
@@ -83,6 +94,18 @@ bool ParsePanelCommMode(const char* mode, PanelCommMode* out_mode) {
     }
     if (std::strcmp(mode, "broadcast") == 0) {
         *out_mode = PanelCommMode::Broadcast;
+        return true;
+    }
+    return false;
+}
+
+bool ParseType(const char* type_str, bool* out_use_double) {
+    if (std::strcmp(type_str, "float") == 0 || std::strcmp(type_str, "fp32") == 0) {
+        *out_use_double = false;
+        return true;
+    }
+    if (std::strcmp(type_str, "double") == 0 || std::strcmp(type_str, "fp64") == 0) {
+        *out_use_double = true;
         return true;
     }
     return false;
@@ -116,73 +139,20 @@ Options ParseArgs(int argc, char** argv) {
             opts.print_per_rank = true;
         } else if (std::strcmp(argv[i], "--print_comm_bw") == 0) {
             opts.print_comm_bw = true;
+        } else if (std::strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
+            opts.type_value = argv[++i];
+            opts.type_valid = ParseType(opts.type_value.c_str(), &opts.use_double);
         } else if (std::strcmp(argv[i], "--panel-comm") == 0 && i + 1 < argc) {
             opts.panel_comm_value = argv[++i];
-            opts.panel_comm_valid = ParsePanelCommMode(opts.panel_comm_value.c_str(),
-                                                       &opts.panel_comm_mode);
+            opts.panel_comm_valid =
+                ParsePanelCommMode(opts.panel_comm_value.c_str(), &opts.panel_comm_mode);
         }
     }
     return opts;
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
-    spdlog::set_level(spdlog::level::info);
-
-    auto env = init_mpi_and_bind_gpu(&argc, &argv);
-    init(&env);
-    if (!init_nccl_comm(&env)) {
-        finalize_mpi_if_needed(env);
-        return 1;
-    }
-
-    const Options opts = ParseArgs(argc, argv);
-    const int block_cols = (opts.block_cols > 0) ? opts.block_cols : opts.nb;
-
-    if (opts.n > opts.m || opts.n % kPanelWidth != 0 || opts.nb % kPanelWidth != 0 ||
-        opts.nb > opts.n) {
-        if (env.rank == 0) {
-            spdlog::error(
-                "Invalid args: require m>=n, n%{}==0, nb%{}==0, nb<=n (got m={} n={} nb={})",
-                kPanelWidth, kPanelWidth, opts.m, opts.n, opts.nb);
-        }
-        finalize_nccl_if_needed(&env);
-        finalize_mpi_if_needed(env);
-        return 1;
-    }
-    if (block_cols <= 0 || block_cols % opts.nb != 0 || block_cols % kPanelWidth != 0 ||
-        block_cols > opts.n) {
-        if (env.rank == 0) {
-            spdlog::error(
-                "Invalid args: require block_cols>0, block_cols%nb==0, block_cols%{}==0, "
-                "block_cols<=n (got block_cols={} nb={} n={})",
-                kPanelWidth, block_cols, opts.nb, opts.n);
-        }
-        finalize_nccl_if_needed(&env);
-        finalize_mpi_if_needed(env);
-        return 1;
-    }
-    if (opts.warmup < 0 || opts.iters <= 0) {
-        if (env.rank == 0) {
-            spdlog::error("Invalid args: require warmup >= 0 and iters > 0 (got warmup={} iters={})",
-                          opts.warmup, opts.iters);
-        }
-        finalize_nccl_if_needed(&env);
-        finalize_mpi_if_needed(env);
-        return 1;
-    }
-    if (!opts.panel_comm_valid) {
-        if (env.rank == 0) {
-            spdlog::error(
-                "Invalid --panel-comm value '{}'. Supported values: sendrecv, broadcast.",
-                opts.panel_comm_value);
-        }
-        finalize_nccl_if_needed(&env);
-        finalize_mpi_if_needed(env);
-        return 1;
-    }
-
+template <typename T>
+int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols) {
     const auto part = distributed_qr_col_blockcyclic::MakeColBlockCyclicPartition(
         opts.n, block_cols, env.size, env.rank);
     const int lda_local = std::max(opts.m, 1);
@@ -191,26 +161,26 @@ int main(int argc, char** argv) {
     const size_t local_elems_used =
         static_cast<size_t>(opts.m) * static_cast<size_t>(part.local_cols);
 
-    float* d_A0 = nullptr;
-    float* d_A = nullptr;
-    float* d_W = nullptr;
-    float* d_Y = nullptr;
+    T* d_A0 = nullptr;
+    T* d_A = nullptr;
+    T* d_W = nullptr;
+    T* d_Y = nullptr;
 
-    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_A0, local_elems_alloc * sizeof(float)),
+    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_A0, local_elems_alloc * sizeof(T)),
                                                "cudaMalloc d_A0");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_A, local_elems_alloc * sizeof(float)),
+    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_A, local_elems_alloc * sizeof(T)),
                                                "cudaMalloc d_A");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_W, local_elems_alloc * sizeof(float)),
+    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_W, local_elems_alloc * sizeof(T)),
                                                "cudaMalloc d_W");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_Y, local_elems_alloc * sizeof(float)),
+    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_Y, local_elems_alloc * sizeof(T)),
                                                "cudaMalloc d_Y");
 
     FillDeviceRandom(d_A0, local_elems_used, 2026ULL + static_cast<unsigned long long>(env.rank));
 
     const int tile_target = (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile;
     const int tile_cols = std::max(kPanelWidth, std::min(tile_target, opts.nb));
-    distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<float> ws{};
-    ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<float>(opts.m), static_cast<size_t>(1));
+    distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
+    ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.pack_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
     ws.block_storage_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
     ws.block_compact_elems =
@@ -218,38 +188,32 @@ int main(int argc, char** argv) {
     ws.tmp_elems = static_cast<size_t>(opts.nb) * static_cast<size_t>(tile_cols);
 
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_r_panel, static_cast<size_t>(kPanelWidth) * kPanelWidth * sizeof(float)),
+        cudaMalloc(&ws.d_r_panel, static_cast<size_t>(kPanelWidth) * kPanelWidth * sizeof(T)),
         "cudaMalloc ws.d_r_panel");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(float)),
+        cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(T)),
         "cudaMalloc ws.d_tsqr_work_panel");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_w[0], ws.pack_elems * sizeof(float)),
-        "cudaMalloc ws.d_pack_w[0]");
+        cudaMalloc(&ws.d_pack_w[0], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_w[0]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_w[1], ws.pack_elems * sizeof(float)),
-        "cudaMalloc ws.d_pack_w[1]");
+        cudaMalloc(&ws.d_pack_w[1], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_w[1]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_y[0], ws.pack_elems * sizeof(float)),
-        "cudaMalloc ws.d_pack_y[0]");
+        cudaMalloc(&ws.d_pack_y[0], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[0]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_y[1], ws.pack_elems * sizeof(float)),
-        "cudaMalloc ws.d_pack_y[1]");
+        cudaMalloc(&ws.d_pack_y[1], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(float)),
-        "cudaMalloc ws.d_block_w");
+        cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_y, ws.block_storage_elems * sizeof(float)),
-        "cudaMalloc ws.d_block_y");
+        cudaMalloc(&ws.d_block_y, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_y");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_w_compact, ws.block_compact_elems * sizeof(float)),
+        cudaMalloc(&ws.d_block_w_compact, ws.block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_y_compact, ws.block_compact_elems * sizeof(float)),
+        cudaMalloc(&ws.d_block_y_compact, ws.block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_y_compact");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(float)),
+    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(T)),
                                                "cudaMalloc ws.d_tmp0");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws.d_tmp1, ws.tmp_elems * sizeof(float)),
+    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws.d_tmp1, ws.tmp_elems * sizeof(T)),
                                                "cudaMalloc ws.d_tmp1");
 
     cudaStream_t compute_stream = nullptr;
@@ -274,17 +238,17 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < opts.warmup; ++i) {
         distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(float),
-                            cudaMemcpyDeviceToDevice, compute_stream),
+            cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(T), cudaMemcpyDeviceToDevice,
+                            compute_stream),
             "cudaMemcpyAsync warmup A <- A0");
         distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(float), compute_stream),
+            cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(T), compute_stream),
             "cudaMemsetAsync warmup W");
         distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(float), compute_stream),
+            cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
             "cudaMemsetAsync warmup Y");
 
-        distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<float>(
+        distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode);
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
@@ -321,14 +285,14 @@ int main(int argc, char** argv) {
     float timed_total_ms = 0.0f;
     for (int i = 0; i < opts.iters; ++i) {
         distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(float),
-                            cudaMemcpyDeviceToDevice, compute_stream),
+            cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(T), cudaMemcpyDeviceToDevice,
+                            compute_stream),
             "cudaMemcpyAsync timed A <- A0");
         distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(float), compute_stream),
+            cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(T), compute_stream),
             "cudaMemsetAsync timed W");
         distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(float), compute_stream),
+            cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
             "cudaMemsetAsync timed Y");
         distributed_qr_col_blockcyclic::CommProfile comm_profile{};
         if (opts.print_comm_bw) {
@@ -337,7 +301,7 @@ int main(int argc, char** argv) {
         }
         distributed_qr_col_blockcyclic::AssertCuda(cudaEventRecord(timed_start, compute_stream),
                                                    "cudaEventRecord timed_start");
-        distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<float>(
+        distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
             opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode);
@@ -346,8 +310,8 @@ int main(int argc, char** argv) {
                 cudaEventRecord(comm_end_events[i], comm_stream), "cudaEventRecord comm_end");
             comm_bytes_per_iter[i] = static_cast<unsigned long long>(comm_profile.bytes);
         }
-        distributed_qr_col_blockcyclic::AssertCuda(
-            cudaEventRecord(timed_comm_done, comm_stream), "cudaEventRecord timed_comm_done");
+        distributed_qr_col_blockcyclic::AssertCuda(cudaEventRecord(timed_comm_done, comm_stream),
+                                                   "cudaEventRecord timed_comm_done");
         distributed_qr_col_blockcyclic::AssertCuda(
             cudaStreamWaitEvent(compute_stream, timed_comm_done, 0),
             "cudaStreamWaitEvent compute <- timed_comm_done");
@@ -357,8 +321,7 @@ int main(int argc, char** argv) {
                                                    "cudaEventSynchronize timed_stop");
         float iter_ms = 0.0f;
         distributed_qr_col_blockcyclic::AssertCuda(
-            cudaEventElapsedTime(&iter_ms, timed_start, timed_stop),
-            "cudaEventElapsedTime timed");
+            cudaEventElapsedTime(&iter_ms, timed_start, timed_stop), "cudaEventElapsedTime timed");
         timed_total_ms += iter_ms;
     }
 
@@ -439,9 +402,9 @@ int main(int argc, char** argv) {
     if (env.rank == 0) {
         const int effective_tile = (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile;
         spdlog::info(
-            "Distributed blocked QR [col-blockcyclic] (float): m={} n={} nb={} block_cols={} "
+            "Distributed blocked QR [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
             "tile={} panel_comm={} np={} avg {:.3f} ms",
-            opts.m, opts.n, opts.nb, block_cols, effective_tile,
+            DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, effective_tile,
             PanelCommModeToString(opts.panel_comm_mode), env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
@@ -504,8 +467,80 @@ int main(int argc, char** argv) {
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_W), "cudaFree d_W");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_Y), "cudaFree d_Y");
 
+    return (total_bad == 0) ? 0 : 1;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    spdlog::set_level(spdlog::level::info);
+
+    auto env = init_mpi_and_bind_gpu(&argc, &argv);
+    init(&env);
+    if (!init_nccl_comm(&env)) {
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+
+    const Options opts = ParseArgs(argc, argv);
+    const int block_cols = (opts.block_cols > 0) ? opts.block_cols : opts.nb;
+
+    if (opts.n > opts.m || opts.n % kPanelWidth != 0 || opts.nb % kPanelWidth != 0 ||
+        opts.nb > opts.n) {
+        if (env.rank == 0) {
+            spdlog::error(
+                "Invalid args: require m>=n, n%{}==0, nb%{}==0, nb<=n (got m={} n={} nb={})",
+                kPanelWidth, kPanelWidth, opts.m, opts.n, opts.nb);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (block_cols <= 0 || block_cols % opts.nb != 0 || block_cols % kPanelWidth != 0 ||
+        block_cols > opts.n) {
+        if (env.rank == 0) {
+            spdlog::error(
+                "Invalid args: require block_cols>0, block_cols%nb==0, block_cols%{}==0, "
+                "block_cols<=n (got block_cols={} nb={} n={})",
+                kPanelWidth, block_cols, opts.nb, opts.n);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (opts.warmup < 0 || opts.iters <= 0) {
+        if (env.rank == 0) {
+            spdlog::error(
+                "Invalid args: require warmup >= 0 and iters > 0 (got warmup={} iters={})",
+                opts.warmup, opts.iters);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (!opts.type_valid) {
+        if (env.rank == 0) {
+            spdlog::error("Invalid --type value '{}'. Supported values: float, double.",
+                          opts.type_value);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (!opts.panel_comm_valid) {
+        if (env.rank == 0) {
+            spdlog::error("Invalid --panel-comm value '{}'. Supported values: sendrecv, broadcast.",
+                          opts.panel_comm_value);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+
+    const int local_ret = opts.use_double ? RunBenchmarkTyped<double>(env, opts, block_cols)
+                                          : RunBenchmarkTyped<float>(env, opts, block_cols);
+
     finalize_nccl_if_needed(&env);
     finalize_mpi_if_needed(env);
-
-    return (total_bad == 0) ? 0 : 1;
+    return local_ret;
 }

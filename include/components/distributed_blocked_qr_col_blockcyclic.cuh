@@ -10,7 +10,6 @@
 #include <cstddef>
 #include <cstdlib>
 #include <type_traits>
-#include <utility>
 #include <vector>
 
 #include "panel_process.cuh"
@@ -21,16 +20,17 @@ namespace distributed_qr_col_blockcyclic {
 constexpr int kPanelWidth = 32;
 
 template <typename T>
-constexpr ncclDataType_t NcclType();
+constexpr bool kSupportedQrType = std::is_same_v<T, float> || std::is_same_v<T, double>;
 
-template <>
-constexpr ncclDataType_t NcclType<float>() {
-    return ncclFloat;
-}
-
-template <>
-constexpr ncclDataType_t NcclType<double>() {
-    return ncclDouble;
+template <typename T>
+constexpr ncclDataType_t NcclType() {
+    static_assert(kSupportedQrType<T>,
+                  "distributed_qr_col_blockcyclic only supports float and double.");
+    if constexpr (std::is_same_v<T, float>) {
+        return ncclFloat;
+    } else {
+        return ncclDouble;
+    }
 }
 
 inline void AssertCuda(cudaError_t status, const char* context) {
@@ -338,25 +338,39 @@ void block_update_tile_pipeline(cublasHandle_t cublas_handle,
 }
 
 template <typename T>
-void distributed_blocked_qr_factorize_col_blockcyclic(cublasHandle_t cublas_handle,
-                                                      ncclComm_t nccl_comm,
-                                                      const ColBlockCyclicPartition& part,
-                                                      int m,
-                                                      int n,
-                                                      int nb,
-                                                      T* d_A_local,
-                                                      int lda_local,
-                                                      T* d_W_local,
-                                                      T* d_Y_local,
-                                                      DistributedQrColBlockCyclicWorkspace<T>* ws,
-                                                      cudaStream_t compute_stream,
-                                                      cudaStream_t comm_stream,
-                                                      int overlap_tile_cols = 0,
-                                                      CommProfile* comm_profile = nullptr,
-                                                      PanelCommMode panel_comm_mode =
-                                                          PanelCommMode::SendRecv) {
+void distributed_blocked_qr_factorize_col_blockcyclic(
+    cublasHandle_t cublas_handle,
+    ncclComm_t nccl_comm,
+    const ColBlockCyclicPartition& part,
+    int m,
+    int n,
+    int nb,
+    T* d_A_local,
+    int lda_local,
+    T* d_W_local,
+    T* d_Y_local,
+    DistributedQrColBlockCyclicWorkspace<T>* ws,
+    cudaStream_t compute_stream,
+    cudaStream_t comm_stream,
+    int overlap_tile_cols = 0,
+    CommProfile* comm_profile = nullptr,
+    PanelCommMode panel_comm_mode = PanelCommMode::SendRecv) {
+    static_assert(kSupportedQrType<T>,
+                  "distributed_qr_col_blockcyclic only supports float and double.");
+
     if (!ws) {
         spdlog::error("distributed_blocked_qr_factorize_col_blockcyclic got null workspace.");
+        std::exit(1);
+    }
+    if (!ws->d_r_panel) {
+        spdlog::error("Col blockcyclic workspace d_r_panel is null.");
+        std::exit(1);
+    }
+    const size_t tsqr_work_need = tsqr_work_elems<T>(m);
+    if (tsqr_work_need > 0 &&
+        (!ws->d_tsqr_work_panel || ws->tsqr_work_panel_elems < tsqr_work_need)) {
+        spdlog::error("Col blockcyclic TSQR workspace too small (need {} elems, got {}).",
+                      tsqr_work_need, ws->tsqr_work_panel_elems);
         std::exit(1);
     }
     if (n != part.n_global) {
@@ -373,10 +387,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(cublasHandle_t cublas_hand
                       kPanelWidth, part.block_cols);
         std::exit(1);
     }
-    if (panel_comm_mode != PanelCommMode::SendRecv &&
-        panel_comm_mode != PanelCommMode::Broadcast) {
-        spdlog::error("Unsupported panel_comm_mode value {}.",
-                      static_cast<int>(panel_comm_mode));
+    if (panel_comm_mode != PanelCommMode::SendRecv && panel_comm_mode != PanelCommMode::Broadcast) {
+        spdlog::error("Unsupported panel_comm_mode value {}.", static_cast<int>(panel_comm_mode));
         std::exit(1);
     }
 
@@ -565,9 +577,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(cublasHandle_t cublas_hand
                                              nccl_type, owner, nccl_comm, comm_stream),
                                "ncclBroadcast panel Y");
                     if (comm_profile && active_receivers > 0) {
-                        comm_profile->bytes +=
-                            2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T) *
-                            static_cast<size_t>(active_receivers);
+                        comm_profile->bytes += 2ULL * static_cast<size_t>(panel_rows) *
+                                               kPanelWidth * sizeof(T) *
+                                               static_cast<size_t>(active_receivers);
                     }
                     AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                                "cudaEventRecord comm_done[buf](bcast)");
