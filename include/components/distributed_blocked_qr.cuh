@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
-#include <type_traits>
 
 #include "panel_process.cuh"
 #include "utils/cublas_gemm_traits.cuh"
