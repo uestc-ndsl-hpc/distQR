@@ -177,8 +177,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
 
     FillDeviceRandom(d_A0, local_elems_used, 2026ULL + static_cast<unsigned long long>(env.rank));
 
-    const int tile_target = (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile;
-    const int tile_cols = std::max(kPanelWidth, std::min(tile_target, opts.nb));
+    const bool trail_one_shot = opts.overlap_tile <= 0;
+    const int tile_cols =
+        trail_one_shot ? std::max(part.local_cols, 1)
+                       : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.pack_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
@@ -400,11 +402,11 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     MPI_Allreduce(&h_bad, &total_bad, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
 
     if (env.rank == 0) {
-        const int effective_tile = (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile;
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
-            "tile={} panel_comm={} np={} avg {:.3f} ms",
-            DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, effective_tile,
+            "trail_update={} tile={} panel_comm={} np={} avg {:.3f} ms",
+            DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols,
+            trail_one_shot ? "one-shot" : "tiled", trail_one_shot ? part.local_cols : tile_cols,
             PanelCommModeToString(opts.panel_comm_mode), env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {

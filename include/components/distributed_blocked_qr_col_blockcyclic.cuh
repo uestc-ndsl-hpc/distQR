@@ -338,6 +338,45 @@ void block_update_tile_pipeline(cublasHandle_t cublas_handle,
 }
 
 template <typename T>
+void block_update_one_shot(cublasHandle_t cublas_handle,
+                           int row_offset,
+                           int rows,
+                           int k,
+                           int cols_local,
+                           const T* W,
+                           const T* Y,
+                           int lda_wy,
+                           T* A_trail,
+                           int lda_local,
+                           T* work,
+                           size_t work_elems) {
+    if (k <= 0 || cols_local <= 0 || rows <= 0) {
+        return;
+    }
+
+    const size_t need = static_cast<size_t>(k) * static_cast<size_t>(cols_local);
+    if (work_elems < need) {
+        spdlog::error("block_update_one_shot work too small (need {} elems, got {}).", need,
+                      work_elems);
+        std::exit(1);
+    }
+
+    const T one = static_cast<T>(1);
+    const T zero = static_cast<T>(0);
+    const T minus_one = static_cast<T>(-1);
+
+    T* a_sub = A_trail + row_offset;
+    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, k, cols_local,
+                                           rows, &one, W, lda_wy, a_sub, lda_local, &zero, work,
+                                           k),
+                 "trail one-shot work = W^T * A");
+    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, rows,
+                                           cols_local, k, &minus_one, Y, lda_wy, work, k, &one,
+                                           a_sub, lda_local),
+                 "trail one-shot A -= Y * work");
+}
+
+template <typename T>
 void distributed_blocked_qr_factorize_col_blockcyclic(
     cublasHandle_t cublas_handle,
     ncclComm_t nccl_comm,
@@ -392,8 +431,10 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         std::exit(1);
     }
 
-    const int tile_target = (overlap_tile_cols <= 0) ? nb : overlap_tile_cols;
-    const int tile_cols = std::max(kPanelWidth, std::min(tile_target, nb));
+    const bool trail_one_shot = overlap_tile_cols <= 0;
+    const int tile_cols =
+        trail_one_shot ? std::max(part.local_cols, 1)
+                       : std::max(kPanelWidth, std::min(overlap_tile_cols, nb));
     const size_t tmp_need = static_cast<size_t>(nb) * static_cast<size_t>(tile_cols);
     if (ws->tmp_elems < tmp_need) {
         spdlog::error("Col blockcyclic tmp too small (need {} elems, got {}).", tmp_need,
@@ -772,11 +813,18 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         ForEachLocalSegment(part, trail_begin, n, [&](int seg_begin, int seg_end, int local_begin) {
             const int cols_local = seg_end - seg_begin;
             T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
-            block_update_tile_pipeline(cublas_handle, compute_stream, block_begin, block_rows, kb,
-                                       cols_local, tile_cols,
-                                       ws->d_block_w + static_cast<size_t>(block_begin),
-                                       ws->d_block_y + static_cast<size_t>(block_begin), m, a_trail,
-                                       lda_local, ws->d_tmp0, ws->d_tmp1);
+            if (trail_one_shot) {
+                block_update_one_shot(cublas_handle, block_begin, block_rows, kb, cols_local,
+                                      ws->d_block_w + static_cast<size_t>(block_begin),
+                                      ws->d_block_y + static_cast<size_t>(block_begin), m, a_trail,
+                                      lda_local, ws->d_tmp0, ws->tmp_elems);
+            } else {
+                block_update_tile_pipeline(cublas_handle, compute_stream, block_begin, block_rows,
+                                           kb, cols_local, tile_cols,
+                                           ws->d_block_w + static_cast<size_t>(block_begin),
+                                           ws->d_block_y + static_cast<size_t>(block_begin), m,
+                                           a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
+            }
         });
     }
 }
