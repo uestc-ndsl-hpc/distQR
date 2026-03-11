@@ -196,6 +196,80 @@ struct CommProfile {
     size_t bytes = 0;
 };
 
+enum class PhaseKind {
+    PanelFactor = 0,
+    WyBuild = 1,
+    TailUpdate = 2,
+};
+
+struct PhaseInterval {
+    PhaseKind kind = PhaseKind::PanelFactor;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+};
+
+struct PhaseProfile {
+    double panel_factor_ms = 0.0;
+    double wy_build_ms = 0.0;
+    double tail_update_ms = 0.0;
+    double tail_update_flops = 0.0;
+    std::vector<PhaseInterval> intervals;
+};
+
+inline void ResetPhaseProfile(PhaseProfile* profile) {
+    if (!profile) {
+        return;
+    }
+    profile->panel_factor_ms = 0.0;
+    profile->wy_build_ms = 0.0;
+    profile->tail_update_ms = 0.0;
+    profile->tail_update_flops = 0.0;
+    profile->intervals.clear();
+}
+
+inline size_t BeginPhaseInterval(PhaseProfile* profile,
+                                 PhaseKind kind,
+                                 cudaStream_t stream) {
+    if (!profile) {
+        return 0;
+    }
+    PhaseInterval interval{};
+    interval.kind = kind;
+    AssertCuda(cudaEventCreate(&interval.start), "cudaEventCreate phase_start");
+    AssertCuda(cudaEventCreate(&interval.stop), "cudaEventCreate phase_stop");
+    AssertCuda(cudaEventRecord(interval.start, stream), "cudaEventRecord phase_start");
+    profile->intervals.push_back(interval);
+    return profile->intervals.size() - 1;
+}
+
+inline void EndPhaseInterval(PhaseProfile* profile, size_t idx, cudaStream_t stream) {
+    if (!profile) {
+        return;
+    }
+    AssertCuda(cudaEventRecord(profile->intervals[idx].stop, stream), "cudaEventRecord phase_stop");
+}
+
+inline void FinalizePhaseProfile(PhaseProfile* profile) {
+    if (!profile) {
+        return;
+    }
+    for (auto& interval : profile->intervals) {
+        float ms = 0.0f;
+        AssertCuda(cudaEventElapsedTime(&ms, interval.start, interval.stop),
+                   "cudaEventElapsedTime phase");
+        if (interval.kind == PhaseKind::PanelFactor) {
+            profile->panel_factor_ms += static_cast<double>(ms);
+        } else if (interval.kind == PhaseKind::WyBuild) {
+            profile->wy_build_ms += static_cast<double>(ms);
+        } else {
+            profile->tail_update_ms += static_cast<double>(ms);
+        }
+        AssertCuda(cudaEventDestroy(interval.start), "cudaEventDestroy phase_start");
+        AssertCuda(cudaEventDestroy(interval.stop), "cudaEventDestroy phase_stop");
+    }
+    profile->intervals.clear();
+}
+
 enum class PanelCommMode {
     SendRecv = 0,
     Broadcast = 1,
@@ -393,7 +467,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     cudaStream_t comm_stream,
     int overlap_tile_cols = 0,
     CommProfile* comm_profile = nullptr,
-    PanelCommMode panel_comm_mode = PanelCommMode::SendRecv) {
+    PanelCommMode panel_comm_mode = PanelCommMode::SendRecv,
+    PhaseProfile* phase_profile = nullptr) {
     static_assert(kSupportedQrType<T>,
                   "distributed_qr_col_blockcyclic only supports float and double.");
 
@@ -448,6 +523,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     if (comm_profile) {
         comm_profile->bytes = 0;
     }
+    ResetPhaseProfile(phase_profile);
     const size_t pack_need = static_cast<size_t>(m) * static_cast<size_t>(kPanelWidth);
     if (!ws->d_pack_w[0] || !ws->d_pack_w[1] || !ws->d_pack_y[0] || !ws->d_pack_y[1] ||
         ws->pack_elems < pack_need) {
@@ -598,12 +674,18 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                 T* panel_A = d_A_local + static_cast<size_t>(local_panel_col) * lda_local;
                 T* panel_A_sub = panel_A + inner;
 
+                const size_t panel_factor_idx =
+                    BeginPhaseInterval(phase_profile, PhaseKind::PanelFactor, compute_stream);
                 tsqr<T>(cublas_handle, panel_rows, panel_A_sub, lda_local, ws->d_r_panel,
                         kPanelWidth, ws->d_tsqr_work_panel, ws->tsqr_work_panel_elems,
                         compute_stream);
+                EndPhaseInterval(phase_profile, panel_factor_idx, compute_stream);
 
+                const size_t wy_build_idx =
+                    BeginPhaseInterval(phase_profile, PhaseKind::WyBuild, compute_stream);
                 generate_wy<T>(panel_rows, kPanelWidth, panel_A_sub, lda_local, d_pack_y,
                                panel_rows, d_pack_w, panel_rows, compute_stream);
+                EndPhaseInterval(phase_profile, wy_build_idx, compute_stream);
 
                 const dim3 block_dim(16, 16);
                 const dim3 grid_dim((kPanelWidth + block_dim.x - 1) / block_dim.x,
@@ -856,8 +938,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
                        "cudaStreamWaitEvent compute_stream <- block_comm_done(use)");
         }
+        int local_tail_cols = 0;
+        const size_t tail_update_idx =
+            BeginPhaseInterval(phase_profile, PhaseKind::TailUpdate, compute_stream);
         ForEachLocalSegment(part, trail_begin, n, [&](int seg_begin, int seg_end, int local_begin) {
             const int cols_local = seg_end - seg_begin;
+            local_tail_cols += cols_local;
             T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
             if (trail_one_shot) {
                 block_update_one_shot(cublas_handle, block_begin, block_rows, kb, cols_local,
@@ -872,6 +958,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                                            a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
             }
         });
+        EndPhaseInterval(phase_profile, tail_update_idx, compute_stream);
+        if (phase_profile && local_tail_cols > 0) {
+            phase_profile->tail_update_flops +=
+                4.0 * static_cast<double>(block_rows) * static_cast<double>(kb) *
+                static_cast<double>(local_tail_cols);
+        }
     }
 }
 

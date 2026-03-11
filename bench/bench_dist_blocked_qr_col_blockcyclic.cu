@@ -79,6 +79,7 @@ struct Options {
     int block_cols = 0;
     bool print_per_rank = false;
     bool print_comm_bw = false;
+    bool print_phase_timing = false;
     bool use_double = false;
     bool type_valid = true;
     std::string type_value = "float";
@@ -139,6 +140,8 @@ Options ParseArgs(int argc, char** argv) {
             opts.print_per_rank = true;
         } else if (std::strcmp(argv[i], "--print_comm_bw") == 0) {
             opts.print_comm_bw = true;
+        } else if (std::strcmp(argv[i], "--print_phase_timing") == 0) {
+            opts.print_phase_timing = true;
         } else if (std::strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
             opts.type_value = argv[++i];
             opts.type_valid = ParseType(opts.type_value.c_str(), &opts.use_double);
@@ -272,6 +275,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<cudaEvent_t> comm_start_events;
     std::vector<cudaEvent_t> comm_end_events;
     std::vector<unsigned long long> comm_bytes_per_iter;
+    std::vector<double> phase_panel_ms_per_iter;
+    std::vector<double> phase_wy_ms_per_iter;
+    std::vector<double> phase_tail_ms_per_iter;
+    std::vector<double> phase_tail_flops_per_iter;
     if (opts.print_comm_bw) {
         comm_start_events.resize(opts.iters, nullptr);
         comm_end_events.resize(opts.iters, nullptr);
@@ -282,6 +289,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             distributed_qr_col_blockcyclic::AssertCuda(cudaEventCreate(&comm_end_events[i]),
                                                        "cudaEventCreate comm_end");
         }
+    }
+    if (opts.print_phase_timing) {
+        phase_panel_ms_per_iter.resize(opts.iters, 0.0);
+        phase_wy_ms_per_iter.resize(opts.iters, 0.0);
+        phase_tail_ms_per_iter.resize(opts.iters, 0.0);
+        phase_tail_flops_per_iter.resize(opts.iters, 0.0);
     }
 
     float timed_total_ms = 0.0f;
@@ -303,10 +316,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         }
         distributed_qr_col_blockcyclic::AssertCuda(cudaEventRecord(timed_start, compute_stream),
                                                    "cudaEventRecord timed_start");
+        distributed_qr_col_blockcyclic::PhaseProfile phase_profile{};
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
-            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode);
+            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode,
+            opts.print_phase_timing ? &phase_profile : nullptr);
         if (opts.print_comm_bw) {
             distributed_qr_col_blockcyclic::AssertCuda(
                 cudaEventRecord(comm_end_events[i], comm_stream), "cudaEventRecord comm_end");
@@ -321,6 +336,13 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                                                    "cudaEventRecord timed_stop");
         distributed_qr_col_blockcyclic::AssertCuda(cudaEventSynchronize(timed_stop),
                                                    "cudaEventSynchronize timed_stop");
+        if (opts.print_phase_timing) {
+            distributed_qr_col_blockcyclic::FinalizePhaseProfile(&phase_profile);
+            phase_panel_ms_per_iter[i] = phase_profile.panel_factor_ms;
+            phase_wy_ms_per_iter[i] = phase_profile.wy_build_ms;
+            phase_tail_ms_per_iter[i] = phase_profile.tail_update_ms;
+            phase_tail_flops_per_iter[i] = phase_profile.tail_update_flops;
+        }
         float iter_ms = 0.0f;
         distributed_qr_col_blockcyclic::AssertCuda(
             cudaEventElapsedTime(&iter_ms, timed_start, timed_stop), "cudaEventElapsedTime timed");
@@ -331,6 +353,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     const double local_ms_no_barrier = local_ms;
     double local_comm_ms = 0.0;
     unsigned long long local_comm_bytes = 0ULL;
+    double local_phase_panel_ms = 0.0;
+    double local_phase_wy_ms = 0.0;
+    double local_phase_tail_ms = 0.0;
+    double local_phase_tail_flops = 0.0;
     if (opts.print_comm_bw) {
         for (int i = 0; i < opts.iters; ++i) {
             float ms = 0.0f;
@@ -342,6 +368,18 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         }
         local_comm_ms /= static_cast<double>(opts.iters);
         local_comm_bytes /= static_cast<unsigned long long>(opts.iters);
+    }
+    if (opts.print_phase_timing) {
+        for (int i = 0; i < opts.iters; ++i) {
+            local_phase_panel_ms += phase_panel_ms_per_iter[i];
+            local_phase_wy_ms += phase_wy_ms_per_iter[i];
+            local_phase_tail_ms += phase_tail_ms_per_iter[i];
+            local_phase_tail_flops += phase_tail_flops_per_iter[i];
+        }
+        local_phase_panel_ms /= static_cast<double>(opts.iters);
+        local_phase_wy_ms /= static_cast<double>(opts.iters);
+        local_phase_tail_ms /= static_cast<double>(opts.iters);
+        local_phase_tail_flops /= static_cast<double>(opts.iters);
     }
 
     distributed_qr_col_blockcyclic::AssertCuda(cudaEventDestroy(timed_start),
@@ -357,6 +395,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> all_local_ms_no_barrier;
     std::vector<double> all_local_comm_ms;
     std::vector<unsigned long long> all_local_comm_bytes;
+    std::vector<double> all_local_phase_panel_ms;
+    std::vector<double> all_local_phase_wy_ms;
+    std::vector<double> all_local_phase_tail_ms;
+    std::vector<double> all_local_phase_tail_flops;
     if (opts.print_per_rank && env.rank == 0) {
         all_local_ms.resize(env.size, 0.0);
         all_local_ms_no_barrier.resize(env.size, 0.0);
@@ -364,6 +406,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (opts.print_comm_bw && env.rank == 0) {
         all_local_comm_ms.resize(env.size, 0.0);
         all_local_comm_bytes.resize(env.size, 0ULL);
+    }
+    if (opts.print_phase_timing && env.rank == 0) {
+        all_local_phase_panel_ms.resize(env.size, 0.0);
+        all_local_phase_wy_ms.resize(env.size, 0.0);
+        all_local_phase_tail_ms.resize(env.size, 0.0);
+        all_local_phase_tail_flops.resize(env.size, 0.0);
     }
     if (opts.print_per_rank) {
         MPI_Gather(&local_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_local_ms.data() : nullptr, 1,
@@ -379,6 +427,20 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         MPI_Gather(&local_comm_bytes, 1, MPI_UNSIGNED_LONG_LONG,
                    (env.rank == 0) ? all_local_comm_bytes.data() : nullptr, 1,
                    MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+    }
+    if (opts.print_phase_timing) {
+        MPI_Gather(&local_phase_panel_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_phase_panel_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_phase_wy_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_phase_wy_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_phase_tail_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_phase_tail_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_phase_tail_flops, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_phase_tail_flops.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
     }
 
     unsigned long long* d_bad = nullptr;
@@ -424,6 +486,20 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                              r, all_local_comm_ms[r],
                              static_cast<double>(all_local_comm_bytes[r]) / (1024.0 * 1024.0),
                              bw_gbps);
+            }
+        }
+        if (opts.print_phase_timing) {
+            for (int r = 0; r < env.size; ++r) {
+                const double tail_tflops =
+                    (all_local_phase_tail_ms[r] > 0.0)
+                        ? (all_local_phase_tail_flops[r] /
+                           (all_local_phase_tail_ms[r] * 1.0e-3) / 1.0e12)
+                        : 0.0;
+                spdlog::info(
+                    "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, tail {:.3f} ms, "
+                    "tail_gemm {:.3f} TFLOPS",
+                    r, all_local_phase_panel_ms[r], all_local_phase_wy_ms[r],
+                    all_local_phase_tail_ms[r], tail_tflops);
             }
         }
         if (total_bad > 0) {
