@@ -479,6 +479,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         cudaEvent_t panel_ready[2] = {};
         cudaEvent_t comm_done[2] = {};
         cudaEvent_t compute_done[2] = {};
+        cudaEvent_t block_ready = nullptr;
+        cudaEvent_t block_comm_done = nullptr;
     };
     static PersistentEvents events;
     if (!events.initialized) {
@@ -490,6 +492,10 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             AssertCuda(cudaEventCreateWithFlags(&events.compute_done[i], cudaEventDisableTiming),
                        "cudaEventCreate compute_done[i]");
         }
+        AssertCuda(cudaEventCreateWithFlags(&events.block_ready, cudaEventDisableTiming),
+                   "cudaEventCreate block_ready");
+        AssertCuda(cudaEventCreateWithFlags(&events.block_comm_done, cudaEventDisableTiming),
+                   "cudaEventCreate block_comm_done");
         events.initialized = true;
     }
 
@@ -500,6 +506,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                "cudaEventRecord compute_done[0]");
     AssertCuda(cudaEventRecord(events.compute_done[1], compute_stream),
                "cudaEventRecord compute_done[1]");
+    AssertCuda(cudaEventRecord(events.block_comm_done, comm_stream),
+               "cudaEventRecord block_comm_done");
 
     auto prefetch_recv = [&](int inner, int buf) {
         if (panel_comm_mode != PanelCommMode::SendRecv) {
@@ -538,8 +546,13 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
     int panel_seq = 0;
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
+        if (panel_comm_mode == PanelCommMode::Broadcast && part.world_size > 1) {
+            AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
+                       "cudaStreamWaitEvent compute_stream <- block_comm_done");
+        }
         const int block_end = std::min(block_begin + nb, n);
         const int kb = block_end - block_begin;
+        const int block_owner = OwnerOfPanel(block_begin, part);
 
         // Receiver-side lookahead: start receiving the first panel of this block early.
         prefetch_recv(block_begin, panel_seq & 1);
@@ -548,18 +561,23 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             const int buf = panel_seq & 1;
             ++panel_seq;
             const int panel_rows = m - inner;
-            const int owner = OwnerOfPanel(inner, part);
+            const int owner = block_owner;
             const int block_col_off = inner - block_begin;
             const bool self_needs_panel = RankHasColsAfter(part, part.rank, inner + kPanelWidth);
+            const bool need_panel_now =
+                (part.rank == owner) ||
+                (panel_comm_mode == PanelCommMode::SendRecv && self_needs_panel);
             int active_receivers = 0;
-            for (int r = 0; r < part.world_size; ++r) {
-                if (r == owner) {
-                    continue;
+            if (panel_comm_mode == PanelCommMode::SendRecv) {
+                for (int r = 0; r < part.world_size; ++r) {
+                    if (r == owner) {
+                        continue;
+                    }
+                    if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
+                        continue;
+                    }
+                    ++active_receivers;
                 }
-                if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
-                    continue;
-                }
-                ++active_receivers;
             }
             T* d_pack_w = ws->d_pack_w[buf];
             T* d_pack_y = ws->d_pack_y[buf];
@@ -596,10 +614,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
                 owner_prepared = true;
 
-                AssertCuda(cudaEventRecord(events.panel_ready[buf], compute_stream),
-                           "cudaEventRecord panel_ready[buf]");
-                AssertCuda(cudaStreamWaitEvent(comm_stream, events.panel_ready[buf], 0),
-                           "cudaStreamWaitEvent comm_stream <- panel_ready[buf]");
+                if (panel_comm_mode == PanelCommMode::SendRecv) {
+                    AssertCuda(cudaEventRecord(events.panel_ready[buf], compute_stream),
+                               "cudaEventRecord panel_ready[buf]");
+                    AssertCuda(cudaStreamWaitEvent(comm_stream, events.panel_ready[buf], 0),
+                               "cudaStreamWaitEvent comm_stream <- panel_ready[buf]");
+                }
             }
 
             if (!owner_prepared && part.rank == owner) {
@@ -608,23 +628,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
 
             if (part.world_size > 1) {
-                if (panel_comm_mode == PanelCommMode::Broadcast) {
-                    AssertNccl(ncclBroadcast(d_pack_w, d_pack_w,
-                                             static_cast<size_t>(panel_rows) * kPanelWidth,
-                                             nccl_type, owner, nccl_comm, comm_stream),
-                               "ncclBroadcast panel W");
-                    AssertNccl(ncclBroadcast(d_pack_y, d_pack_y,
-                                             static_cast<size_t>(panel_rows) * kPanelWidth,
-                                             nccl_type, owner, nccl_comm, comm_stream),
-                               "ncclBroadcast panel Y");
-                    if (comm_profile && active_receivers > 0) {
-                        comm_profile->bytes += 2ULL * static_cast<size_t>(panel_rows) *
-                                               kPanelWidth * sizeof(T) *
-                                               static_cast<size_t>(active_receivers);
-                    }
-                    AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
-                               "cudaEventRecord comm_done[buf](bcast)");
-                } else if (part.rank == owner) {
+                if (panel_comm_mode == PanelCommMode::SendRecv && part.rank == owner) {
                     const bool any_send = (active_receivers > 0);
                     if (any_send) {
                         AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
@@ -656,6 +660,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                         AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                                    "cudaEventRecord comm_done[buf](nosend)");
                     }
+                } else if (panel_comm_mode == PanelCommMode::Broadcast) {
+                    AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
+                               "cudaEventRecord comm_done[buf](block-bcast)");
                 }
             } else {
                 // No NCCL comm: for non-owner there is nothing to receive; for owner the pack is
@@ -673,8 +680,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
             // Apply this panel to local columns inside the current block using the original
             // panel WY (before block-WY update).
-            if (part.rank == owner || self_needs_panel) {
-                if (part.world_size > 1 && part.rank != owner) {
+            if (need_panel_now) {
+                if (panel_comm_mode == PanelCommMode::SendRecv && part.world_size > 1 &&
+                    part.rank != owner) {
                     AssertCuda(cudaStreamWaitEvent(compute_stream, events.comm_done[buf], 0),
                                "cudaStreamWaitEvent compute_stream <- comm_done[buf](use)");
                 }
@@ -721,7 +729,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
 
             // Scatter packed W/Y into block buffers and zero top of the panel columns.
-            if (part.rank == owner || self_needs_panel) {
+            if (need_panel_now) {
                 T* dst_w = ws->d_block_w + static_cast<size_t>(inner) +
                            static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
                 T* dst_y = ws->d_block_y + static_cast<size_t>(inner) +
@@ -760,7 +768,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
 
             // Now update W_i inside the block WY using the full block rows.
-            if (part.rank == owner || self_needs_panel) {
+            if (need_panel_now) {
                 if (inner > block_begin) {
                     const int k_prev = inner - block_begin;
                     const int block_rows = m - block_begin;
@@ -807,9 +815,47 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
         }
 
+        if (panel_comm_mode == PanelCommMode::Broadcast && part.world_size > 1) {
+            int block_receivers = 0;
+            for (int r = 0; r < part.world_size; ++r) {
+                if (r == block_owner) {
+                    continue;
+                }
+                if (!RankHasColsAfter(part, r, block_end)) {
+                    continue;
+                }
+                ++block_receivers;
+            }
+            if (block_receivers > 0) {
+                AssertCuda(cudaEventRecord(events.block_ready, compute_stream),
+                           "cudaEventRecord block_ready");
+                AssertCuda(cudaStreamWaitEvent(comm_stream, events.block_ready, 0),
+                           "cudaStreamWaitEvent comm_stream <- block_ready");
+                AssertNccl(ncclBroadcast(ws->d_block_w, ws->d_block_w,
+                                         static_cast<size_t>(m) * static_cast<size_t>(kb),
+                                         nccl_type, block_owner, nccl_comm, comm_stream),
+                           "ncclBroadcast block W");
+                AssertNccl(ncclBroadcast(ws->d_block_y, ws->d_block_y,
+                                         static_cast<size_t>(m) * static_cast<size_t>(kb),
+                                         nccl_type, block_owner, nccl_comm, comm_stream),
+                           "ncclBroadcast block Y");
+                if (comm_profile) {
+                    comm_profile->bytes += 2ULL * static_cast<size_t>(m) * static_cast<size_t>(kb) *
+                                           sizeof(T) * static_cast<size_t>(block_receivers);
+                }
+            }
+            AssertCuda(cudaEventRecord(events.block_comm_done, comm_stream),
+                       "cudaEventRecord block_comm_done");
+        }
+
         // Apply block WY to trailing columns after the block (full rows, like single-GPU).
         const int block_rows = m - block_begin;
         const int trail_begin = block_end;
+        if (panel_comm_mode == PanelCommMode::Broadcast && part.world_size > 1 &&
+            part.rank != block_owner && RankHasColsAfter(part, part.rank, block_end)) {
+            AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
+                       "cudaStreamWaitEvent compute_stream <- block_comm_done(use)");
+        }
         ForEachLocalSegment(part, trail_begin, n, [&](int seg_begin, int seg_end, int local_begin) {
             const int cols_local = seg_end - seg_begin;
             T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
