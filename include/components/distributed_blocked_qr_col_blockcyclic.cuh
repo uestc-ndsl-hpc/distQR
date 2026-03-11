@@ -281,6 +281,11 @@ enum class PanelCommMode {
     Broadcast = 1,
 };
 
+enum class BroadcastMode {
+    Panel = 0,
+    Block = 1,
+};
+
 template <typename T>
 void panel_update_one_shot(cublasHandle_t cublas_handle,
                            int panel_col,
@@ -474,6 +479,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     int overlap_tile_cols = 0,
     CommProfile* comm_profile = nullptr,
     PanelCommMode panel_comm_mode = PanelCommMode::SendRecv,
+    BroadcastMode broadcast_mode = BroadcastMode::Block,
     PhaseProfile* phase_profile = nullptr) {
     static_assert(kSupportedQrType<T>,
                   "distributed_qr_col_blockcyclic only supports float and double.");
@@ -511,11 +517,21 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         spdlog::error("Unsupported panel_comm_mode value {}.", static_cast<int>(panel_comm_mode));
         std::exit(1);
     }
+    if (broadcast_mode != BroadcastMode::Panel && broadcast_mode != BroadcastMode::Block) {
+        spdlog::error("Unsupported broadcast_mode value {}.", static_cast<int>(broadcast_mode));
+        std::exit(1);
+    }
 
     const bool trail_one_shot = overlap_tile_cols <= 0;
     const int tile_cols =
         trail_one_shot ? std::max(part.local_cols, 1)
                        : std::max(kPanelWidth, std::min(overlap_tile_cols, nb));
+    const bool use_panel_broadcast =
+        panel_comm_mode == PanelCommMode::Broadcast && broadcast_mode == BroadcastMode::Panel;
+    const bool use_block_broadcast =
+        panel_comm_mode == PanelCommMode::Broadcast && broadcast_mode == BroadcastMode::Block;
+    const bool use_panel_comm =
+        panel_comm_mode == PanelCommMode::SendRecv || use_panel_broadcast;
     const size_t tmp_need = static_cast<size_t>(nb) * static_cast<size_t>(tile_cols);
     if (ws->tmp_elems < tmp_need) {
         spdlog::error("Col blockcyclic tmp too small (need {} elems, got {}).", tmp_need,
@@ -631,7 +647,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
     int panel_seq = 0;
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
-        if (panel_comm_mode == PanelCommMode::Broadcast && part.world_size > 1) {
+        if (use_block_broadcast && part.world_size > 1) {
             AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
                        "cudaStreamWaitEvent compute_stream <- block_comm_done");
         }
@@ -649,11 +665,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             const int owner = block_owner;
             const int block_col_off = inner - block_begin;
             const bool self_needs_panel = RankHasColsAfter(part, part.rank, inner + kPanelWidth);
-            const bool need_panel_now =
-                (part.rank == owner) ||
-                (panel_comm_mode == PanelCommMode::SendRecv && self_needs_panel);
+            const bool need_panel_now = (part.rank == owner) || (use_panel_comm && self_needs_panel);
             int active_receivers = 0;
-            if (panel_comm_mode == PanelCommMode::SendRecv) {
+            if (use_panel_comm) {
                 for (int r = 0; r < part.world_size; ++r) {
                     if (r == owner) {
                         continue;
@@ -705,7 +719,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
                 owner_prepared = true;
 
-                if (panel_comm_mode == PanelCommMode::SendRecv) {
+                if (use_panel_comm) {
                     AssertCuda(cudaEventRecord(events.panel_ready[buf], compute_stream),
                                "cudaEventRecord panel_ready[buf]");
                     AssertCuda(cudaStreamWaitEvent(comm_stream, events.panel_ready[buf], 0),
@@ -719,7 +733,30 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
 
             if (part.world_size > 1) {
-                if (panel_comm_mode == PanelCommMode::SendRecv && part.rank == owner) {
+                if (use_panel_broadcast) {
+                    if (active_receivers > 0) {
+                        const size_t comm_idx =
+                            BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+                        AssertNccl(ncclBroadcast(
+                                       d_pack_w, d_pack_w,
+                                       static_cast<size_t>(panel_rows) * kPanelWidth, nccl_type,
+                                       owner, nccl_comm, comm_stream),
+                                   "ncclBroadcast panel W");
+                        AssertNccl(ncclBroadcast(
+                                       d_pack_y, d_pack_y,
+                                       static_cast<size_t>(panel_rows) * kPanelWidth, nccl_type,
+                                       owner, nccl_comm, comm_stream),
+                                   "ncclBroadcast panel Y");
+                        EndPhaseInterval(phase_profile, comm_idx, comm_stream);
+                        if (comm_profile) {
+                            comm_profile->bytes +=
+                                2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T) *
+                                static_cast<size_t>(active_receivers);
+                        }
+                    }
+                    AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
+                               "cudaEventRecord comm_done[buf](panel-bcast)");
+                } else if (panel_comm_mode == PanelCommMode::SendRecv && part.rank == owner) {
                     const bool any_send = (active_receivers > 0);
                     size_t comm_idx = 0;
                     if (any_send) {
@@ -754,7 +791,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                         AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                                    "cudaEventRecord comm_done[buf](nosend)");
                     }
-                } else if (panel_comm_mode == PanelCommMode::Broadcast) {
+                } else if (use_block_broadcast) {
                     AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                                "cudaEventRecord comm_done[buf](block-bcast)");
                 }
@@ -775,8 +812,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             // Apply this panel to local columns inside the current block using the original
             // panel WY (before block-WY update).
             if (need_panel_now) {
-                if (panel_comm_mode == PanelCommMode::SendRecv && part.world_size > 1 &&
-                    part.rank != owner) {
+                if (use_panel_comm && part.world_size > 1 && part.rank != owner) {
                     AssertCuda(cudaStreamWaitEvent(compute_stream, events.comm_done[buf], 0),
                                "cudaStreamWaitEvent compute_stream <- comm_done[buf](use)");
                 }
@@ -909,7 +945,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
         }
 
-        if (panel_comm_mode == PanelCommMode::Broadcast && part.world_size > 1) {
+        if (use_block_broadcast && part.world_size > 1) {
             int block_receivers = 0;
             for (int r = 0; r < part.world_size; ++r) {
                 if (r == block_owner) {
@@ -949,8 +985,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         // Apply block WY to trailing columns after the block (full rows, like single-GPU).
         const int block_rows = m - block_begin;
         const int trail_begin = block_end;
-        if (panel_comm_mode == PanelCommMode::Broadcast && part.world_size > 1 &&
-            part.rank != block_owner && RankHasColsAfter(part, part.rank, block_end)) {
+        if (use_block_broadcast && part.world_size > 1 && part.rank != block_owner &&
+            RankHasColsAfter(part, part.rank, block_end)) {
             AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
                        "cudaStreamWaitEvent compute_stream <- block_comm_done(use)");
         }

@@ -20,6 +20,7 @@
 namespace {
 
 using distributed_qr_col_blockcyclic::kPanelWidth;
+using distributed_qr_col_blockcyclic::BroadcastMode;
 using distributed_qr_col_blockcyclic::PanelCommMode;
 
 void AssertCurand(curandStatus_t status, const char* context) {
@@ -86,6 +87,9 @@ struct Options {
     PanelCommMode panel_comm_mode = PanelCommMode::SendRecv;
     bool panel_comm_valid = true;
     std::string panel_comm_value = "sendrecv";
+    BroadcastMode broadcast_mode = BroadcastMode::Block;
+    bool broadcast_mode_valid = true;
+    std::string broadcast_mode_value = "block";
 };
 
 bool ParsePanelCommMode(const char* mode, PanelCommMode* out_mode) {
@@ -95,6 +99,18 @@ bool ParsePanelCommMode(const char* mode, PanelCommMode* out_mode) {
     }
     if (std::strcmp(mode, "broadcast") == 0) {
         *out_mode = PanelCommMode::Broadcast;
+        return true;
+    }
+    return false;
+}
+
+bool ParseBroadcastMode(const char* mode, BroadcastMode* out_mode) {
+    if (std::strcmp(mode, "panel") == 0) {
+        *out_mode = BroadcastMode::Panel;
+        return true;
+    }
+    if (std::strcmp(mode, "block") == 0) {
+        *out_mode = BroadcastMode::Block;
         return true;
     }
     return false;
@@ -117,6 +133,13 @@ const char* PanelCommModeToString(PanelCommMode mode) {
         return "broadcast";
     }
     return "sendrecv";
+}
+
+const char* BroadcastModeToString(BroadcastMode mode) {
+    if (mode == BroadcastMode::Panel) {
+        return "panel";
+    }
+    return "block";
 }
 
 Options ParseArgs(int argc, char** argv) {
@@ -149,6 +172,10 @@ Options ParseArgs(int argc, char** argv) {
             opts.panel_comm_value = argv[++i];
             opts.panel_comm_valid =
                 ParsePanelCommMode(opts.panel_comm_value.c_str(), &opts.panel_comm_mode);
+        } else if (std::strcmp(argv[i], "--broadcast-mode") == 0 && i + 1 < argc) {
+            opts.broadcast_mode_value = argv[++i];
+            opts.broadcast_mode_valid =
+                ParseBroadcastMode(opts.broadcast_mode_value.c_str(), &opts.broadcast_mode);
         }
     }
     return opts;
@@ -255,7 +282,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
 
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
-            &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode);
+            &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode,
+            opts.broadcast_mode);
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                    "cudaStreamSynchronize warmup compute");
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
@@ -323,7 +351,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
             opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode,
-            opts.print_phase_timing ? &phase_profile : nullptr);
+            opts.broadcast_mode, opts.print_phase_timing ? &phase_profile : nullptr);
         if (opts.print_comm_bw) {
             distributed_qr_col_blockcyclic::AssertCuda(
                 cudaEventRecord(comm_end_events[i], comm_stream), "cudaEventRecord comm_end");
@@ -477,10 +505,14 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (env.rank == 0) {
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
-            "trail_update={} tile={} panel_comm={} np={} avg {:.3f} ms",
+            "trail_update={} tile={} panel_comm={} broadcast_mode={} np={} avg {:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols,
             trail_one_shot ? "one-shot" : "tiled", trail_one_shot ? part.local_cols : tile_cols,
-            PanelCommModeToString(opts.panel_comm_mode), env.size, max_ms);
+            PanelCommModeToString(opts.panel_comm_mode),
+            (opts.panel_comm_mode == PanelCommMode::Broadcast)
+                ? BroadcastModeToString(opts.broadcast_mode)
+                : "n/a",
+            env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms (no-barrier {:.3f} ms)", r,
@@ -620,6 +652,15 @@ int main(int argc, char** argv) {
         if (env.rank == 0) {
             spdlog::error("Invalid --panel-comm value '{}'. Supported values: sendrecv, broadcast.",
                           opts.panel_comm_value);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (opts.panel_comm_mode == PanelCommMode::Broadcast && !opts.broadcast_mode_valid) {
+        if (env.rank == 0) {
+            spdlog::error("Invalid --broadcast-mode value '{}'. Supported values: panel, block.",
+                          opts.broadcast_mode_value);
         }
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);
