@@ -71,9 +71,9 @@ inline void init(const MpiCudaEnv* env = nullptr) {
         }
 
         const size_t mem_mb = static_cast<size_t>(prop.totalGlobalMem / (1024 * 1024));
-        const int clock_mhz = prop.clockRate / 1000;
-        spdlog::info("GPU {}: {} (SM {}.{}, {} MB, {} MHz, {} SMs)", device, prop.name, prop.major,
-                     prop.minor, mem_mb, clock_mhz, prop.multiProcessorCount);
+        // const int clock_mhz = prop.clockRate / 1000;
+        spdlog::info("GPU {}: {} (SM {}.{}, {} MB, {} SMs)", device, prop.name, prop.major,
+                     prop.minor, mem_mb, prop.multiProcessorCount);
     }
 }
 
@@ -144,6 +144,15 @@ inline MpiCudaEnv init_mpi_and_bind_gpu(int* argc, char*** argv) {
         spdlog::error("No CUDA devices detected on node {}.", env.node_name);
         return env;
     }
+    if (env.local_size > env.device_count) {
+        spdlog::error(
+            "Local MPI ranks exceed visible CUDA devices on node {}: local_size={} "
+            "device_count={}. "
+            "Current mapping would reuse GPUs and NCCL init is invalid.",
+            env.node_name, env.local_size, env.device_count);
+        env.device_id = -1;
+        return env;
+    }
 
     env.device_id = env.local_rank % env.device_count;
     err = cudaSetDevice(env.device_id);
@@ -177,6 +186,11 @@ inline void finalize_mpi_if_needed(const MpiCudaEnv& env) {
 inline bool init_nccl_comm(MpiCudaEnv* env, MPI_Comm comm = MPI_COMM_WORLD) {
     if (!env) {
         spdlog::error("init_nccl_comm called with null env.");
+        return false;
+    }
+    if (env->device_id < 0) {
+        spdlog::error("NCCL init skipped because GPU binding is invalid on node {}.",
+                      env->node_name);
         return false;
     }
     if (env->nccl_initialized) {
