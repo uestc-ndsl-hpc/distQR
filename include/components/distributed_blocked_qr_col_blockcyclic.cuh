@@ -200,6 +200,7 @@ enum class PhaseKind {
     PanelFactor = 0,
     WyBuild = 1,
     TailUpdate = 2,
+    Comm = 3,
 };
 
 struct PhaseInterval {
@@ -212,6 +213,7 @@ struct PhaseProfile {
     double panel_factor_ms = 0.0;
     double wy_build_ms = 0.0;
     double tail_update_ms = 0.0;
+    double comm_ms = 0.0;
     double tail_update_flops = 0.0;
     std::vector<PhaseInterval> intervals;
 };
@@ -223,6 +225,7 @@ inline void ResetPhaseProfile(PhaseProfile* profile) {
     profile->panel_factor_ms = 0.0;
     profile->wy_build_ms = 0.0;
     profile->tail_update_ms = 0.0;
+    profile->comm_ms = 0.0;
     profile->tail_update_flops = 0.0;
     profile->intervals.clear();
 }
@@ -246,7 +249,8 @@ inline void EndPhaseInterval(PhaseProfile* profile, size_t idx, cudaStream_t str
     if (!profile) {
         return;
     }
-    AssertCuda(cudaEventRecord(profile->intervals[idx].stop, stream), "cudaEventRecord phase_stop");
+    AssertCuda(cudaEventRecord(profile->intervals[idx].stop, stream),
+               "cudaEventRecord phase_stop");
 }
 
 inline void FinalizePhaseProfile(PhaseProfile* profile) {
@@ -261,6 +265,8 @@ inline void FinalizePhaseProfile(PhaseProfile* profile) {
             profile->panel_factor_ms += static_cast<double>(ms);
         } else if (interval.kind == PhaseKind::WyBuild) {
             profile->wy_build_ms += static_cast<double>(ms);
+        } else if (interval.kind == PhaseKind::Comm) {
+            profile->comm_ms += static_cast<double>(ms);
         } else {
             profile->tail_update_ms += static_cast<double>(ms);
         }
@@ -605,6 +611,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         T* d_pack_y = ws->d_pack_y[buf];
         AssertCuda(cudaStreamWaitEvent(comm_stream, events.compute_done[buf], 0),
                    "cudaStreamWaitEvent comm_stream <- compute_done[buf](prefetch)");
+        const size_t comm_idx = BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
         AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y(prefetch)");
         AssertNccl(ncclRecv(d_pack_w, static_cast<size_t>(panel_rows) * kPanelWidth, nccl_type,
                             owner, nccl_comm, comm_stream),
@@ -613,8 +620,10 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                             owner, nccl_comm, comm_stream),
                    "ncclRecv panel Y(prefetch)");
         AssertNccl(ncclGroupEnd(), "ncclGroupEnd panel W/Y(prefetch)");
+        EndPhaseInterval(phase_profile, comm_idx, comm_stream);
         if (comm_profile) {
-            comm_profile->bytes += 2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
+            comm_profile->bytes +=
+                2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
         }
         AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                    "cudaEventRecord comm_done[buf](prefetch)");
@@ -712,7 +721,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             if (part.world_size > 1) {
                 if (panel_comm_mode == PanelCommMode::SendRecv && part.rank == owner) {
                     const bool any_send = (active_receivers > 0);
+                    size_t comm_idx = 0;
                     if (any_send) {
+                        comm_idx = BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
                         AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
                     }
                     for (int r = 0; r < part.world_size; ++r) {
@@ -735,6 +746,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     }
                     if (any_send) {
                         AssertNccl(ncclGroupEnd(), "ncclGroupEnd panel W/Y");
+                        EndPhaseInterval(phase_profile, comm_idx, comm_stream);
                         AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                                    "cudaEventRecord comm_done[buf](send)");
                     } else {
@@ -913,6 +925,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                            "cudaEventRecord block_ready");
                 AssertCuda(cudaStreamWaitEvent(comm_stream, events.block_ready, 0),
                            "cudaStreamWaitEvent comm_stream <- block_ready");
+                const size_t comm_idx =
+                    BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
                 AssertNccl(ncclBroadcast(ws->d_block_w, ws->d_block_w,
                                          static_cast<size_t>(m) * static_cast<size_t>(kb),
                                          nccl_type, block_owner, nccl_comm, comm_stream),
@@ -921,9 +935,11 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                                          static_cast<size_t>(m) * static_cast<size_t>(kb),
                                          nccl_type, block_owner, nccl_comm, comm_stream),
                            "ncclBroadcast block Y");
+                EndPhaseInterval(phase_profile, comm_idx, comm_stream);
                 if (comm_profile) {
-                    comm_profile->bytes += 2ULL * static_cast<size_t>(m) * static_cast<size_t>(kb) *
-                                           sizeof(T) * static_cast<size_t>(block_receivers);
+                    comm_profile->bytes +=
+                        2ULL * static_cast<size_t>(m) * static_cast<size_t>(kb) * sizeof(T) *
+                        static_cast<size_t>(block_receivers);
                 }
             }
             AssertCuda(cudaEventRecord(events.block_comm_done, comm_stream),

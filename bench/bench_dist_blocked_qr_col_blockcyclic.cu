@@ -277,6 +277,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<unsigned long long> comm_bytes_per_iter;
     std::vector<double> phase_panel_ms_per_iter;
     std::vector<double> phase_wy_ms_per_iter;
+    std::vector<double> phase_comm_ms_per_iter;
     std::vector<double> phase_tail_ms_per_iter;
     std::vector<double> phase_tail_flops_per_iter;
     if (opts.print_comm_bw) {
@@ -293,6 +294,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (opts.print_phase_timing) {
         phase_panel_ms_per_iter.resize(opts.iters, 0.0);
         phase_wy_ms_per_iter.resize(opts.iters, 0.0);
+        phase_comm_ms_per_iter.resize(opts.iters, 0.0);
         phase_tail_ms_per_iter.resize(opts.iters, 0.0);
         phase_tail_flops_per_iter.resize(opts.iters, 0.0);
     }
@@ -340,6 +342,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             distributed_qr_col_blockcyclic::FinalizePhaseProfile(&phase_profile);
             phase_panel_ms_per_iter[i] = phase_profile.panel_factor_ms;
             phase_wy_ms_per_iter[i] = phase_profile.wy_build_ms;
+            phase_comm_ms_per_iter[i] = phase_profile.comm_ms;
             phase_tail_ms_per_iter[i] = phase_profile.tail_update_ms;
             phase_tail_flops_per_iter[i] = phase_profile.tail_update_flops;
         }
@@ -355,6 +358,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     unsigned long long local_comm_bytes = 0ULL;
     double local_phase_panel_ms = 0.0;
     double local_phase_wy_ms = 0.0;
+    double local_phase_comm_ms = 0.0;
     double local_phase_tail_ms = 0.0;
     double local_phase_tail_flops = 0.0;
     if (opts.print_comm_bw) {
@@ -373,11 +377,13 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         for (int i = 0; i < opts.iters; ++i) {
             local_phase_panel_ms += phase_panel_ms_per_iter[i];
             local_phase_wy_ms += phase_wy_ms_per_iter[i];
+            local_phase_comm_ms += phase_comm_ms_per_iter[i];
             local_phase_tail_ms += phase_tail_ms_per_iter[i];
             local_phase_tail_flops += phase_tail_flops_per_iter[i];
         }
         local_phase_panel_ms /= static_cast<double>(opts.iters);
         local_phase_wy_ms /= static_cast<double>(opts.iters);
+        local_phase_comm_ms /= static_cast<double>(opts.iters);
         local_phase_tail_ms /= static_cast<double>(opts.iters);
         local_phase_tail_flops /= static_cast<double>(opts.iters);
     }
@@ -397,6 +403,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<unsigned long long> all_local_comm_bytes;
     std::vector<double> all_local_phase_panel_ms;
     std::vector<double> all_local_phase_wy_ms;
+    std::vector<double> all_local_phase_comm_ms;
     std::vector<double> all_local_phase_tail_ms;
     std::vector<double> all_local_phase_tail_flops;
     if (opts.print_per_rank && env.rank == 0) {
@@ -410,6 +417,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (opts.print_phase_timing && env.rank == 0) {
         all_local_phase_panel_ms.resize(env.size, 0.0);
         all_local_phase_wy_ms.resize(env.size, 0.0);
+        all_local_phase_comm_ms.resize(env.size, 0.0);
         all_local_phase_tail_ms.resize(env.size, 0.0);
         all_local_phase_tail_flops.resize(env.size, 0.0);
     }
@@ -434,6 +442,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                    MPI_COMM_WORLD);
         MPI_Gather(&local_phase_wy_ms, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_local_phase_wy_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_phase_comm_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_phase_comm_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
         MPI_Gather(&local_phase_tail_ms, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_local_phase_tail_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
@@ -496,10 +507,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                            (all_local_phase_tail_ms[r] * 1.0e-3) / 1.0e12)
                         : 0.0;
                 spdlog::info(
-                    "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, tail {:.3f} ms, "
-                    "tail_gemm {:.3f} TFLOPS",
+                    "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, comm {:.3f} ms, "
+                    "tail {:.3f} ms, tail_gemm {:.3f} TFLOPS",
                     r, all_local_phase_panel_ms[r], all_local_phase_wy_ms[r],
-                    all_local_phase_tail_ms[r], tail_tflops);
+                    all_local_phase_comm_ms[r], all_local_phase_tail_ms[r], tail_tflops);
             }
         }
         if (total_bad > 0) {
