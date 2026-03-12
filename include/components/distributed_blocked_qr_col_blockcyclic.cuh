@@ -340,7 +340,8 @@ void block_update_tile_pipeline(cublasHandle_t cublas_handle,
                                 T* A_trail,
                                 int lda_local,
                                 T* d_tmp0,
-                                T* d_tmp1) {
+                                T* d_tmp1,
+                                bool use_aux_events = false) {
     if (k <= 0 || cols_local <= 0 || rows <= 0 || tile_cols <= 0) {
         return;
     }
@@ -349,12 +350,14 @@ void block_update_tile_pipeline(cublasHandle_t cublas_handle,
     const T zero = static_cast<T>(0);
     const T minus_one = static_cast<T>(-1);
 
-    struct PersistentEvents {
+    struct PipelineEvents {
         bool initialized = false;
         cudaEvent_t gemm1_done[2] = {};
         cudaEvent_t apply_done[2] = {};
     };
-    static PersistentEvents events;
+    static PipelineEvents primary_events;
+    static PipelineEvents aux_events;
+    auto& events = use_aux_events ? aux_events : primary_events;
     if (!events.initialized) {
         AssertCuda(cudaEventCreateWithFlags(&events.gemm1_done[0], cudaEventDisableTiming),
                    "cudaEventCreate gemm1_done[0]");
@@ -779,7 +782,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                         block_update_tile_pipeline(
                             events.tail_cublas_handle, events.tail_update_stream, block_begin,
                             block_rows, tile_k, cols_local, tile_cols, block_w_tile, block_y_tile,
-                            m, a_trail, lda_local, ws->d_tail_tmp0, ws->d_tail_tmp1);
+                            m, a_trail, lda_local, ws->d_tail_tmp0, ws->d_tail_tmp1, true);
                     }
                 });
             EndPhaseInterval(phase_profile, tail_update_idx, events.tail_update_stream);
