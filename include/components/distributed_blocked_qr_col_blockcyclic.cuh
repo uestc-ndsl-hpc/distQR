@@ -716,9 +716,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             T* block_y_tile = ws->d_block_y + static_cast<size_t>(block_begin) +
                               static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
 
+            AssertCuda(cudaEventRecord(events.block_ready[tile_idx], compute_stream),
+                       "cudaEventRecord block_ready[tile_idx]");
             if (block_receivers > 0) {
-                AssertCuda(cudaEventRecord(events.block_ready[tile_idx], compute_stream),
-                           "cudaEventRecord block_ready[tile_idx]");
                 AssertCuda(cudaStreamWaitEvent(comm_stream, events.block_ready[tile_idx], 0),
                            "cudaStreamWaitEvent comm_stream <- block_ready[tile_idx]");
                 const size_t comm_idx =
@@ -746,7 +746,11 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                 return;
             }
 
-            if (part.world_size > 1 && part.rank != block_owner && block_receivers > 0) {
+            if (part.rank == block_owner || block_receivers == 0) {
+                AssertCuda(
+                    cudaStreamWaitEvent(events.tail_update_stream, events.block_ready[tile_idx], 0),
+                    "cudaStreamWaitEvent tail_update_stream <- block_ready[tile_idx]");
+            } else if (part.world_size > 1 && part.rank != block_owner && block_receivers > 0) {
                 AssertCuda(cudaStreamWaitEvent(events.tail_update_stream,
                                                events.block_comm_done[tile_idx], 0),
                            "cudaStreamWaitEvent tail_update_stream <- "
