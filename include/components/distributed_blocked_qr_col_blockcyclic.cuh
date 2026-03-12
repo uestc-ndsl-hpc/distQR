@@ -185,6 +185,11 @@ struct DistributedQrColBlockCyclicWorkspace {
     T* d_tmp1 = nullptr;
     size_t tmp_elems = 0;
 
+    // Dedicated work buffers for overlapped tail-update GEMMs.
+    T* d_tail_tmp0 = nullptr;
+    T* d_tail_tmp1 = nullptr;
+    size_t tail_tmp_elems = 0;
+
     // Compact block WY buffers: [(nb + kPanelWidth) x nb]
     // Used to build a global block WY without scattering into [m x nb].
     T* d_block_w_compact = nullptr;
@@ -230,9 +235,7 @@ inline void ResetPhaseProfile(PhaseProfile* profile) {
     profile->intervals.clear();
 }
 
-inline size_t BeginPhaseInterval(PhaseProfile* profile,
-                                 PhaseKind kind,
-                                 cudaStream_t stream) {
+inline size_t BeginPhaseInterval(PhaseProfile* profile, PhaseKind kind, cudaStream_t stream) {
     if (!profile) {
         return 0;
     }
@@ -249,8 +252,7 @@ inline void EndPhaseInterval(PhaseProfile* profile, size_t idx, cudaStream_t str
     if (!profile) {
         return;
     }
-    AssertCuda(cudaEventRecord(profile->intervals[idx].stop, stream),
-               "cudaEventRecord phase_stop");
+    AssertCuda(cudaEventRecord(profile->intervals[idx].stop, stream), "cudaEventRecord phase_stop");
 }
 
 inline void FinalizePhaseProfile(PhaseProfile* profile) {
@@ -452,13 +454,12 @@ void block_update_one_shot(cublasHandle_t cublas_handle,
 
     T* a_sub = A_trail + row_offset;
     AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, k, cols_local,
-                                           rows, &one, W, lda_wy, a_sub, lda_local, &zero, work,
-                                           k),
+                                           rows, &one, W, lda_wy, a_sub, lda_local, &zero, work, k),
                  "trail one-shot work = W^T * A");
-    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, rows,
-                                           cols_local, k, &minus_one, Y, lda_wy, work, k, &one,
-                                           a_sub, lda_local),
-                 "trail one-shot A -= Y * work");
+    AssertCublas(
+        CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, rows, cols_local, k,
+                                  &minus_one, Y, lda_wy, work, k, &one, a_sub, lda_local),
+        "trail one-shot A -= Y * work");
 }
 
 template <typename T>
@@ -480,7 +481,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     CommProfile* comm_profile = nullptr,
     PanelCommMode panel_comm_mode = PanelCommMode::SendRecv,
     BroadcastMode broadcast_mode = BroadcastMode::Block,
-    PhaseProfile* phase_profile = nullptr) {
+    PhaseProfile* phase_profile = nullptr,
+    int update_tile_cols = 0) {
     static_assert(kSupportedQrType<T>,
                   "distributed_qr_col_blockcyclic only supports float and double.");
 
@@ -522,16 +524,27 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         std::exit(1);
     }
 
-    const bool trail_one_shot = overlap_tile_cols <= 0;
-    const int tile_cols =
-        trail_one_shot ? std::max(part.local_cols, 1)
-                       : std::max(kPanelWidth, std::min(overlap_tile_cols, nb));
     const bool use_panel_broadcast =
         panel_comm_mode == PanelCommMode::Broadcast && broadcast_mode == BroadcastMode::Panel;
     const bool use_block_broadcast =
         panel_comm_mode == PanelCommMode::Broadcast && broadcast_mode == BroadcastMode::Block;
-    const bool use_panel_comm =
-        panel_comm_mode == PanelCommMode::SendRecv || use_panel_broadcast;
+    const bool use_panel_comm = panel_comm_mode == PanelCommMode::SendRecv || use_panel_broadcast;
+    const int block_update_tile_cols =
+        use_panel_broadcast
+            ? kPanelWidth
+            : (use_block_broadcast ? ((update_tile_cols > 0) ? update_tile_cols : nb) : nb);
+    if (use_block_broadcast &&
+        (block_update_tile_cols < kPanelWidth || block_update_tile_cols > nb ||
+         block_update_tile_cols % kPanelWidth != 0)) {
+        spdlog::error(
+            "Require update_tile_cols in [{}, {}] and multiple of {} for block broadcast "
+            "(got {}).",
+            kPanelWidth, nb, kPanelWidth, block_update_tile_cols);
+        std::exit(1);
+    }
+    const bool trail_one_shot = overlap_tile_cols <= 0;
+    const int tile_cols = trail_one_shot ? std::max(part.local_cols, 1)
+                                         : std::max(kPanelWidth, std::min(overlap_tile_cols, nb));
     const size_t tmp_need = static_cast<size_t>(nb) * static_cast<size_t>(tile_cols);
     if (ws->tmp_elems < tmp_need) {
         spdlog::error("Col blockcyclic tmp too small (need {} elems, got {}).", tmp_need,
@@ -540,6 +553,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     }
     if (!ws->d_tmp0 || !ws->d_tmp1) {
         spdlog::error("Col blockcyclic tmp buffers are null.");
+        std::exit(1);
+    }
+    if (use_block_broadcast &&
+        (!ws->d_tail_tmp0 || !ws->d_tail_tmp1 || ws->tail_tmp_elems < tmp_need)) {
+        spdlog::error("Col blockcyclic tail tmp too small or null (need {} elems, got {}).",
+                      tmp_need, ws->tail_tmp_elems);
         std::exit(1);
     }
     if (comm_profile) {
@@ -577,8 +596,11 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         cudaEvent_t panel_ready[2] = {};
         cudaEvent_t comm_done[2] = {};
         cudaEvent_t compute_done[2] = {};
-        cudaEvent_t block_ready = nullptr;
-        cudaEvent_t block_comm_done = nullptr;
+        cudaEvent_t tail_apply_done = nullptr;
+        std::vector<cudaEvent_t> block_ready;
+        std::vector<cudaEvent_t> block_comm_done;
+        cudaStream_t tail_update_stream = nullptr;
+        cublasHandle_t tail_cublas_handle = nullptr;
     };
     static PersistentEvents events;
     if (!events.initialized) {
@@ -590,11 +612,26 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             AssertCuda(cudaEventCreateWithFlags(&events.compute_done[i], cudaEventDisableTiming),
                        "cudaEventCreate compute_done[i]");
         }
-        AssertCuda(cudaEventCreateWithFlags(&events.block_ready, cudaEventDisableTiming),
-                   "cudaEventCreate block_ready");
-        AssertCuda(cudaEventCreateWithFlags(&events.block_comm_done, cudaEventDisableTiming),
-                   "cudaEventCreate block_comm_done");
+        AssertCuda(cudaEventCreateWithFlags(&events.tail_apply_done, cudaEventDisableTiming),
+                   "cudaEventCreate tail_apply_done");
+        AssertCuda(cudaStreamCreateWithFlags(&events.tail_update_stream, cudaStreamNonBlocking),
+                   "cudaStreamCreate tail_update_stream");
+        AssertCublas(cublasCreate(&events.tail_cublas_handle), "cublasCreate tail_cublas_handle");
+        AssertCublas(cublasSetStream(events.tail_cublas_handle, events.tail_update_stream),
+                     "cublasSetStream(tail_update_stream)");
         events.initialized = true;
+    }
+    const int block_tile_count =
+        use_block_broadcast ? ((nb + block_update_tile_cols - 1) / block_update_tile_cols) : 0;
+    while (static_cast<int>(events.block_ready.size()) < block_tile_count) {
+        cudaEvent_t block_ready = nullptr;
+        cudaEvent_t block_comm_done = nullptr;
+        AssertCuda(cudaEventCreateWithFlags(&block_ready, cudaEventDisableTiming),
+                   "cudaEventCreate block_ready");
+        AssertCuda(cudaEventCreateWithFlags(&block_comm_done, cudaEventDisableTiming),
+                   "cudaEventCreate block_comm_done");
+        events.block_ready.push_back(block_ready);
+        events.block_comm_done.push_back(block_comm_done);
     }
 
     // Initialize reuse guards: both pack buffers start out free.
@@ -604,8 +641,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                "cudaEventRecord compute_done[0]");
     AssertCuda(cudaEventRecord(events.compute_done[1], compute_stream),
                "cudaEventRecord compute_done[1]");
-    AssertCuda(cudaEventRecord(events.block_comm_done, comm_stream),
-               "cudaEventRecord block_comm_done");
+    AssertCuda(cudaEventRecord(events.tail_apply_done, events.tail_update_stream),
+               "cudaEventRecord tail_apply_done");
 
     auto prefetch_recv = [&](int inner, int buf) {
         if (panel_comm_mode != PanelCommMode::SendRecv) {
@@ -638,8 +675,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         AssertNccl(ncclGroupEnd(), "ncclGroupEnd panel W/Y(prefetch)");
         EndPhaseInterval(phase_profile, comm_idx, comm_stream);
         if (comm_profile) {
-            comm_profile->bytes +=
-                2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
+            comm_profile->bytes += 2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
         }
         AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                    "cudaEventRecord comm_done[buf](prefetch)");
@@ -647,13 +683,108 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
     int panel_seq = 0;
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
-        if (use_block_broadcast && part.world_size > 1) {
-            AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
-                       "cudaStreamWaitEvent compute_stream <- block_comm_done");
-        }
         const int block_end = std::min(block_begin + nb, n);
         const int kb = block_end - block_begin;
         const int block_owner = OwnerOfPanel(block_begin, part);
+        int block_receivers = 0;
+        if (use_block_broadcast && part.world_size > 1) {
+            for (int r = 0; r < part.world_size; ++r) {
+                if (r == block_owner) {
+                    continue;
+                }
+                if (!RankHasColsAfter(part, r, block_end)) {
+                    continue;
+                }
+                ++block_receivers;
+            }
+        }
+        int flushed_block_cols = 0;
+        int flushed_block_tiles = 0;
+
+        auto flush_block_tile = [&](int tile_end) {
+            if (!use_block_broadcast) {
+                return;
+            }
+            const int tile_k = tile_end - (block_begin + flushed_block_cols);
+            if (tile_k <= 0) {
+                return;
+            }
+            const int tile_idx = flushed_block_tiles++;
+
+            T* block_w_tile = ws->d_block_w + static_cast<size_t>(block_begin) +
+                              static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
+            T* block_y_tile = ws->d_block_y + static_cast<size_t>(block_begin) +
+                              static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
+
+            if (block_receivers > 0) {
+                AssertCuda(cudaEventRecord(events.block_ready[tile_idx], compute_stream),
+                           "cudaEventRecord block_ready[tile_idx]");
+                AssertCuda(cudaStreamWaitEvent(comm_stream, events.block_ready[tile_idx], 0),
+                           "cudaStreamWaitEvent comm_stream <- block_ready[tile_idx]");
+                const size_t comm_idx =
+                    BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+                AssertNccl(ncclBroadcast(block_w_tile, block_w_tile,
+                                         static_cast<size_t>(m) * static_cast<size_t>(tile_k),
+                                         nccl_type, block_owner, nccl_comm, comm_stream),
+                           "ncclBroadcast block-tile W");
+                AssertNccl(ncclBroadcast(block_y_tile, block_y_tile,
+                                         static_cast<size_t>(m) * static_cast<size_t>(tile_k),
+                                         nccl_type, block_owner, nccl_comm, comm_stream),
+                           "ncclBroadcast block-tile Y");
+                EndPhaseInterval(phase_profile, comm_idx, comm_stream);
+                if (comm_profile) {
+                    comm_profile->bytes += 2ULL * static_cast<size_t>(m) *
+                                           static_cast<size_t>(tile_k) * sizeof(T) *
+                                           static_cast<size_t>(block_receivers);
+                }
+            }
+            AssertCuda(cudaEventRecord(events.block_comm_done[tile_idx], comm_stream),
+                       "cudaEventRecord block_comm_done[tile_idx]");
+
+            if (!RankHasColsAfter(part, part.rank, block_end)) {
+                flushed_block_cols += tile_k;
+                return;
+            }
+
+            if (part.world_size > 1 && part.rank != block_owner && block_receivers > 0) {
+                AssertCuda(cudaStreamWaitEvent(events.tail_update_stream,
+                                               events.block_comm_done[tile_idx], 0),
+                           "cudaStreamWaitEvent tail_update_stream <- "
+                           "block_comm_done[tile_idx]");
+            }
+
+            int local_tail_cols = 0;
+            const int block_rows = m - block_begin;
+            const size_t tail_update_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::TailUpdate, events.tail_update_stream);
+            ForEachLocalSegment(
+                part, block_end, n, [&](int seg_begin, int seg_end, int local_begin) {
+                    const int cols_local = seg_end - seg_begin;
+                    local_tail_cols += cols_local;
+                    T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                    if (trail_one_shot) {
+                        block_update_one_shot(events.tail_cublas_handle, block_begin, block_rows,
+                                              tile_k, cols_local, block_w_tile, block_y_tile, m,
+                                              a_trail, lda_local, ws->d_tail_tmp0,
+                                              ws->tail_tmp_elems);
+                    } else {
+                        block_update_tile_pipeline(
+                            events.tail_cublas_handle, events.tail_update_stream, block_begin,
+                            block_rows, tile_k, cols_local, tile_cols, block_w_tile, block_y_tile,
+                            m, a_trail, lda_local, ws->d_tail_tmp0, ws->d_tail_tmp1);
+                    }
+                });
+            EndPhaseInterval(phase_profile, tail_update_idx, events.tail_update_stream);
+            if (phase_profile && local_tail_cols > 0) {
+                phase_profile->tail_update_flops += 4.0 * static_cast<double>(block_rows) *
+                                                    static_cast<double>(tile_k) *
+                                                    static_cast<double>(local_tail_cols);
+            }
+            AssertCuda(cudaEventRecord(events.tail_apply_done, events.tail_update_stream),
+                       "cudaEventRecord tail_apply_done");
+
+            flushed_block_cols += tile_k;
+        };
 
         // Receiver-side lookahead: start receiving the first panel of this block early.
         prefetch_recv(block_begin, panel_seq & 1);
@@ -665,7 +796,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             const int owner = block_owner;
             const int block_col_off = inner - block_begin;
             const bool self_needs_panel = RankHasColsAfter(part, part.rank, inner + kPanelWidth);
-            const bool need_panel_now = (part.rank == owner) || (use_panel_comm && self_needs_panel);
+            const bool need_panel_now =
+                (part.rank == owner) || (use_panel_comm && self_needs_panel);
             int active_receivers = 0;
             if (use_panel_comm) {
                 for (int r = 0; r < part.world_size; ++r) {
@@ -737,21 +869,19 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     if (active_receivers > 0) {
                         const size_t comm_idx =
                             BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
-                        AssertNccl(ncclBroadcast(
-                                       d_pack_w, d_pack_w,
-                                       static_cast<size_t>(panel_rows) * kPanelWidth, nccl_type,
-                                       owner, nccl_comm, comm_stream),
+                        AssertNccl(ncclBroadcast(d_pack_w, d_pack_w,
+                                                 static_cast<size_t>(panel_rows) * kPanelWidth,
+                                                 nccl_type, owner, nccl_comm, comm_stream),
                                    "ncclBroadcast panel W");
-                        AssertNccl(ncclBroadcast(
-                                       d_pack_y, d_pack_y,
-                                       static_cast<size_t>(panel_rows) * kPanelWidth, nccl_type,
-                                       owner, nccl_comm, comm_stream),
+                        AssertNccl(ncclBroadcast(d_pack_y, d_pack_y,
+                                                 static_cast<size_t>(panel_rows) * kPanelWidth,
+                                                 nccl_type, owner, nccl_comm, comm_stream),
                                    "ncclBroadcast panel Y");
                         EndPhaseInterval(phase_profile, comm_idx, comm_stream);
                         if (comm_profile) {
-                            comm_profile->bytes +=
-                                2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T) *
-                                static_cast<size_t>(active_receivers);
+                            comm_profile->bytes += 2ULL * static_cast<size_t>(panel_rows) *
+                                                   kPanelWidth * sizeof(T) *
+                                                   static_cast<size_t>(active_receivers);
                         }
                     }
                     AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
@@ -943,78 +1073,48 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                         cudaMemcpyDeviceToDevice, compute_stream),
                     "cudaMemcpy2DAsync block_w -> d_W_local");
             }
+
+            const int built_block_cols = inner + kPanelWidth - block_begin;
+            if (use_block_broadcast &&
+                ((built_block_cols - flushed_block_cols) >= block_update_tile_cols ||
+                 inner + kPanelWidth == block_end)) {
+                flush_block_tile(inner + kPanelWidth);
+            }
         }
 
-        if (use_block_broadcast && part.world_size > 1) {
-            int block_receivers = 0;
-            for (int r = 0; r < part.world_size; ++r) {
-                if (r == block_owner) {
-                    continue;
-                }
-                if (!RankHasColsAfter(part, r, block_end)) {
-                    continue;
-                }
-                ++block_receivers;
+        if (!use_block_broadcast) {
+            const int block_rows = m - block_begin;
+            int local_tail_cols = 0;
+            const size_t tail_update_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::TailUpdate, compute_stream);
+            ForEachLocalSegment(
+                part, block_end, n, [&](int seg_begin, int seg_end, int local_begin) {
+                    const int cols_local = seg_end - seg_begin;
+                    local_tail_cols += cols_local;
+                    T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                    if (trail_one_shot) {
+                        block_update_one_shot(cublas_handle, block_begin, block_rows, kb,
+                                              cols_local,
+                                              ws->d_block_w + static_cast<size_t>(block_begin),
+                                              ws->d_block_y + static_cast<size_t>(block_begin), m,
+                                              a_trail, lda_local, ws->d_tmp0, ws->tmp_elems);
+                    } else {
+                        block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
+                                                   block_rows, kb, cols_local, tile_cols,
+                                                   ws->d_block_w + static_cast<size_t>(block_begin),
+                                                   ws->d_block_y + static_cast<size_t>(block_begin),
+                                                   m, a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
+                    }
+                });
+            EndPhaseInterval(phase_profile, tail_update_idx, compute_stream);
+            if (phase_profile && local_tail_cols > 0) {
+                phase_profile->tail_update_flops += 4.0 * static_cast<double>(block_rows) *
+                                                    static_cast<double>(kb) *
+                                                    static_cast<double>(local_tail_cols);
             }
-            if (block_receivers > 0) {
-                AssertCuda(cudaEventRecord(events.block_ready, compute_stream),
-                           "cudaEventRecord block_ready");
-                AssertCuda(cudaStreamWaitEvent(comm_stream, events.block_ready, 0),
-                           "cudaStreamWaitEvent comm_stream <- block_ready");
-                const size_t comm_idx =
-                    BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
-                AssertNccl(ncclBroadcast(ws->d_block_w, ws->d_block_w,
-                                         static_cast<size_t>(m) * static_cast<size_t>(kb),
-                                         nccl_type, block_owner, nccl_comm, comm_stream),
-                           "ncclBroadcast block W");
-                AssertNccl(ncclBroadcast(ws->d_block_y, ws->d_block_y,
-                                         static_cast<size_t>(m) * static_cast<size_t>(kb),
-                                         nccl_type, block_owner, nccl_comm, comm_stream),
-                           "ncclBroadcast block Y");
-                EndPhaseInterval(phase_profile, comm_idx, comm_stream);
-                if (comm_profile) {
-                    comm_profile->bytes +=
-                        2ULL * static_cast<size_t>(m) * static_cast<size_t>(kb) * sizeof(T) *
-                        static_cast<size_t>(block_receivers);
-                }
-            }
-            AssertCuda(cudaEventRecord(events.block_comm_done, comm_stream),
-                       "cudaEventRecord block_comm_done");
-        }
-
-        // Apply block WY to trailing columns after the block (full rows, like single-GPU).
-        const int block_rows = m - block_begin;
-        const int trail_begin = block_end;
-        if (use_block_broadcast && part.world_size > 1 && part.rank != block_owner &&
-            RankHasColsAfter(part, part.rank, block_end)) {
-            AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
-                       "cudaStreamWaitEvent compute_stream <- block_comm_done(use)");
-        }
-        int local_tail_cols = 0;
-        const size_t tail_update_idx =
-            BeginPhaseInterval(phase_profile, PhaseKind::TailUpdate, compute_stream);
-        ForEachLocalSegment(part, trail_begin, n, [&](int seg_begin, int seg_end, int local_begin) {
-            const int cols_local = seg_end - seg_begin;
-            local_tail_cols += cols_local;
-            T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
-            if (trail_one_shot) {
-                block_update_one_shot(cublas_handle, block_begin, block_rows, kb, cols_local,
-                                      ws->d_block_w + static_cast<size_t>(block_begin),
-                                      ws->d_block_y + static_cast<size_t>(block_begin), m, a_trail,
-                                      lda_local, ws->d_tmp0, ws->tmp_elems);
-            } else {
-                block_update_tile_pipeline(cublas_handle, compute_stream, block_begin, block_rows,
-                                           kb, cols_local, tile_cols,
-                                           ws->d_block_w + static_cast<size_t>(block_begin),
-                                           ws->d_block_y + static_cast<size_t>(block_begin), m,
-                                           a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
-            }
-        });
-        EndPhaseInterval(phase_profile, tail_update_idx, compute_stream);
-        if (phase_profile && local_tail_cols > 0) {
-            phase_profile->tail_update_flops +=
-                4.0 * static_cast<double>(block_rows) * static_cast<double>(kb) *
-                static_cast<double>(local_tail_cols);
+        } else if (RankHasColsAfter(part, part.rank, block_end)) {
+            AssertCuda(cudaStreamWaitEvent(compute_stream, events.tail_apply_done, 0),
+                       "cudaStreamWaitEvent compute_stream <- tail_apply_done");
         }
     }
 }

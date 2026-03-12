@@ -19,8 +19,8 @@
 
 namespace {
 
-using distributed_qr_col_blockcyclic::kPanelWidth;
 using distributed_qr_col_blockcyclic::BroadcastMode;
+using distributed_qr_col_blockcyclic::kPanelWidth;
 using distributed_qr_col_blockcyclic::PanelCommMode;
 
 void AssertCurand(curandStatus_t status, const char* context) {
@@ -77,6 +77,7 @@ struct Options {
     int warmup = 1;
     int iters = 3;
     int overlap_tile = 0;
+    int update_tile = 0;
     int block_cols = 0;
     bool print_per_rank = false;
     bool print_comm_bw = false;
@@ -157,6 +158,8 @@ Options ParseArgs(int argc, char** argv) {
             opts.iters = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--overlap_tile") == 0 && i + 1 < argc) {
             opts.overlap_tile = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--update_tile") == 0 && i + 1 < argc) {
+            opts.update_tile = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--block_cols") == 0 && i + 1 < argc) {
             opts.block_cols = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--print_per_rank") == 0) {
@@ -208,9 +211,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     FillDeviceRandom(d_A0, local_elems_used, 2026ULL + static_cast<unsigned long long>(env.rank));
 
     const bool trail_one_shot = opts.overlap_tile <= 0;
-    const int tile_cols =
-        trail_one_shot ? std::max(part.local_cols, 1)
-                       : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
+    const int tile_cols = trail_one_shot
+                              ? std::max(part.local_cols, 1)
+                              : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.pack_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
@@ -218,6 +221,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     ws.block_compact_elems =
         static_cast<size_t>(opts.nb + kPanelWidth) * static_cast<size_t>(opts.nb);
     ws.tmp_elems = static_cast<size_t>(opts.nb) * static_cast<size_t>(tile_cols);
+    ws.tail_tmp_elems = ws.tmp_elems;
 
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_r_panel, static_cast<size_t>(kPanelWidth) * kPanelWidth * sizeof(T)),
@@ -247,6 +251,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                                                "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws.d_tmp1, ws.tmp_elems * sizeof(T)),
                                                "cudaMalloc ws.d_tmp1");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_tail_tmp0, ws.tail_tmp_elems * sizeof(T)), "cudaMalloc ws.d_tail_tmp0");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_tail_tmp1, ws.tail_tmp_elems * sizeof(T)), "cudaMalloc ws.d_tail_tmp1");
 
     cudaStream_t compute_stream = nullptr;
     cudaStream_t comm_stream = nullptr;
@@ -283,7 +291,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode,
-            opts.broadcast_mode);
+            opts.broadcast_mode, nullptr, opts.update_tile);
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                    "cudaStreamSynchronize warmup compute");
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
@@ -350,8 +358,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
-            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode,
-            opts.broadcast_mode, opts.print_phase_timing ? &phase_profile : nullptr);
+            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode, opts.broadcast_mode,
+            opts.print_phase_timing ? &phase_profile : nullptr, opts.update_tile);
         if (opts.print_comm_bw) {
             distributed_qr_col_blockcyclic::AssertCuda(
                 cudaEventRecord(comm_end_events[i], comm_stream), "cudaEventRecord comm_end");
@@ -503,16 +511,23 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     MPI_Allreduce(&h_bad, &total_bad, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
 
     if (env.rank == 0) {
+        const int effective_update_tile =
+            (opts.panel_comm_mode != PanelCommMode::Broadcast)
+                ? 0
+                : ((opts.broadcast_mode == BroadcastMode::Panel)
+                       ? kPanelWidth
+                       : ((opts.update_tile > 0) ? opts.update_tile : opts.nb));
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
-            "trail_update={} tile={} panel_comm={} broadcast_mode={} np={} avg {:.3f} ms",
+            "trail_update={} tile={} panel_comm={} broadcast_mode={} update_tile={} np={} avg "
+            "{:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols,
             trail_one_shot ? "one-shot" : "tiled", trail_one_shot ? part.local_cols : tile_cols,
             PanelCommModeToString(opts.panel_comm_mode),
             (opts.panel_comm_mode == PanelCommMode::Broadcast)
                 ? BroadcastModeToString(opts.broadcast_mode)
                 : "n/a",
-            env.size, max_ms);
+            effective_update_tile, env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms (no-barrier {:.3f} ms)", r,
@@ -533,11 +548,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         }
         if (opts.print_phase_timing) {
             for (int r = 0; r < env.size; ++r) {
-                const double tail_tflops =
-                    (all_local_phase_tail_ms[r] > 0.0)
-                        ? (all_local_phase_tail_flops[r] /
-                           (all_local_phase_tail_ms[r] * 1.0e-3) / 1.0e12)
-                        : 0.0;
+                const double tail_tflops = (all_local_phase_tail_ms[r] > 0.0)
+                                               ? (all_local_phase_tail_flops[r] /
+                                                  (all_local_phase_tail_ms[r] * 1.0e-3) / 1.0e12)
+                                               : 0.0;
                 spdlog::info(
                     "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, comm {:.3f} ms, "
                     "tail {:.3f} ms, tail_gemm {:.3f} TFLOPS",
@@ -582,6 +596,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                                                "cudaFree ws.d_block_y_compact");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tail_tmp0), "cudaFree ws.d_tail_tmp0");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tail_tmp1), "cudaFree ws.d_tail_tmp1");
 
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_A0), "cudaFree d_A0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_A), "cudaFree d_A");
@@ -661,6 +677,26 @@ int main(int argc, char** argv) {
         if (env.rank == 0) {
             spdlog::error("Invalid --broadcast-mode value '{}'. Supported values: panel, block.",
                           opts.broadcast_mode_value);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (opts.update_tile < 0) {
+        if (env.rank == 0) {
+            spdlog::error("Invalid --update_tile {}. Require update_tile >= 0.", opts.update_tile);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (opts.update_tile > 0 && (opts.update_tile < kPanelWidth || opts.update_tile > opts.nb ||
+                                 opts.update_tile % kPanelWidth != 0)) {
+        if (env.rank == 0) {
+            spdlog::error(
+                "Invalid --update_tile {}. Require {} <= update_tile <= nb and "
+                "update_tile%{}==0.",
+                opts.update_tile, kPanelWidth, kPanelWidth);
         }
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);

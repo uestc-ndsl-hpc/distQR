@@ -243,6 +243,7 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
     ws.block_compact_elems = static_cast<size_t>(nb + distributed_qr_col_blockcyclic::kPanelWidth) *
                              static_cast<size_t>(nb);
     ws.tmp_elems = static_cast<size_t>(nb) * static_cast<size_t>(tile_cols);
+    ws.tail_tmp_elems = ws.tmp_elems;
 
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_r_panel, static_cast<size_t>(distributed_qr_col_blockcyclic::kPanelWidth) *
@@ -273,6 +274,10 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
                                                "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws.d_tmp1, ws.tmp_elems * sizeof(T)),
                                                "cudaMalloc ws.d_tmp1");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_tail_tmp0, ws.tail_tmp_elems * sizeof(T)), "cudaMalloc ws.d_tail_tmp0");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_tail_tmp1, ws.tail_tmp_elems * sizeof(T)), "cudaMalloc ws.d_tail_tmp1");
 
     cudaStream_t compute_stream = nullptr;
     cudaStream_t comm_stream = nullptr;
@@ -391,6 +396,8 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
                                                "cudaFree ws.d_block_y_compact");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tail_tmp0), "cudaFree ws.d_tail_tmp0");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tail_tmp1), "cudaFree ws.d_tail_tmp1");
 
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_A0), "cudaFree d_A0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_Afact), "cudaFree d_Afact");
