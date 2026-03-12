@@ -718,10 +718,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
             const int tile_idx = flushed_block_tiles++;
 
-            T* block_w_tile = ws->d_block_w + static_cast<size_t>(block_begin) +
-                              static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
-            T* block_y_tile = ws->d_block_y + static_cast<size_t>(block_begin) +
-                              static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
+            T* block_w_tile =
+                ws->d_block_w + static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
+            T* block_y_tile =
+                ws->d_block_y + static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
+            T* block_w_tile_sub = block_w_tile + static_cast<size_t>(block_begin);
+            T* block_y_tile_sub = block_y_tile + static_cast<size_t>(block_begin);
 
             AssertCuda(cudaEventRecord(events.block_ready[tile_idx], compute_stream),
                        "cudaEventRecord block_ready[tile_idx]");
@@ -775,14 +777,15 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
                     if (trail_one_shot) {
                         block_update_one_shot(events.tail_cublas_handle, block_begin, block_rows,
-                                              tile_k, cols_local, block_w_tile, block_y_tile, m,
-                                              a_trail, lda_local, ws->d_tail_tmp0,
+                                              tile_k, cols_local, block_w_tile_sub,
+                                              block_y_tile_sub, m, a_trail, lda_local, ws->d_tail_tmp0,
                                               ws->tail_tmp_elems);
                     } else {
                         block_update_tile_pipeline(
                             events.tail_cublas_handle, events.tail_update_stream, block_begin,
-                            block_rows, tile_k, cols_local, tile_cols, block_w_tile, block_y_tile,
-                            m, a_trail, lda_local, ws->d_tail_tmp0, ws->d_tail_tmp1, true);
+                            block_rows, tile_k, cols_local, tile_cols, block_w_tile_sub,
+                            block_y_tile_sub, m, a_trail, lda_local, ws->d_tail_tmp0,
+                            ws->d_tail_tmp1, true);
                     }
                 });
             EndPhaseInterval(phase_profile, tail_update_idx, events.tail_update_stream);
