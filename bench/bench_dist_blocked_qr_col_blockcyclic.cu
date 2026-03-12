@@ -19,8 +19,8 @@
 
 namespace {
 
-using distributed_qr_col_blockcyclic::kPanelWidth;
 using distributed_qr_col_blockcyclic::BroadcastMode;
+using distributed_qr_col_blockcyclic::kPanelWidth;
 using distributed_qr_col_blockcyclic::PanelCommMode;
 
 void AssertCurand(curandStatus_t status, const char* context) {
@@ -208,9 +208,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     FillDeviceRandom(d_A0, local_elems_used, 2026ULL + static_cast<unsigned long long>(env.rank));
 
     const bool trail_one_shot = opts.overlap_tile <= 0;
-    const int tile_cols =
-        trail_one_shot ? std::max(part.local_cols, 1)
-                       : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
+    const int tile_cols = trail_one_shot
+                              ? std::max(part.local_cols, 1)
+                              : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.pack_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
@@ -234,9 +234,17 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_pack_y[1], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
+        cudaMalloc(&ws.d_block_w[0], ws.block_storage_elems * sizeof(T)),
+        "cudaMalloc ws.d_block_w[0]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_y, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_y");
+        cudaMalloc(&ws.d_block_w[1], ws.block_storage_elems * sizeof(T)),
+        "cudaMalloc ws.d_block_w[1]");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_block_y[0], ws.block_storage_elems * sizeof(T)),
+        "cudaMalloc ws.d_block_y[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(
+        cudaMalloc(&ws.d_block_y[1], ws.block_storage_elems * sizeof(T)),
+        "cudaMalloc ws.d_block_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_w_compact, ws.block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_w_compact");
@@ -350,8 +358,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
-            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode,
-            opts.broadcast_mode, opts.print_phase_timing ? &phase_profile : nullptr);
+            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode, opts.broadcast_mode,
+            opts.print_phase_timing ? &phase_profile : nullptr);
         if (opts.print_comm_bw) {
             distributed_qr_col_blockcyclic::AssertCuda(
                 cudaEventRecord(comm_end_events[i], comm_stream), "cudaEventRecord comm_end");
@@ -533,11 +541,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         }
         if (opts.print_phase_timing) {
             for (int r = 0; r < env.size; ++r) {
-                const double tail_tflops =
-                    (all_local_phase_tail_ms[r] > 0.0)
-                        ? (all_local_phase_tail_flops[r] /
-                           (all_local_phase_tail_ms[r] * 1.0e-3) / 1.0e12)
-                        : 0.0;
+                const double tail_tflops = (all_local_phase_tail_ms[r] > 0.0)
+                                               ? (all_local_phase_tail_flops[r] /
+                                                  (all_local_phase_tail_ms[r] * 1.0e-3) / 1.0e12)
+                                               : 0.0;
                 spdlog::info(
                     "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, comm {:.3f} ms, "
                     "tail {:.3f} ms, tail_gemm {:.3f} TFLOPS",
@@ -574,8 +581,14 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[1]), "cudaFree ws.d_pack_w[1]");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[0]), "cudaFree ws.d_pack_y[0]");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[1]), "cudaFree ws.d_pack_y[1]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w), "cudaFree ws.d_block_w");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y), "cudaFree ws.d_block_y");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w[0]),
+                                               "cudaFree ws.d_block_w[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w[1]),
+                                               "cudaFree ws.d_block_w[1]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y[0]),
+                                               "cudaFree ws.d_block_y[0]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y[1]),
+                                               "cudaFree ws.d_block_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_compact),
                                                "cudaFree ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y_compact),
