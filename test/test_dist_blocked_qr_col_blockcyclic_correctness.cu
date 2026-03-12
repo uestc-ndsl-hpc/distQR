@@ -240,8 +240,7 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
     ws.pack_elems =
         static_cast<size_t>(m) * static_cast<size_t>(distributed_qr_col_blockcyclic::kPanelWidth);
     ws.block_storage_elems = static_cast<size_t>(m) * static_cast<size_t>(nb);
-    ws.block_compact_elems = static_cast<size_t>(nb + distributed_qr_col_blockcyclic::kPanelWidth) *
-                             static_cast<size_t>(nb);
+    ws.block_compact_elems = static_cast<size_t>(m) * static_cast<size_t>(nb);
     ws.tmp_elems = static_cast<size_t>(nb) * static_cast<size_t>(tile_cols);
     ws.tail_tmp_elems = ws.tmp_elems;
 

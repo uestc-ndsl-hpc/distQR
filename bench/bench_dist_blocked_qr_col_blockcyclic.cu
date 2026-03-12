@@ -218,8 +218,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.pack_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
     ws.block_storage_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
-    ws.block_compact_elems =
-        static_cast<size_t>(opts.nb + kPanelWidth) * static_cast<size_t>(opts.nb);
+    ws.block_compact_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
     ws.tmp_elems = static_cast<size_t>(opts.nb) * static_cast<size_t>(tile_cols);
     ws.tail_tmp_elems = ws.tmp_elems;
 

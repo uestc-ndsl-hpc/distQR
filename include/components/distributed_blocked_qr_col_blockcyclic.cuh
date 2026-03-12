@@ -190,8 +190,9 @@ struct DistributedQrColBlockCyclicWorkspace {
     T* d_tail_tmp1 = nullptr;
     size_t tail_tmp_elems = 0;
 
-    // Compact block WY buffers: [(nb + kPanelWidth) x nb]
-    // Used to build a global block WY without scattering into [m x nb].
+    // Packed block WY buffers for block-broadcast / tail-update:
+    // [block_rows x nb], stored contiguously per block/tile with no leading m-padding.
+    // Capacity is provisioned for the worst-case block_rows=m.
     T* d_block_w_compact = nullptr;
     T* d_block_y_compact = nullptr;
     size_t block_compact_elems = 0;
@@ -583,8 +584,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                       block_storage_need, ws->block_storage_elems);
         std::exit(1);
     }
-    const int compact_rows = nb + kPanelWidth;
-    const size_t compact_need = static_cast<size_t>(compact_rows) * static_cast<size_t>(nb);
+    const size_t compact_need = static_cast<size_t>(m) * static_cast<size_t>(nb);
     if (!ws->d_block_w_compact || !ws->d_block_y_compact ||
         ws->block_compact_elems < compact_need) {
         spdlog::error("Col blockcyclic compact storage too small (need {} elems, got {}).",
@@ -718,12 +718,13 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
             const int tile_idx = flushed_block_tiles++;
 
-            T* block_w_tile =
-                ws->d_block_w + static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
-            T* block_y_tile =
-                ws->d_block_y + static_cast<size_t>(flushed_block_cols) * static_cast<size_t>(m);
-            T* block_w_tile_sub = block_w_tile + static_cast<size_t>(block_begin);
-            T* block_y_tile_sub = block_y_tile + static_cast<size_t>(block_begin);
+            const int block_rows = m - block_begin;
+            T* block_w_tile = ws->d_block_w_compact +
+                              static_cast<size_t>(flushed_block_cols) *
+                                  static_cast<size_t>(block_rows);
+            T* block_y_tile = ws->d_block_y_compact +
+                              static_cast<size_t>(flushed_block_cols) *
+                                  static_cast<size_t>(block_rows);
 
             AssertCuda(cudaEventRecord(events.block_ready[tile_idx], compute_stream),
                        "cudaEventRecord block_ready[tile_idx]");
@@ -733,16 +734,18 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                 const size_t comm_idx =
                     BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
                 AssertNccl(ncclBroadcast(block_w_tile, block_w_tile,
-                                         static_cast<size_t>(m) * static_cast<size_t>(tile_k),
+                                         static_cast<size_t>(block_rows) *
+                                             static_cast<size_t>(tile_k),
                                          nccl_type, block_owner, nccl_comm, comm_stream),
                            "ncclBroadcast block-tile W");
                 AssertNccl(ncclBroadcast(block_y_tile, block_y_tile,
-                                         static_cast<size_t>(m) * static_cast<size_t>(tile_k),
+                                         static_cast<size_t>(block_rows) *
+                                             static_cast<size_t>(tile_k),
                                          nccl_type, block_owner, nccl_comm, comm_stream),
                            "ncclBroadcast block-tile Y");
                 EndPhaseInterval(phase_profile, comm_idx, comm_stream);
                 if (comm_profile) {
-                    comm_profile->bytes += 2ULL * static_cast<size_t>(m) *
+                    comm_profile->bytes += 2ULL * static_cast<size_t>(block_rows) *
                                            static_cast<size_t>(tile_k) * sizeof(T) *
                                            static_cast<size_t>(block_receivers);
                 }
@@ -767,7 +770,6 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
 
             int local_tail_cols = 0;
-            const int block_rows = m - block_begin;
             const size_t tail_update_idx =
                 BeginPhaseInterval(phase_profile, PhaseKind::TailUpdate, events.tail_update_stream);
             ForEachLocalSegment(
@@ -777,14 +779,14 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
                     if (trail_one_shot) {
                         block_update_one_shot(events.tail_cublas_handle, block_begin, block_rows,
-                                              tile_k, cols_local, block_w_tile_sub,
-                                              block_y_tile_sub, m, a_trail, lda_local, ws->d_tail_tmp0,
+                                              tile_k, cols_local, block_w_tile, block_y_tile,
+                                              block_rows, a_trail, lda_local, ws->d_tail_tmp0,
                                               ws->tail_tmp_elems);
                     } else {
                         block_update_tile_pipeline(
                             events.tail_cublas_handle, events.tail_update_stream, block_begin,
-                            block_rows, tile_k, cols_local, tile_cols, block_w_tile_sub,
-                            block_y_tile_sub, m, a_trail, lda_local, ws->d_tail_tmp0,
+                            block_rows, tile_k, cols_local, tile_cols, block_w_tile, block_y_tile,
+                            block_rows, a_trail, lda_local, ws->d_tail_tmp0,
                             ws->d_tail_tmp1, true);
                     }
                 });
@@ -1088,6 +1090,28 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     "cudaMemcpy2DAsync block_w -> d_W_local");
             }
 
+            if (use_block_broadcast && part.rank == owner) {
+                const int block_rows = m - block_begin;
+                T* src_w = ws->d_block_w + static_cast<size_t>(block_begin) +
+                           static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
+                T* src_y = ws->d_block_y + static_cast<size_t>(block_begin) +
+                           static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
+                T* dst_w = ws->d_block_w_compact +
+                           static_cast<size_t>(block_col_off) * static_cast<size_t>(block_rows);
+                T* dst_y = ws->d_block_y_compact +
+                           static_cast<size_t>(block_col_off) * static_cast<size_t>(block_rows);
+                AssertCuda(cudaMemcpy2DAsync(dst_w, static_cast<size_t>(block_rows) * sizeof(T),
+                                             src_w, static_cast<size_t>(m) * sizeof(T),
+                                             static_cast<size_t>(block_rows) * sizeof(T),
+                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
+                           "cudaMemcpy2DAsync block_w -> block_w_compact");
+                AssertCuda(cudaMemcpy2DAsync(dst_y, static_cast<size_t>(block_rows) * sizeof(T),
+                                             src_y, static_cast<size_t>(m) * sizeof(T),
+                                             static_cast<size_t>(block_rows) * sizeof(T),
+                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
+                           "cudaMemcpy2DAsync block_y -> block_y_compact");
+            }
+
             const int built_block_cols = inner + kPanelWidth - block_begin;
             if (use_tiled_block_overlap &&
                 ((built_block_cols - flushed_block_cols) >= block_update_tile_cols ||
@@ -1145,18 +1169,20 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                            "cudaStreamWaitEvent comm_stream <- block_ready[0](legacy)");
                 const size_t comm_idx =
                     BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
-                AssertNccl(ncclBroadcast(ws->d_block_w, ws->d_block_w,
-                                         static_cast<size_t>(m) * static_cast<size_t>(kb),
+                const int block_rows = m - block_begin;
+                AssertNccl(ncclBroadcast(ws->d_block_w_compact, ws->d_block_w_compact,
+                                         static_cast<size_t>(block_rows) * static_cast<size_t>(kb),
                                          nccl_type, block_owner, nccl_comm, comm_stream),
                            "ncclBroadcast block W");
-                AssertNccl(ncclBroadcast(ws->d_block_y, ws->d_block_y,
-                                         static_cast<size_t>(m) * static_cast<size_t>(kb),
+                AssertNccl(ncclBroadcast(ws->d_block_y_compact, ws->d_block_y_compact,
+                                         static_cast<size_t>(block_rows) * static_cast<size_t>(kb),
                                          nccl_type, block_owner, nccl_comm, comm_stream),
                            "ncclBroadcast block Y");
                 EndPhaseInterval(phase_profile, comm_idx, comm_stream);
                 if (comm_profile) {
-                    comm_profile->bytes += 2ULL * static_cast<size_t>(m) * static_cast<size_t>(kb) *
-                                           sizeof(T) * static_cast<size_t>(block_receivers);
+                    comm_profile->bytes += 2ULL * static_cast<size_t>(block_rows) *
+                                           static_cast<size_t>(kb) * sizeof(T) *
+                                           static_cast<size_t>(block_receivers);
                 }
             }
             AssertCuda(cudaEventRecord(events.block_comm_done[0], comm_stream),
@@ -1178,16 +1204,15 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
                     if (trail_one_shot) {
                         block_update_one_shot(cublas_handle, block_begin, block_rows, kb,
-                                              cols_local,
-                                              ws->d_block_w + static_cast<size_t>(block_begin),
-                                              ws->d_block_y + static_cast<size_t>(block_begin), m,
-                                              a_trail, lda_local, ws->d_tmp0, ws->tmp_elems);
+                                              cols_local, ws->d_block_w_compact,
+                                              ws->d_block_y_compact, block_rows, a_trail,
+                                              lda_local, ws->d_tmp0, ws->tmp_elems);
                     } else {
                         block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
                                                    block_rows, kb, cols_local, tile_cols,
-                                                   ws->d_block_w + static_cast<size_t>(block_begin),
-                                                   ws->d_block_y + static_cast<size_t>(block_begin),
-                                                   m, a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
+                                                   ws->d_block_w_compact, ws->d_block_y_compact,
+                                                   block_rows, a_trail, lda_local, ws->d_tmp0,
+                                                   ws->d_tmp1);
                     }
                 });
             EndPhaseInterval(phase_profile, tail_update_idx, compute_stream);
