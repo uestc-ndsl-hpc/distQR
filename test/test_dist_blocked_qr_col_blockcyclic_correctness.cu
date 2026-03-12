@@ -151,9 +151,9 @@ void ApplyAllOuterPanelsQTToA(
             distributed_qr_col_blockcyclic::AssertNccl(ncclGroupEnd(),
                                                        "ncclGroupEnd panel W/Y(pack)");
 
-            T* dst_w = ws->d_block_w[0] + static_cast<size_t>(block_begin) +
+            T* dst_w = ws->d_block_w + static_cast<size_t>(block_begin) +
                        static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
-            T* dst_y = ws->d_block_y[0] + static_cast<size_t>(block_begin) +
+            T* dst_y = ws->d_block_y + static_cast<size_t>(block_begin) +
                        static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
             distributed_qr_col_blockcyclic::AssertCuda(
                 cudaMemcpy2DAsync(dst_w, static_cast<size_t>(m) * sizeof(T), pack_w,
@@ -177,8 +177,8 @@ void ApplyAllOuterPanelsQTToA(
                 T* a_trail = d_A + static_cast<size_t>(local_begin) * lda_local;
                 distributed_qr_col_blockcyclic::block_update_tile_pipeline<T>(
                     cublas_handle, compute_stream, block_begin, rows, kb, cols_local, tile_cols,
-                    ws->d_block_w[0] + static_cast<size_t>(block_begin),
-                    ws->d_block_y[0] + static_cast<size_t>(block_begin), m, a_trail, lda_local,
+                    ws->d_block_w + static_cast<size_t>(block_begin),
+                    ws->d_block_y + static_cast<size_t>(block_begin), m, a_trail, lda_local,
                     ws->d_tmp0, ws->d_tmp1);
             });
     }
@@ -260,17 +260,9 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_pack_y[1], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[1]");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_w[0], ws.block_storage_elems * sizeof(T)),
-        "cudaMalloc ws.d_block_w[0]");
+        cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_w[1], ws.block_storage_elems * sizeof(T)),
-        "cudaMalloc ws.d_block_w[1]");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_y[0], ws.block_storage_elems * sizeof(T)),
-        "cudaMalloc ws.d_block_y[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_block_y[1], ws.block_storage_elems * sizeof(T)),
-        "cudaMalloc ws.d_block_y[1]");
+        cudaMalloc(&ws.d_block_y, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_y");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_w_compact, ws.block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_w_compact");
@@ -391,14 +383,8 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[1]), "cudaFree ws.d_pack_w[1]");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[0]), "cudaFree ws.d_pack_y[0]");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[1]), "cudaFree ws.d_pack_y[1]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w[0]),
-                                               "cudaFree ws.d_block_w[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w[1]),
-                                               "cudaFree ws.d_block_w[1]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y[0]),
-                                               "cudaFree ws.d_block_y[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y[1]),
-                                               "cudaFree ws.d_block_y[1]");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w), "cudaFree ws.d_block_w");
+    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y), "cudaFree ws.d_block_y");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_compact),
                                                "cudaFree ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y_compact),
