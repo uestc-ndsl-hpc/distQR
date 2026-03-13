@@ -36,6 +36,13 @@ cmake --build build
 ./build/bench/bench_qr --m 16384 --n 16384 --nb 1024 --iters 10 --warmup 2 --type float
 ```
 
+构建并运行分布式列块循环（col-blockcyclic）分块 QR 基准测试：
+```bash
+mpirun -np 4 ./build/bench/bench_dist_blocked_qr_col_blockcyclic \
+  --m 32768 --n 32768 --nb 1024 --block_cols 4096 \
+  --iters 5 --warmup 2 --type float
+```
+
 `bench_qr` 参数：
 - `--m <int>`：矩阵行数（`m`），默认 `16384`。
 - `--n <int>`：矩阵列数（`n`），默认 `16384`。
@@ -66,4 +73,37 @@ cmake --build build
 包含显式 Q 计时的示例：
 ```bash
 ./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --with-q --iters 10 --warmup 2
+```
+
+`bench_dist_blocked_qr_col_blockcyclic` 参数：
+- `--m <int>`：矩阵行数（`m`），默认 `16384`。
+- `--n <int>`：矩阵列数（`n`），默认 `1024`。
+- `--nb <int>`：外层 blocked QR 的块宽（`nb`），默认 `1024`。
+- `--block_cols <int>`：列块循环分布的块宽。未指定（或设为 `0`）时默认使用 `nb`。
+- `--overlap_tile <int>`：尾矩阵 tiled update 的 tile 宽度。`0` 表示使用 one-shot trailing update。
+- `--iters <int>`：基准迭代次数，默认 `3`。
+- `--warmup <int>`：预热次数，默认 `1`。
+- `--type <float|double|fp64>`：数据类型，默认 `float`。
+- `--print_per_rank`：打印每个 rank 的总耗时。
+- `--print_comm_bw`：打印较粗粒度的通信 event 时间、传输字节数和估算带宽。
+- `--print_phase_timing`：打印每个 rank 的阶段计时，包括 panel factorization、WY 构造、通信、尾矩阵更新，以及尾矩阵更新 GEMM 的 TFLOPS。
+- `--panel-comm <sendrecv|broadcast>`：选择 panel 通信方式。
+- `--broadcast-mode <panel|block>`：当 `--panel-comm broadcast` 时，选择“每个 panel 广播一次”或“每个 block 只广播一次”。默认是 `block`。
+
+`bench_dist_blocked_qr_col_blockcyclic` 参数约束：
+- `m >= n > 0`。
+- `nb > 0`、`nb <= n`，且 `n` 与 `nb` 都必须是 `32` 的倍数。
+- `block_cols > 0`、`block_cols <= n`、`block_cols % nb == 0`，且 `block_cols` 必须是 `32` 的倍数。
+- `warmup >= 0`、`iters > 0`。
+- `broadcast_mode` 仅在 `--panel-comm broadcast` 时生效；其他情况下会被忽略。
+
+对比 panel-broadcast 与 block-broadcast 的示例：
+```bash
+mpirun -np 8 ./build/bench/bench_dist_blocked_qr_col_blockcyclic \
+  --m 131072 --n 131072 --nb 1024 --block_cols 4096 \
+  --panel-comm broadcast --broadcast-mode panel --print_phase_timing
+
+mpirun -np 8 ./build/bench/bench_dist_blocked_qr_col_blockcyclic \
+  --m 131072 --n 131072 --nb 1024 --block_cols 4096 \
+  --panel-comm broadcast --broadcast-mode block --print_phase_timing
 ```

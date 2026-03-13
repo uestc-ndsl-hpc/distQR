@@ -719,12 +719,10 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             const int tile_idx = flushed_block_tiles++;
 
             const int block_rows = m - block_begin;
-            T* block_w_tile = ws->d_block_w_compact +
-                              static_cast<size_t>(flushed_block_cols) *
-                                  static_cast<size_t>(block_rows);
-            T* block_y_tile = ws->d_block_y_compact +
-                              static_cast<size_t>(flushed_block_cols) *
-                                  static_cast<size_t>(block_rows);
+            T* block_w_tile = ws->d_block_w_compact + static_cast<size_t>(flushed_block_cols) *
+                                                          static_cast<size_t>(block_rows);
+            T* block_y_tile = ws->d_block_y_compact + static_cast<size_t>(flushed_block_cols) *
+                                                          static_cast<size_t>(block_rows);
 
             AssertCuda(cudaEventRecord(events.block_ready[tile_idx], compute_stream),
                        "cudaEventRecord block_ready[tile_idx]");
@@ -733,16 +731,16 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                            "cudaStreamWaitEvent comm_stream <- block_ready[tile_idx]");
                 const size_t comm_idx =
                     BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
-                AssertNccl(ncclBroadcast(block_w_tile, block_w_tile,
-                                         static_cast<size_t>(block_rows) *
-                                             static_cast<size_t>(tile_k),
-                                         nccl_type, block_owner, nccl_comm, comm_stream),
-                           "ncclBroadcast block-tile W");
-                AssertNccl(ncclBroadcast(block_y_tile, block_y_tile,
-                                         static_cast<size_t>(block_rows) *
-                                             static_cast<size_t>(tile_k),
-                                         nccl_type, block_owner, nccl_comm, comm_stream),
-                           "ncclBroadcast block-tile Y");
+                AssertNccl(
+                    ncclBroadcast(block_w_tile, block_w_tile,
+                                  static_cast<size_t>(block_rows) * static_cast<size_t>(tile_k),
+                                  nccl_type, block_owner, nccl_comm, comm_stream),
+                    "ncclBroadcast block-tile W");
+                AssertNccl(
+                    ncclBroadcast(block_y_tile, block_y_tile,
+                                  static_cast<size_t>(block_rows) * static_cast<size_t>(tile_k),
+                                  nccl_type, block_owner, nccl_comm, comm_stream),
+                    "ncclBroadcast block-tile Y");
                 EndPhaseInterval(phase_profile, comm_idx, comm_stream);
                 if (comm_profile) {
                     comm_profile->bytes += 2ULL * static_cast<size_t>(block_rows) *
@@ -786,8 +784,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                         block_update_tile_pipeline(
                             events.tail_cublas_handle, events.tail_update_stream, block_begin,
                             block_rows, tile_k, cols_local, tile_cols, block_w_tile, block_y_tile,
-                            block_rows, a_trail, lda_local, ws->d_tail_tmp0,
-                            ws->d_tail_tmp1, true);
+                            block_rows, a_trail, lda_local, ws->d_tail_tmp0, ws->d_tail_tmp1, true);
                     }
                 });
             EndPhaseInterval(phase_profile, tail_update_idx, events.tail_update_stream);
@@ -1205,14 +1202,13 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     if (trail_one_shot) {
                         block_update_one_shot(cublas_handle, block_begin, block_rows, kb,
                                               cols_local, ws->d_block_w_compact,
-                                              ws->d_block_y_compact, block_rows, a_trail,
-                                              lda_local, ws->d_tmp0, ws->tmp_elems);
+                                              ws->d_block_y_compact, block_rows, a_trail, lda_local,
+                                              ws->d_tmp0, ws->tmp_elems);
                     } else {
-                        block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
-                                                   block_rows, kb, cols_local, tile_cols,
-                                                   ws->d_block_w_compact, ws->d_block_y_compact,
-                                                   block_rows, a_trail, lda_local, ws->d_tmp0,
-                                                   ws->d_tmp1);
+                        block_update_tile_pipeline(
+                            cublas_handle, compute_stream, block_begin, block_rows, kb, cols_local,
+                            tile_cols, ws->d_block_w_compact, ws->d_block_y_compact, block_rows,
+                            a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
                     }
                 });
             EndPhaseInterval(phase_profile, tail_update_idx, compute_stream);
