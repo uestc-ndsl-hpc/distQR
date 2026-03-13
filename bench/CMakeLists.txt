@@ -10,10 +10,6 @@ add_executable(bench_dist_blocked_qr bench_dist_blocked_qr.cu)
 target_include_directories(bench_dist_blocked_qr PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(bench_dist_blocked_qr PRIVATE CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL)
 
-add_executable(bench_dist_blocked_qr_col bench_dist_blocked_qr_col.cu)
-target_include_directories(bench_dist_blocked_qr_col PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(bench_dist_blocked_qr_col PRIVATE CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL)
-
 add_executable(bench_dist_blocked_qr_col_blockcyclic bench_dist_blocked_qr_col_blockcyclic.cu)
 target_include_directories(bench_dist_blocked_qr_col_blockcyclic PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(bench_dist_blocked_qr_col_blockcyclic PRIVATE CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL)
