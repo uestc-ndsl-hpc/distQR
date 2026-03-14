@@ -160,14 +160,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.panel_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
     ws.block_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
-    ws.rowblock_elems =
-        static_cast<size_t>(std::max(opts.row_block_rows, 1)) *
-        static_cast<size_t>(std::max(opts.update_tile, kPanelWidth));
-    ws.tmp_elems =
-        std::max(static_cast<size_t>(std::max(opts.nb, kPanelWidth)) *
-                     static_cast<size_t>(kPanelWidth),
-                 static_cast<size_t>(std::max(opts.update_tile, kPanelWidth)) *
-                     static_cast<size_t>(std::max(opts.trail_tile_cols, 1)));
+    ws.block_rowmajor_elems = ws.block_elems;
+    ws.tmp_elems = static_cast<size_t>(std::max(opts.nb, kPanelWidth)) *
+                   static_cast<size_t>(std::max(opts.trail_tile_cols, 1));
 
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_r_panel, static_cast<size_t>(kPanelWidth) * kPanelWidth * sizeof(T)),
@@ -183,14 +178,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         cudaMalloc(&ws.d_block_w, ws.block_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_block_y, ws.block_elems * sizeof(T)), "cudaMalloc ws.d_block_y");
-    for (int i = 0; i < distributed_qr_col_blockcyclic_pipeline::kRowBlockBufferCount; ++i) {
-        distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-            cudaMalloc(&ws.d_rowblock_w[i], ws.rowblock_elems * sizeof(T)),
-            "cudaMalloc ws.d_rowblock_w[i]");
-        distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-            cudaMalloc(&ws.d_rowblock_y[i], ws.rowblock_elems * sizeof(T)),
-            "cudaMalloc ws.d_rowblock_y[i]");
-    }
+    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
+        cudaMalloc(&ws.d_block_w_rowmajor, ws.block_rowmajor_elems * sizeof(T)),
+        "cudaMalloc ws.d_block_w_rowmajor");
+    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
+        cudaMalloc(&ws.d_block_y_rowmajor, ws.block_rowmajor_elems * sizeof(T)),
+        "cudaMalloc ws.d_block_y_rowmajor");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(T)), "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
@@ -404,11 +397,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (env.rank == 0) {
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic-pipeline] ({}): m={} n={} nb={} "
-            "block_cols={} update_tile={} row_block_rows={} trail_tile_cols={} rowblock_buffers={} "
-            "np={} avg {:.3f} ms",
+            "block_cols={} update_tile(compat)={} row_block_rows={} trail_tile_cols={} np={} avg {:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
-            opts.row_block_rows, opts.trail_tile_cols,
-            distributed_qr_col_blockcyclic_pipeline::kRowBlockBufferCount, env.size, max_ms);
+            opts.row_block_rows, opts.trail_tile_cols, env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms", r, all_local_ms[r]);
@@ -455,12 +446,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                                                         "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_block_y),
                                                         "cudaFree ws.d_block_y");
-    for (int i = 0; i < distributed_qr_col_blockcyclic_pipeline::kRowBlockBufferCount; ++i) {
-        distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_w[i]),
-                                                            "cudaFree ws.d_rowblock_w[i]");
-        distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_y[i]),
-                                                            "cudaFree ws.d_rowblock_y[i]");
-    }
+    distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_block_w_rowmajor),
+                                                        "cudaFree ws.d_block_w_rowmajor");
+    distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_block_y_rowmajor),
+                                                        "cudaFree ws.d_block_y_rowmajor");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
 
