@@ -211,6 +211,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     ws.panel_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
     ws.block_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
     ws.block_rowmajor_elems = ws.block_elems;
+    ws.rowblock_wy_packed_elems = 2 * ws.block_elems;
     ws.tmp_elems = static_cast<size_t>(std::max(opts.nb, kPanelWidth)) *
                    static_cast<size_t>(std::max(opts.trail_tile_cols, 1));
 
@@ -234,6 +235,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_block_y_rowmajor, ws.block_rowmajor_elems * sizeof(T)),
         "cudaMalloc ws.d_block_y_rowmajor");
+    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
+        cudaMalloc(&ws.d_rowblock_wy_packed, ws.rowblock_wy_packed_elems * sizeof(T)),
+        "cudaMalloc ws.d_rowblock_wy_packed");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(T)), "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
@@ -262,9 +266,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
 
     auto run_once = [&](distributed_qr_col_blockcyclic_pipeline::CommProfile* comm_profile,
                         distributed_qr_col_blockcyclic_pipeline::PhaseProfile* phase_profile) {
-        distributed_qr_col_blockcyclic_pipeline::distributed_blocked_qr_factorize_col_blockcyclic_pipeline<T>(
-            cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
-            &ws, compute_stream, comm_stream, pipeline_cfg, comm_profile, phase_profile);
+        distributed_qr_col_blockcyclic_pipeline::
+            distributed_blocked_qr_factorize_col_blockcyclic_pipeline<T>(
+                cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W,
+                d_Y, &ws, compute_stream, comm_stream, pipeline_cfg, comm_profile, phase_profile);
     };
 
     for (int i = 0; i < opts.warmup; ++i) {
@@ -279,10 +284,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
             "cudaMemsetAsync warmup Y");
         run_once(nullptr, nullptr);
-        distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-            cudaStreamSynchronize(compute_stream), "cudaStreamSynchronize warmup compute");
-        distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-            cudaStreamSynchronize(comm_stream), "cudaStreamSynchronize warmup comm");
+        distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaStreamSynchronize(compute_stream),
+                                                            "cudaStreamSynchronize warmup compute");
+        distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaStreamSynchronize(comm_stream),
+                                                            "cudaStreamSynchronize warmup comm");
     }
 
     cudaEvent_t timed_start = nullptr;
@@ -335,8 +340,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             "cudaStreamWaitEvent compute <- timed_comm_done");
         distributed_qr_col_blockcyclic_pipeline::AssertCuda(
             cudaEventRecord(timed_stop, compute_stream), "cudaEventRecord timed_stop");
-        distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-            cudaEventSynchronize(timed_stop), "cudaEventSynchronize timed_stop");
+        distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaEventSynchronize(timed_stop),
+                                                            "cudaEventSynchronize timed_stop");
 
         if (opts.print_phase_timing) {
             distributed_qr_col_blockcyclic_pipeline::FinalizePhaseProfile(&phase_profile);
@@ -405,18 +410,14 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
     }
     if (opts.print_phase_timing) {
-        MPI_Gather(&local_panel_ms, 1, MPI_DOUBLE,
-                   (env.rank == 0) ? all_panel_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
-                   MPI_COMM_WORLD);
-        MPI_Gather(&local_wy_ms, 1, MPI_DOUBLE,
-                   (env.rank == 0) ? all_wy_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
-                   MPI_COMM_WORLD);
-        MPI_Gather(&local_merge_ms, 1, MPI_DOUBLE,
-                   (env.rank == 0) ? all_merge_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
-                   MPI_COMM_WORLD);
-        MPI_Gather(&local_comm_ms, 1, MPI_DOUBLE,
-                   (env.rank == 0) ? all_comm_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
-                   MPI_COMM_WORLD);
+        MPI_Gather(&local_panel_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_panel_ms.data() : nullptr,
+                   1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Gather(&local_wy_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_wy_ms.data() : nullptr, 1,
+                   MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Gather(&local_merge_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_merge_ms.data() : nullptr,
+                   1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_comm_ms.data() : nullptr, 1,
+                   MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Gather(&local_tail_acc_ms, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_tail_acc_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
@@ -452,8 +453,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             "row_block_mode={} np={} avg {:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
             opts.row_block_rows, opts.trail_tile_cols,
-            distributed_qr_col_blockcyclic_pipeline::TailModeString(opts.row_block_mode),
-            env.size, max_ms);
+            distributed_qr_col_blockcyclic_pipeline::TailModeString(opts.row_block_mode), env.size,
+            max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms", r, all_local_ms[r]);
@@ -504,6 +505,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                                                         "cudaFree ws.d_block_w_rowmajor");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_block_y_rowmajor),
                                                         "cudaFree ws.d_block_y_rowmajor");
+    distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_wy_packed),
+                                                        "cudaFree ws.d_rowblock_wy_packed");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
 
