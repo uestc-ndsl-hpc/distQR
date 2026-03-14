@@ -243,9 +243,10 @@ enum class PhaseKind {
     PanelFactor = 0,
     WyBuild = 1,
     BlockWyMerge = 2,
-    TailAccumulate = 3,
-    TailApply = 4,
-    Comm = 5,
+    InnerBlockUpdate = 3,
+    TailAccumulate = 4,
+    TailApply = 5,
+    Comm = 6,
 };
 
 struct PhaseInterval {
@@ -258,6 +259,7 @@ struct PhaseProfile {
     double panel_factor_ms = 0.0;
     double wy_build_ms = 0.0;
     double block_wy_merge_ms = 0.0;
+    double inner_block_update_ms = 0.0;
     double tail_accumulate_ms = 0.0;
     double tail_apply_ms = 0.0;
     double comm_ms = 0.0;
@@ -272,6 +274,7 @@ inline void ResetPhaseProfile(PhaseProfile* profile) {
     profile->panel_factor_ms = 0.0;
     profile->wy_build_ms = 0.0;
     profile->block_wy_merge_ms = 0.0;
+    profile->inner_block_update_ms = 0.0;
     profile->tail_accumulate_ms = 0.0;
     profile->tail_apply_ms = 0.0;
     profile->comm_ms = 0.0;
@@ -316,6 +319,9 @@ inline void FinalizePhaseProfile(PhaseProfile* profile) {
                 break;
             case PhaseKind::BlockWyMerge:
                 profile->block_wy_merge_ms += static_cast<double>(ms);
+                break;
+            case PhaseKind::InnerBlockUpdate:
+                profile->inner_block_update_ms += static_cast<double>(ms);
                 break;
             case PhaseKind::TailAccumulate:
                 profile->tail_accumulate_ms += static_cast<double>(ms);
@@ -1265,9 +1271,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
                 [&](int seg_begin, int seg_end, int local_begin) {
                     const int cols_local = seg_end - seg_begin;
                     T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                    const size_t inner_update_idx = BeginPhaseInterval(
+                        phase_profile, PhaseKind::InnerBlockUpdate, compute_stream);
                     ApplyPanelToTrailingSegment(cublas_handle, inner, panel_rows, cols_local,
                                                 ws->d_panel_w, ws->d_panel_y, a_trail, lda_local,
                                                 ws->d_tmp0, ws->tmp_elems);
+                    EndPhaseInterval(phase_profile, inner_update_idx, compute_stream);
                 });
         }
 

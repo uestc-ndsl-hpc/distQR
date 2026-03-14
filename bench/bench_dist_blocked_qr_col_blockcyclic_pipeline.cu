@@ -309,6 +309,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> phase_panel_ms_per_iter;
     std::vector<double> phase_wy_ms_per_iter;
     std::vector<double> phase_merge_ms_per_iter;
+    std::vector<double> phase_inner_update_ms_per_iter;
     std::vector<double> phase_comm_ms_per_iter;
     std::vector<double> phase_tail_acc_ms_per_iter;
     std::vector<double> phase_tail_apply_ms_per_iter;
@@ -316,6 +317,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         phase_panel_ms_per_iter.resize(opts.iters, 0.0);
         phase_wy_ms_per_iter.resize(opts.iters, 0.0);
         phase_merge_ms_per_iter.resize(opts.iters, 0.0);
+        phase_inner_update_ms_per_iter.resize(opts.iters, 0.0);
         phase_comm_ms_per_iter.resize(opts.iters, 0.0);
         phase_tail_acc_ms_per_iter.resize(opts.iters, 0.0);
         phase_tail_apply_ms_per_iter.resize(opts.iters, 0.0);
@@ -352,6 +354,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             phase_panel_ms_per_iter[i] = phase_profile.panel_factor_ms;
             phase_wy_ms_per_iter[i] = phase_profile.wy_build_ms;
             phase_merge_ms_per_iter[i] = phase_profile.block_wy_merge_ms;
+            phase_inner_update_ms_per_iter[i] = phase_profile.inner_block_update_ms;
             phase_comm_ms_per_iter[i] = phase_profile.comm_ms;
             phase_tail_acc_ms_per_iter[i] = phase_profile.tail_accumulate_ms;
             phase_tail_apply_ms_per_iter[i] = phase_profile.tail_apply_ms;
@@ -371,12 +374,14 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> all_panel_ms;
     std::vector<double> all_wy_ms;
     std::vector<double> all_merge_ms;
+    std::vector<double> all_inner_update_ms;
     std::vector<double> all_comm_ms;
     std::vector<double> all_tail_acc_ms;
     std::vector<double> all_tail_apply_ms;
     double local_panel_ms = 0.0;
     double local_wy_ms = 0.0;
     double local_merge_ms = 0.0;
+    double local_inner_update_ms = 0.0;
     double local_comm_ms = 0.0;
     double local_tail_acc_ms = 0.0;
     double local_tail_apply_ms = 0.0;
@@ -386,6 +391,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             local_panel_ms += phase_panel_ms_per_iter[i];
             local_wy_ms += phase_wy_ms_per_iter[i];
             local_merge_ms += phase_merge_ms_per_iter[i];
+            local_inner_update_ms += phase_inner_update_ms_per_iter[i];
             local_comm_ms += phase_comm_ms_per_iter[i];
             local_tail_acc_ms += phase_tail_acc_ms_per_iter[i];
             local_tail_apply_ms += phase_tail_apply_ms_per_iter[i];
@@ -393,6 +399,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         local_panel_ms /= static_cast<double>(opts.iters);
         local_wy_ms /= static_cast<double>(opts.iters);
         local_merge_ms /= static_cast<double>(opts.iters);
+        local_inner_update_ms /= static_cast<double>(opts.iters);
         local_comm_ms /= static_cast<double>(opts.iters);
         local_tail_acc_ms /= static_cast<double>(opts.iters);
         local_tail_apply_ms /= static_cast<double>(opts.iters);
@@ -405,6 +412,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         all_panel_ms.resize(env.size, 0.0);
         all_wy_ms.resize(env.size, 0.0);
         all_merge_ms.resize(env.size, 0.0);
+        all_inner_update_ms.resize(env.size, 0.0);
         all_comm_ms.resize(env.size, 0.0);
         all_tail_acc_ms.resize(env.size, 0.0);
         all_tail_apply_ms.resize(env.size, 0.0);
@@ -420,6 +428,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Gather(&local_merge_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_merge_ms.data() : nullptr,
                    1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Gather(&local_inner_update_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_inner_update_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
         MPI_Gather(&local_comm_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_comm_ms.data() : nullptr, 1,
                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Gather(&local_tail_acc_ms, 1, MPI_DOUBLE,
@@ -468,9 +479,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info(
                     "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, merge {:.3f} ms, "
-                    "comm {:.3f} ms, tail_acc {:.3f} ms, tail_apply {:.3f} ms",
-                    r, all_panel_ms[r], all_wy_ms[r], all_merge_ms[r], all_comm_ms[r],
-                    all_tail_acc_ms[r], all_tail_apply_ms[r]);
+                    "inner_update {:.3f} ms, comm {:.3f} ms, tail_acc {:.3f} ms, tail_apply {:.3f} "
+                    "ms",
+                    r, all_panel_ms[r], all_wy_ms[r], all_merge_ms[r], all_inner_update_ms[r],
+                    all_comm_ms[r], all_tail_acc_ms[r], all_tail_apply_ms[r]);
             }
         }
         if (total_bad > 0) {
