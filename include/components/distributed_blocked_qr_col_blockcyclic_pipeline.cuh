@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <type_traits>
@@ -67,16 +68,94 @@ inline void AssertNccl(ncclResult_t status, const char* context) {
 }
 
 struct ScopedNvtxRange {
-    explicit ScopedNvtxRange(const char* label) {
-        nvtxRangePushA(label);
+    enum class Category : uint32_t {
+        kGeneric = 0,
+        kBenchIteration = 1,
+        kOuterBlock = 2,
+        kPanel = 3,
+        kPack = 4,
+        kCommW = 5,
+        kCommY = 6,
+        kTailTile = 7,
+        kTailAcc = 8,
+        kTailApply = 9,
+    };
+
+    explicit ScopedNvtxRange(const char* label, Category category = Category::kGeneric)
+        : domain(GetDomain()) {
+        Push(label, category);
     }
 
-    explicit ScopedNvtxRange(const std::string& label) {
-        nvtxRangePushA(label.c_str());
+    explicit ScopedNvtxRange(const std::string& label, Category category = Category::kGeneric)
+        : domain(GetDomain()) {
+        Push(label.c_str(), category);
     }
 
     ~ScopedNvtxRange() {
-        nvtxRangePop();
+        nvtxDomainRangePop(domain);
+    }
+
+private:
+    nvtxDomainHandle_t domain = nullptr;
+
+    static nvtxDomainHandle_t GetDomain() {
+        static nvtxDomainHandle_t domain_handle = []() {
+            auto* handle = nvtxDomainCreateA("distQR");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kBenchIteration),
+                                    "bench_iteration");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kOuterBlock),
+                                    "outer_block");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kPanel), "panel");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kPack), "pack");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kCommW), "comm_w");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kCommY), "comm_y");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kTailTile),
+                                    "tail_tile");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kTailAcc),
+                                    "tail_acc");
+            nvtxDomainNameCategoryA(handle, static_cast<uint32_t>(Category::kTailApply),
+                                    "tail_apply");
+            return handle;
+        }();
+        return domain_handle;
+    }
+
+    static uint32_t CategoryColor(Category category) {
+        switch (category) {
+            case Category::kBenchIteration:
+                return 0xFF6C5CE7u;
+            case Category::kOuterBlock:
+                return 0xFF0F766Eu;
+            case Category::kPanel:
+                return 0xFF2563EBu;
+            case Category::kPack:
+                return 0xFFEA580Cu;
+            case Category::kCommW:
+                return 0xFFC2410Cu;
+            case Category::kCommY:
+                return 0xFFF59E0Bu;
+            case Category::kTailTile:
+                return 0xFF059669u;
+            case Category::kTailAcc:
+                return 0xFF16A34Au;
+            case Category::kTailApply:
+                return 0xFFDC2626u;
+            case Category::kGeneric:
+            default:
+                return 0xFF64748Bu;
+        }
+    }
+
+    void Push(const char* label, Category category) const {
+        nvtxEventAttributes_t attrib{};
+        attrib.version = NVTX_VERSION;
+        attrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+        attrib.category = static_cast<uint32_t>(category);
+        attrib.colorType = NVTX_COLOR_ARGB;
+        attrib.color = CategoryColor(category);
+        attrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
+        attrib.message.ascii = label;
+        nvtxDomainRangePushEx(domain, &attrib);
     }
 };
 
@@ -1407,7 +1486,7 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
 
     const ncclDataType_t nccl_type = NcclType<T>();
     if (overlap_tail) {
-        ScopedNvtxRange tail_range("tail_update_overlap");
+        ScopedNvtxRange tail_range("tail_update_overlap", ScopedNvtxRange::Category::kGeneric);
         for (int rb_idx = 0; rb_idx < row_block_count; ++rb_idx) {
             const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
             const size_t off = RowBlockOffsetElems(row_block_rows, kb, rb_idx);
@@ -1415,7 +1494,8 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             T* d_rowblock_w = ws->d_block_w_rowmajor + off;
 
             if (part.rank == block_owner) {
-                ScopedNvtxRange pack_range(FormatRowBlockLabel("pack_w", rb_idx, row_count));
+                ScopedNvtxRange pack_range(FormatRowBlockLabel("pack_w", rb_idx, row_count),
+                                           ScopedNvtxRange::Category::kPack);
                 const size_t pack_idx = BeginPhaseInterval(phase_profile, PhaseKind::RowBlockPack,
                                                            events.rowblock_pack_stream);
                 PackCompactWRowBlockToRowMajorCache(rb_idx, block_rows, kb, row_block_rows,
@@ -1430,7 +1510,8 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             }
 
             if (block_receivers > 0) {
-                ScopedNvtxRange comm_range(FormatRowBlockLabel("comm_w", rb_idx, row_count));
+                ScopedNvtxRange comm_range(FormatRowBlockLabel("comm_w", rb_idx, row_count),
+                                           ScopedNvtxRange::Category::kCommW);
                 if (comm_profile && rb_idx == 0) {
                     const double skew_ms = MeasureCollectiveEnterSkewMs();
                     comm_profile->w_enter_skew_ms += skew_ms;
@@ -1460,7 +1541,7 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
 
         const size_t compact_y_elems = static_cast<size_t>(block_rows) * static_cast<size_t>(kb);
         if (block_receivers > 0) {
-            ScopedNvtxRange comm_y_range("comm_y_compact");
+            ScopedNvtxRange comm_y_range("comm_y_compact", ScopedNvtxRange::Category::kCommY);
             if (comm_profile) {
                 const double skew_ms = MeasureCollectiveEnterSkewMs();
                 comm_profile->y_enter_skew_ms += skew_ms;
@@ -1511,9 +1592,11 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         });
 
         for (const auto& tile : tail_tiles) {
-            ScopedNvtxRange tile_range(FormatTileLabel("tail_tile", tile.cols_tile));
+            ScopedNvtxRange tile_range(FormatTileLabel("tail_tile", tile.cols_tile),
+                                       ScopedNvtxRange::Category::kTailTile);
             {
-                ScopedNvtxRange acc_range(FormatTileLabel("tail_acc", tile.cols_tile));
+                ScopedNvtxRange acc_range(FormatTileLabel("tail_acc", tile.cols_tile),
+                                          ScopedNvtxRange::Category::kTailAcc);
             TailAccumulateColTileFromRowBlockCache(
                 events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, block_begin, block_rows, kb,
                 row_block_rows, tile.a_tile, lda_local, tile.cols_tile, ws->d_tmp0, ws->tmp_elems,
@@ -1527,7 +1610,8 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
 
             {
-                ScopedNvtxRange apply_range(FormatTileLabel("tail_apply", tile.cols_tile));
+                ScopedNvtxRange apply_range(FormatTileLabel("tail_apply", tile.cols_tile),
+                                            ScopedNvtxRange::Category::kTailApply);
             TailApplyCompactBlockToTile(events.tail_acc_cublas_handle, ws->d_block_y, block_begin,
                                         block_rows, kb, tile.a_tile, lda_local, tile.cols_tile,
                                         ws->d_tmp0, events.tail_acc_stream, phase_profile);
@@ -1784,7 +1868,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
         const int kb = block_end - block_begin;
         const int block_rows = m - block_begin;
         const int block_owner = OwnerOfPanel(block_begin, part);
-        ScopedNvtxRange block_range(FormatOuterBlockLabel(block_begin, block_end, block_owner));
+        ScopedNvtxRange block_range(FormatOuterBlockLabel(block_begin, block_end, block_owner),
+                                    ScopedNvtxRange::Category::kOuterBlock);
 
         // Compact block-WY is the canonical block representation here, so the
         // owner clears it once per outer block and then appends each panel
@@ -1809,7 +1894,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
                               block_begin, block_end, inner);
                 std::exit(1);
             }
-            ScopedNvtxRange panel_range(FormatPanelLabel(inner, owner));
+            ScopedNvtxRange panel_range(FormatPanelLabel(inner, owner),
+                                        ScopedNvtxRange::Category::kPanel);
 
             if (part.rank != owner) {
                 continue;
