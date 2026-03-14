@@ -3,7 +3,6 @@
 #include <curand.h>
 #include <mpi.h>
 #include <nccl.h>
-#include <nvtx3/nvToolsExt.h>
 
 #include <spdlog/spdlog.h>
 
@@ -388,9 +387,6 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     }
 
     for (int i = 0; i < opts.iters; ++i) {
-        char iter_label[64];
-        std::snprintf(iter_label, sizeof(iter_label), "bench_iter_%d", i);
-        nvtxRangePushA(iter_label);
         distributed_qr_col_blockcyclic_pipeline::AssertCuda(
             cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(T), cudaMemcpyDeviceToDevice,
                             compute_stream),
@@ -448,7 +444,6 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         distributed_qr_col_blockcyclic_pipeline::AssertCuda(
             cudaEventElapsedTime(&iter_ms, timed_start, timed_stop), "cudaEventElapsedTime timed");
         timed_total_ms += iter_ms;
-        nvtxRangePop();
     }
 
     const double local_ms = static_cast<double>(timed_total_ms) / static_cast<double>(opts.iters);

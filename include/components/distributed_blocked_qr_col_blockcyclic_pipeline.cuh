@@ -13,14 +13,11 @@
 #include <cublas_v2.h>
 #include <mpi.h>
 #include <nccl.h>
-#include <nvtx3/nvToolsExt.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cstdio>
 #include <cstddef>
 #include <cstdlib>
-#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -64,45 +61,6 @@ inline void AssertNccl(ncclResult_t status, const char* context) {
         spdlog::error("{}: {}", context, ncclGetErrorString(status));
         std::exit(1);
     }
-}
-
-struct ScopedNvtxRange {
-    explicit ScopedNvtxRange(const char* label) {
-        nvtxRangePushA(label);
-    }
-
-    explicit ScopedNvtxRange(const std::string& label) {
-        nvtxRangePushA(label.c_str());
-    }
-
-    ~ScopedNvtxRange() {
-        nvtxRangePop();
-    }
-};
-
-inline std::string FormatOuterBlockLabel(int block_begin, int block_end, int owner) {
-    char label[128];
-    std::snprintf(label, sizeof(label), "outer_block[%d,%d)_owner%d", block_begin, block_end,
-                  owner);
-    return std::string(label);
-}
-
-inline std::string FormatPanelLabel(int inner, int owner) {
-    char label[96];
-    std::snprintf(label, sizeof(label), "panel_%d_owner%d", inner, owner);
-    return std::string(label);
-}
-
-inline std::string FormatRowBlockLabel(const char* prefix, int rb_idx, int row_count) {
-    char label[96];
-    std::snprintf(label, sizeof(label), "%s_rb%d_rows%d", prefix, rb_idx, row_count);
-    return std::string(label);
-}
-
-inline std::string FormatTileLabel(const char* prefix, int cols_tile) {
-    char label[96];
-    std::snprintf(label, sizeof(label), "%s_cols%d", prefix, cols_tile);
-    return std::string(label);
 }
 
 struct ColBlockCyclicPartition {
@@ -1407,7 +1365,6 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
 
     const ncclDataType_t nccl_type = NcclType<T>();
     if (overlap_tail) {
-        ScopedNvtxRange tail_range("tail_update_overlap");
         for (int rb_idx = 0; rb_idx < row_block_count; ++rb_idx) {
             const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
             const size_t off = RowBlockOffsetElems(row_block_rows, kb, rb_idx);
@@ -1415,7 +1372,6 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             T* d_rowblock_w = ws->d_block_w_rowmajor + off;
 
             if (part.rank == block_owner) {
-                ScopedNvtxRange pack_range(FormatRowBlockLabel("pack_w", rb_idx, row_count));
                 const size_t pack_idx = BeginPhaseInterval(phase_profile, PhaseKind::RowBlockPack,
                                                            events.rowblock_pack_stream);
                 PackCompactWRowBlockToRowMajorCache(rb_idx, block_rows, kb, row_block_rows,
@@ -1430,7 +1386,6 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             }
 
             if (block_receivers > 0) {
-                ScopedNvtxRange comm_range(FormatRowBlockLabel("comm_w", rb_idx, row_count));
                 if (comm_profile && rb_idx == 0) {
                     const double skew_ms = MeasureCollectiveEnterSkewMs();
                     comm_profile->w_enter_skew_ms += skew_ms;
@@ -1460,7 +1415,6 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
 
         const size_t compact_y_elems = static_cast<size_t>(block_rows) * static_cast<size_t>(kb);
         if (block_receivers > 0) {
-            ScopedNvtxRange comm_y_range("comm_y_compact");
             if (comm_profile) {
                 const double skew_ms = MeasureCollectiveEnterSkewMs();
                 comm_profile->y_enter_skew_ms += skew_ms;
@@ -1511,14 +1465,10 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         });
 
         for (const auto& tile : tail_tiles) {
-            ScopedNvtxRange tile_range(FormatTileLabel("tail_tile", tile.cols_tile));
-            {
-                ScopedNvtxRange acc_range(FormatTileLabel("tail_acc", tile.cols_tile));
             TailAccumulateColTileFromRowBlockCache(
                 events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, block_begin, block_rows, kb,
                 row_block_rows, tile.a_tile, lda_local, tile.cols_tile, ws->d_tmp0, ws->tmp_elems,
                 events.tail_acc_stream, true, events.rowblock_comm_done, phase_profile);
-            }
 
             const size_t tail_wait_idx =
                 BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, events.tail_acc_stream);
@@ -1526,12 +1476,9 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                        "cudaStreamWaitEvent tail_acc_stream <- compact_y_comm_done");
             EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
 
-            {
-                ScopedNvtxRange apply_range(FormatTileLabel("tail_apply", tile.cols_tile));
             TailApplyCompactBlockToTile(events.tail_acc_cublas_handle, ws->d_block_y, block_begin,
                                         block_rows, kb, tile.a_tile, lda_local, tile.cols_tile,
                                         ws->d_tmp0, events.tail_acc_stream, phase_profile);
-            }
         }
 
         if (phase_profile && local_tail_cols > 0) {
@@ -1784,7 +1731,6 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
         const int kb = block_end - block_begin;
         const int block_rows = m - block_begin;
         const int block_owner = OwnerOfPanel(block_begin, part);
-        ScopedNvtxRange block_range(FormatOuterBlockLabel(block_begin, block_end, block_owner));
 
         // Compact block-WY is the canonical block representation here, so the
         // owner clears it once per outer block and then appends each panel
@@ -1809,7 +1755,6 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
                               block_begin, block_end, inner);
                 std::exit(1);
             }
-            ScopedNvtxRange panel_range(FormatPanelLabel(inner, owner));
 
             if (part.rank != owner) {
                 continue;
