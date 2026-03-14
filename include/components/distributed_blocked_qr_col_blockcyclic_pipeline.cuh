@@ -762,10 +762,10 @@ inline void PackCompactChunkToPackedBroadcastCache(int k_chunk_begin,
     const size_t elems = static_cast<size_t>(chunk_rows) * static_cast<size_t>(kc);
     T* dst_w = d_wy_packed;
     T* dst_y = d_wy_packed + elems;
-    const T* src_w =
-        d_block_w + k_chunk_begin + static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
-    const T* src_y =
-        d_block_y + k_chunk_begin + static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
+    const T* src_w = d_block_w + k_chunk_begin +
+                     static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
+    const T* src_y = d_block_y + k_chunk_begin +
+                     static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
 
     AssertCuda(cudaMemcpy2DAsync(dst_w, static_cast<size_t>(chunk_rows) * sizeof(T), src_w,
                                  static_cast<size_t>(block_rows) * sizeof(T),
@@ -791,10 +791,10 @@ inline void UnpackPackedCompactChunkToCompactBlockStorage(int k_chunk_begin,
     const size_t elems = static_cast<size_t>(chunk_rows) * static_cast<size_t>(kc);
     const T* src_w = d_wy_packed;
     const T* src_y = d_wy_packed + elems;
-    T* dst_w =
-        d_block_w + k_chunk_begin + static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
-    T* dst_y =
-        d_block_y + k_chunk_begin + static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
+    T* dst_w = d_block_w + k_chunk_begin +
+               static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
+    T* dst_y = d_block_y + k_chunk_begin +
+               static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
 
     AssertCuda(cudaMemcpy2DAsync(dst_w, static_cast<size_t>(block_rows) * sizeof(T), src_w,
                                  static_cast<size_t>(chunk_rows) * sizeof(T),
@@ -1088,9 +1088,9 @@ inline void TailApplyCompactBlockToTile(cublasHandle_t tail_cublas_handle,
     T* a_sub = a_tile + row_offset;
     const size_t tail_apply_gemm_idx =
         BeginPhaseInterval(phase_profile, PhaseKind::TailApplyGemm, tail_update_stream);
-    AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                           block_rows, cols_tile, kb, &minus_one, d_block_y,
-                                           block_rows, d_tmp, kb, &one, a_sub, lda_local),
+    AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, block_rows,
+                                           cols_tile, kb, &minus_one, d_block_y, block_rows, d_tmp,
+                                           kb, &one, a_sub, lda_local),
                  "Pipeline compact tail apply A -= Y * tmp");
     EndPhaseInterval(phase_profile, tail_apply_gemm_idx, tail_update_stream);
 }
@@ -1123,8 +1123,8 @@ inline void TailAccumulateCompactChunkToTile(cublasHandle_t tail_cublas_handle,
     const int chunk_rows = block_rows - k_chunk_begin;
     const T one = static_cast<T>(1);
     const T zero = static_cast<T>(0);
-    const T* w_chunk =
-        d_block_w + k_chunk_begin + static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
+    const T* w_chunk = d_block_w + k_chunk_begin +
+                       static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
     const T* a_sub = a_tile + block_begin + k_chunk_begin;
     T* tmp_sub = d_tmp + k_chunk_begin;
 
@@ -1158,16 +1158,16 @@ inline void TailApplyCompactChunkToTile(cublasHandle_t tail_cublas_handle,
     const int chunk_rows = block_rows - k_chunk_begin;
     const T one = static_cast<T>(1);
     const T minus_one = static_cast<T>(-1);
-    const T* y_chunk =
-        d_block_y + k_chunk_begin + static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
+    const T* y_chunk = d_block_y + k_chunk_begin +
+                       static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows);
     const T* tmp_sub = d_tmp + k_chunk_begin;
     T* a_sub = a_tile + block_begin + k_chunk_begin;
 
     const size_t tail_apply_gemm_idx =
         BeginPhaseInterval(phase_profile, PhaseKind::TailApplyGemm, tail_update_stream);
-    AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                           chunk_rows, cols_tile, kc, &minus_one, y_chunk,
-                                           block_rows, tmp_sub, kb, &one, a_sub, lda_local),
+    AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, chunk_rows,
+                                           cols_tile, kc, &minus_one, y_chunk, block_rows, tmp_sub,
+                                           kb, &one, a_sub, lda_local),
                  "Pipeline chunked tail A_sub -= Y_chunk * tmp_sub");
     EndPhaseInterval(phase_profile, tail_apply_gemm_idx, tail_update_stream);
 }
@@ -1263,12 +1263,9 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         cublasHandle_t tail_apply_cublas_handle = nullptr;
         cudaEvent_t block_wy_ready = nullptr;
         cudaEvent_t tail_update_done = nullptr;
-        cudaEvent_t tail_accum_done = nullptr;
-        cudaEvent_t chunk_pack_ready[2] = {nullptr, nullptr};
-        cudaEvent_t chunk_comm_done[2] = {nullptr, nullptr};
+        cudaEvent_t compact_y_comm_done = nullptr;
         std::vector<cudaEvent_t> rowblock_ready;
         std::vector<cudaEvent_t> rowblock_comm_done;
-        std::vector<cudaEvent_t> chunk_data_ready;
     };
     static PersistentPipelineEvents events;
     if (!events.initialized) {
@@ -1290,14 +1287,8 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                    "cudaEventCreate block_wy_ready");
         AssertCuda(cudaEventCreateWithFlags(&events.tail_update_done, cudaEventDisableTiming),
                    "cudaEventCreate tail_update_done");
-        AssertCuda(cudaEventCreateWithFlags(&events.tail_accum_done, cudaEventDisableTiming),
-                   "cudaEventCreate tail_accum_done");
-        for (int i = 0; i < 2; ++i) {
-            AssertCuda(cudaEventCreateWithFlags(&events.chunk_pack_ready[i], cudaEventDisableTiming),
-                       "cudaEventCreate chunk_pack_ready");
-            AssertCuda(cudaEventCreateWithFlags(&events.chunk_comm_done[i], cudaEventDisableTiming),
-                       "cudaEventCreate chunk_comm_done");
-        }
+        AssertCuda(cudaEventCreateWithFlags(&events.compact_y_comm_done, cudaEventDisableTiming),
+                   "cudaEventCreate compact_y_comm_done");
         events.initialized = true;
     }
     while (static_cast<int>(events.rowblock_ready.size()) < row_block_count) {
@@ -1310,25 +1301,10 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         events.rowblock_ready.push_back(rowblock_ready);
         events.rowblock_comm_done.push_back(rowblock_comm_done);
     }
-    int overlap_chunk_count = 0;
-    if (overlap_tail) {
-        const int k_chunk_cols = std::min(std::max(kPanelWidth, pipeline_cfg.update_tile_cols), kb);
-        overlap_chunk_count = (kb + k_chunk_cols - 1) / k_chunk_cols;
-        while (static_cast<int>(events.chunk_data_ready.size()) < overlap_chunk_count) {
-            cudaEvent_t chunk_data_ready = nullptr;
-            AssertCuda(cudaEventCreateWithFlags(&chunk_data_ready, cudaEventDisableTiming),
-                       "cudaEventCreate chunk_data_ready");
-            events.chunk_data_ready.push_back(chunk_data_ready);
-        }
-    }
-    AssertCuda(cudaEventRecord(events.tail_update_done, events.tail_apply_stream),
+    AssertCuda(cudaEventRecord(events.tail_update_done, events.tail_acc_stream),
                "cudaEventRecord tail_update_done(reset)");
-    AssertCuda(cudaEventRecord(events.tail_accum_done, events.tail_acc_stream),
-               "cudaEventRecord tail_accum_done(reset)");
-    for (int i = 0; i < 2; ++i) {
-        AssertCuda(cudaEventRecord(events.chunk_comm_done[i], comm_stream),
-                   "cudaEventRecord chunk_comm_done(reset)");
-    }
+    AssertCuda(cudaEventRecord(events.compact_y_comm_done, comm_stream),
+               "cudaEventRecord compact_y_comm_done(reset)");
     if (part.rank == block_owner) {
         AssertCuda(cudaEventRecord(events.block_wy_ready, compute_stream),
                    "cudaEventRecord block_wy_ready");
@@ -1338,73 +1314,59 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
 
     const ncclDataType_t nccl_type = NcclType<T>();
     if (overlap_tail) {
-        const int k_chunk_cols = std::min(std::max(kPanelWidth, pipeline_cfg.update_tile_cols), kb);
-        const size_t packed_chunk_max_elems =
-            2ULL * static_cast<size_t>(block_rows) * static_cast<size_t>(k_chunk_cols);
-        const int packed_buffer_count =
-            (2 * packed_chunk_max_elems <= ws->rowblock_wy_packed_elems) ? 2 : 1;
-        const size_t packed_buffer_stride = packed_chunk_max_elems;
-
-        for (int chunk_idx = 0, k_chunk_begin = 0; k_chunk_begin < kb;
-             k_chunk_begin += k_chunk_cols, ++chunk_idx) {
-            const int kc = std::min(k_chunk_cols, kb - k_chunk_begin);
-            const int buf_idx = chunk_idx % packed_buffer_count;
-            const int chunk_rows = block_rows - k_chunk_begin;
-            const size_t elems = static_cast<size_t>(chunk_rows) * static_cast<size_t>(kc);
-            T* d_wy_packed =
-                ws->d_rowblock_wy_packed + static_cast<size_t>(buf_idx) * packed_buffer_stride;
+        for (int rb_idx = 0; rb_idx < row_block_count; ++rb_idx) {
+            const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
+            const size_t off = RowBlockOffsetElems(row_block_rows, kb, rb_idx);
+            const size_t elems = static_cast<size_t>(row_count) * static_cast<size_t>(kb);
+            T* d_rowblock_w = ws->d_block_w_rowmajor + off;
 
             if (part.rank == block_owner) {
-                AssertCuda(cudaStreamWaitEvent(events.rowblock_pack_stream,
-                                               events.chunk_comm_done[buf_idx], 0),
-                           "cudaStreamWaitEvent rowblock_pack_stream <- chunk_comm_done");
                 const size_t pack_idx = BeginPhaseInterval(phase_profile, PhaseKind::RowBlockPack,
                                                            events.rowblock_pack_stream);
-                PackCompactChunkToPackedBroadcastCache(k_chunk_begin, kc, block_rows, ws->d_block_w,
-                                                      ws->d_block_y, d_wy_packed,
-                                                      events.rowblock_pack_stream);
+                PackCompactWRowBlockToRowMajorCache(rb_idx, block_rows, kb, row_block_rows,
+                                                   ws->d_block_w, ws->d_block_w_rowmajor,
+                                                   events.rowblock_pack_stream);
                 EndPhaseInterval(phase_profile, pack_idx, events.rowblock_pack_stream);
-                AssertCuda(cudaEventRecord(events.chunk_pack_ready[buf_idx],
-                                           events.rowblock_pack_stream),
-                           "cudaEventRecord chunk_pack_ready");
-                AssertCuda(cudaStreamWaitEvent(comm_stream, events.chunk_pack_ready[buf_idx], 0),
-                           "cudaStreamWaitEvent comm_stream <- chunk_pack_ready");
-                AssertCuda(cudaEventRecord(events.chunk_data_ready[chunk_idx], compute_stream),
-                           "cudaEventRecord owner chunk_data_ready");
+                AssertCuda(
+                    cudaEventRecord(events.rowblock_ready[rb_idx], events.rowblock_pack_stream),
+                    "cudaEventRecord rowblock_ready");
+                AssertCuda(cudaStreamWaitEvent(comm_stream, events.rowblock_ready[rb_idx], 0),
+                           "cudaStreamWaitEvent comm_stream <- rowblock_ready");
             }
 
             if (block_receivers > 0) {
                 const size_t comm_idx =
                     BeginPhaseInterval(phase_profile, PhaseKind::CommW, comm_stream);
-                AssertNccl(ncclBroadcast(d_wy_packed, d_wy_packed, 2 * elems, nccl_type,
-                                         block_owner, nccl_comm, comm_stream),
-                           "ncclBroadcast overlap compact chunk WY");
+                AssertNccl(ncclBroadcast(d_rowblock_w, d_rowblock_w, elems, nccl_type, block_owner,
+                                         nccl_comm, comm_stream),
+                           "ncclBroadcast overlap rowblock W");
                 EndPhaseInterval(phase_profile, comm_idx, comm_stream);
                 if (comm_profile) {
-                    comm_profile->bytes +=
-                        2ULL * elems * sizeof(T) * static_cast<size_t>(block_receivers);
+                    comm_profile->bytes += elems * sizeof(T) * static_cast<size_t>(block_receivers);
                 }
             }
-            if (part.rank != block_owner && self_has_tail) {
-                const size_t unpack_idx =
-                    BeginPhaseInterval(phase_profile, PhaseKind::RowBlockUnpack, comm_stream);
-                UnpackPackedCompactChunkToCompactBlockStorage(k_chunk_begin, kc, block_rows,
-                                                              d_wy_packed, ws->d_block_w,
-                                                              ws->d_block_y, comm_stream);
-                EndPhaseInterval(phase_profile, unpack_idx, comm_stream);
-                AssertCuda(cudaEventRecord(events.chunk_data_ready[chunk_idx], comm_stream),
-                           "cudaEventRecord recv chunk_data_ready");
-            }
-            AssertCuda(cudaEventRecord(events.chunk_comm_done[buf_idx], comm_stream),
-                       "cudaEventRecord chunk_comm_done");
+            AssertCuda(cudaEventRecord(events.rowblock_comm_done[rb_idx], comm_stream),
+                       "cudaEventRecord rowblock_comm_done");
         }
 
+        const size_t compact_y_elems = static_cast<size_t>(block_rows) * static_cast<size_t>(kb);
+        if (block_receivers > 0) {
+            const size_t comm_idx = BeginPhaseInterval(phase_profile, PhaseKind::CommY, comm_stream);
+            AssertNccl(ncclBroadcast(ws->d_block_y, ws->d_block_y, compact_y_elems, nccl_type,
+                                     block_owner, nccl_comm, comm_stream),
+                       "ncclBroadcast overlap compact Y");
+            EndPhaseInterval(phase_profile, comm_idx, comm_stream);
+            if (comm_profile) {
+                comm_profile->bytes +=
+                    compact_y_elems * sizeof(T) * static_cast<size_t>(block_receivers);
+            }
+        }
+        AssertCuda(cudaEventRecord(events.compact_y_comm_done, comm_stream),
+                   "cudaEventRecord compact_y_comm_done");
+
         if (!self_has_tail) {
-            AssertCuda(cudaStreamWaitEvent(compute_stream,
-                                           events.chunk_comm_done[(overlap_chunk_count - 1) %
-                                                                  packed_buffer_count],
-                                           0),
-                       "cudaStreamWaitEvent compute_stream <- chunk_comm_done[last]");
+            AssertCuda(cudaStreamWaitEvent(compute_stream, events.compact_y_comm_done, 0),
+                       "cudaStreamWaitEvent compute_stream <- compact_y_comm_done");
             return;
         }
 
@@ -1421,39 +1383,26 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             for (int col_off = 0; col_off < cols_local; col_off += target_cols) {
                 const int cols_tile = std::min(target_cols, cols_local - col_off);
                 tail_tiles.push_back(
-                    {d_A_local + static_cast<size_t>(local_begin + col_off) * lda_local, cols_tile});
+                    {d_A_local + static_cast<size_t>(local_begin + col_off) * lda_local,
+                     cols_tile});
             }
         });
 
         for (const auto& tile : tail_tiles) {
-            for (int chunk_idx = 0, k_chunk_begin = 0; k_chunk_begin < kb;
-                 k_chunk_begin += k_chunk_cols, ++chunk_idx) {
-                const int kc = std::min(k_chunk_cols, kb - k_chunk_begin);
-                const size_t tail_wait_idx =
-                    BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait,
-                                       events.tail_acc_stream);
-                AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream,
-                                               events.chunk_data_ready[chunk_idx], 0),
-                           "cudaStreamWaitEvent tail_acc_stream <- chunk_data_ready");
-                EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
-                TailAccumulateCompactChunkToTile(events.tail_acc_cublas_handle, ws->d_block_w,
-                                                block_begin, block_rows, kb, k_chunk_begin, kc,
-                                                tile.a_tile, lda_local, tile.cols_tile, ws->d_tmp0,
-                                                ws->tmp_elems, events.tail_acc_stream,
-                                                phase_profile);
-            }
+            TailAccumulateColTileFromRowBlockCache(
+                events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, block_begin, block_rows, kb,
+                row_block_rows, tile.a_tile, lda_local, tile.cols_tile, ws->d_tmp0, ws->tmp_elems,
+                events.tail_acc_stream, true, events.rowblock_comm_done, phase_profile);
 
-            AssertCuda(cudaEventRecord(events.tail_accum_done, events.tail_acc_stream),
-                       "cudaEventRecord tail_accum_done(acc complete)");
-            AssertCuda(cudaStreamWaitEvent(events.tail_apply_stream, events.tail_accum_done, 0),
-                       "cudaStreamWaitEvent tail_apply_stream <- acc complete");
-            for (int k_chunk_begin = 0; k_chunk_begin < kb; k_chunk_begin += k_chunk_cols) {
-                const int kc = std::min(k_chunk_cols, kb - k_chunk_begin);
-                TailApplyCompactChunkToTile(events.tail_apply_cublas_handle, ws->d_block_y,
-                                            block_begin, block_rows, kb, k_chunk_begin, kc,
-                                            tile.a_tile, lda_local, tile.cols_tile, ws->d_tmp0,
-                                            events.tail_apply_stream, phase_profile);
-            }
+            const size_t tail_wait_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, events.tail_acc_stream);
+            AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream, events.compact_y_comm_done, 0),
+                       "cudaStreamWaitEvent tail_acc_stream <- compact_y_comm_done");
+            EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
+
+            TailApplyCompactBlockToTile(events.tail_acc_cublas_handle, ws->d_block_y, block_begin,
+                                        block_rows, kb, tile.a_tile, lda_local, tile.cols_tile,
+                                        ws->d_tmp0, events.tail_acc_stream, phase_profile);
         }
 
         if (phase_profile && local_tail_cols > 0) {
@@ -1462,15 +1411,12 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                                                 static_cast<double>(local_tail_cols);
         }
 
-        AssertCuda(cudaEventRecord(events.tail_update_done, events.tail_apply_stream),
+        AssertCuda(cudaEventRecord(events.tail_update_done, events.tail_acc_stream),
                    "cudaEventRecord tail_update_done");
         AssertCuda(cudaStreamWaitEvent(compute_stream, events.tail_update_done, 0),
                    "cudaStreamWaitEvent compute_stream <- tail_update_done");
-        AssertCuda(cudaStreamWaitEvent(compute_stream,
-                                       events.chunk_comm_done[(overlap_chunk_count - 1) %
-                                                              packed_buffer_count],
-                                       0),
-                   "cudaStreamWaitEvent compute_stream <- chunk_comm_done[last]");
+        AssertCuda(cudaStreamWaitEvent(compute_stream, events.compact_y_comm_done, 0),
+                   "cudaStreamWaitEvent compute_stream <- compact_y_comm_done");
         return;
     }
 
