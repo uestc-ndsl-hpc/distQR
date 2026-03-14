@@ -236,10 +236,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     distributed_qr_col_blockcyclic_pipeline::DistributedQrColBlockCyclicPipelineWorkspace<T> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.panel_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
-    ws.block_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
+    ws.block_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(block_cols);
     ws.block_rowmajor_elems = ws.block_elems;
     ws.rowblock_wy_packed_elems = 2 * ws.block_elems;
-    ws.tmp_elems = static_cast<size_t>(std::max(opts.nb, kPanelWidth)) *
+    ws.tmp_elems = static_cast<size_t>(std::max(block_cols, kPanelWidth)) *
                    static_cast<size_t>(std::max(opts.trail_tile_cols, 1));
 
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
@@ -570,7 +570,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             TflopsFromFlopsAndMs(QrFactorizationFlops(opts.m, opts.n), max_ms);
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic-pipeline] ({}): m={} n={} nb={} "
-            "block_cols={} update_tile(compat)={} row_block_rows={} trail_tile_cols={} "
+            "block_cols={} update_tile_cols={} row_block_rows={} trail_tile_cols={} "
             "row_block_mode={} skip_tail_update={} np={} avg {:.3f} ms overall {:.3f} TFLOP/s",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
             opts.row_block_rows, opts.trail_tile_cols,
