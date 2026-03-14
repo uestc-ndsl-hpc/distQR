@@ -1,21 +1,12 @@
 #pragma once
-// Column-partitioned distributed blocked QR scaffold for a block-cyclic column layout.
+// Column-partitioned distributed blocked QR for a block-cyclic column layout.
 //
-// This file intentionally mirrors the structure of
-// distributed_blocked_qr_col_blockcyclic.cuh, but only migrates the reusable
-// distributed skeleton:
-//   1. partition helpers,
-//   2. owner-side panel factorization,
-//   3. compact block-WY construction,
-//   4. profiling / accounting hooks.
-//
-// The panel-by-panel propagation/update path from the existing implementation is
-// intentionally not migrated. The long-term pipeline direction for this file is:
-//   owner builds compact block-WY,
-//   owner broadcasts block-WY k-tiles,
-//   each rank performs a local row-block streamed trailing update.
-//
-// In other words, this file is a migration scaffold, not a finished algorithm.
+// This variant keeps compact owner-side block-WY storage and performs the
+// trailing update with a streamed row-block pipeline:
+//   1. the owner factorizes panels and builds compact block-WY,
+//   2. compact block-WY is broadcast k-tile by k-tile,
+//   3. each rank stages row-block slices through multi-buffered device staging,
+//   4. tail GEMMs overlap row-block staging and the next tile's communication.
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -34,6 +25,7 @@
 namespace distributed_qr_col_blockcyclic_pipeline {
 
 constexpr int kPanelWidth = 32;
+constexpr int kRowBlockBufferCount = 3;
 
 template <typename T>
 constexpr bool kSupportedQrType = std::is_same_v<T, float> || std::is_same_v<T, double>;
@@ -204,8 +196,8 @@ struct DistributedQrColBlockCyclicPipelineWorkspace {
     // Row-block staging for the future streamed trailing update.
     // Each staging buffer is intended to hold one row-block slice of a single
     // k-tile: [row_block_rows x update_tile_cols].
-    T* d_rowblock_w[2] = {nullptr, nullptr};
-    T* d_rowblock_y[2] = {nullptr, nullptr};
+    T* d_rowblock_w[kRowBlockBufferCount] = {nullptr, nullptr, nullptr};
+    T* d_rowblock_y[kRowBlockBufferCount] = {nullptr, nullptr, nullptr};
     size_t rowblock_elems = 0;
 
     // Temporary workspaces for:
@@ -365,6 +357,61 @@ inline void ValidateWorkspace(const DistributedQrColBlockCyclicPipelineWorkspace
     }
 }
 
+inline RowBlockPipelineConfig NormalizePipelineConfig(const RowBlockPipelineConfig& pipeline_cfg,
+                                                      int nb) {
+    RowBlockPipelineConfig cfg = pipeline_cfg;
+    if (cfg.update_tile_cols <= 0) {
+        cfg.update_tile_cols = nb;
+    }
+    if (cfg.row_block_rows <= 0) {
+        cfg.row_block_rows = 1024;
+    }
+    if (cfg.trail_tile_cols <= 0) {
+        cfg.trail_tile_cols = nb;
+    }
+    return cfg;
+}
+
+template <typename T>
+inline void ValidatePipelineConfig(const DistributedQrColBlockCyclicPipelineWorkspace<T>& ws,
+                                   const RowBlockPipelineConfig& cfg,
+                                   int nb) {
+    if (cfg.update_tile_cols < kPanelWidth || cfg.update_tile_cols > nb ||
+        cfg.update_tile_cols % kPanelWidth != 0) {
+        spdlog::error(
+            "Pipeline update_tile_cols must be in [{}, {}] and a multiple of {} (got {}).",
+            kPanelWidth, nb, kPanelWidth, cfg.update_tile_cols);
+        std::exit(1);
+    }
+    if (cfg.row_block_rows <= 0) {
+        spdlog::error("Pipeline row_block_rows must be positive (got {}).", cfg.row_block_rows);
+        std::exit(1);
+    }
+    if (cfg.trail_tile_cols <= 0) {
+        spdlog::error("Pipeline trail_tile_cols must be positive (got {}).", cfg.trail_tile_cols);
+        std::exit(1);
+    }
+
+    const size_t rowblock_need =
+        static_cast<size_t>(cfg.row_block_rows) * static_cast<size_t>(cfg.update_tile_cols);
+    for (int i = 0; i < kRowBlockBufferCount; ++i) {
+        if (!ws.d_rowblock_w[i] || !ws.d_rowblock_y[i] || ws.rowblock_elems < rowblock_need) {
+            spdlog::error(
+                "Pipeline row-block staging buffer {} too small or null (need {} elems, got {}).",
+                i, rowblock_need, ws.rowblock_elems);
+            std::exit(1);
+        }
+    }
+
+    const size_t tmp_need =
+        std::max(static_cast<size_t>(nb) * static_cast<size_t>(kPanelWidth),
+                 static_cast<size_t>(cfg.update_tile_cols) * static_cast<size_t>(cfg.trail_tile_cols));
+    if (ws.tmp_elems < tmp_need) {
+        spdlog::error("Pipeline tmp too small (need {} elems, got {}).", tmp_need, ws.tmp_elems);
+        std::exit(1);
+    }
+}
+
 template <typename T>
 inline void ScatterPanelToCompactBlockWy(int block_begin,
                                          int inner,
@@ -502,6 +549,211 @@ inline void SaveOwnerBlockW(int block_begin,
 }
 
 template <typename T>
+inline void PanelUpdateOneShot(cublasHandle_t cublas_handle,
+                               int panel_col,
+                               int panel_rows,
+                               int cols_local,
+                               const T* W,
+                               const T* Y,
+                               int lda_wy,
+                               T* A_trail,
+                               int lda_local,
+                               T* work,
+                               size_t work_elems) {
+    if (panel_rows <= 0 || cols_local <= 0) {
+        return;
+    }
+
+    const size_t need = static_cast<size_t>(kPanelWidth) * static_cast<size_t>(cols_local);
+    if (work_elems < need) {
+        spdlog::error("Pipeline panel update work too small (need {} elems, got {}).", need,
+                      work_elems);
+        std::exit(1);
+    }
+
+    const T one = static_cast<T>(1);
+    const T zero = static_cast<T>(0);
+    const T minus_one = static_cast<T>(-1);
+    T* a_sub = A_trail + panel_col;
+    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kPanelWidth,
+                                           cols_local, panel_rows, &one, W, lda_wy, a_sub,
+                                           lda_local, &zero, work, kPanelWidth),
+                 "Pipeline in-block work = W^T * A");
+    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, panel_rows,
+                                           cols_local, kPanelWidth, &minus_one, Y, lda_wy, work,
+                                           kPanelWidth, &one, a_sub, lda_local),
+                 "Pipeline in-block A -= Y * work");
+}
+
+template <typename T>
+inline void ApplyPanelToTrailingSegment(cublasHandle_t cublas_handle,
+                                        int inner,
+                                        int panel_rows,
+                                        int cols_local,
+                                        const T* d_panel_w,
+                                        const T* d_panel_y,
+                                        T* a_trail,
+                                        int lda_local,
+                                        T* d_tmp,
+                                        size_t tmp_elems) {
+    if (cols_local <= 0) {
+        return;
+    }
+    const int max_chunk_cols =
+        std::max(1, static_cast<int>(tmp_elems / static_cast<size_t>(kPanelWidth)));
+    for (int col_off = 0; col_off < cols_local; col_off += max_chunk_cols) {
+        const int chunk_cols = std::min(max_chunk_cols, cols_local - col_off);
+        PanelUpdateOneShot(cublas_handle, inner, panel_rows, chunk_cols, d_panel_w, d_panel_y,
+                           panel_rows, a_trail + static_cast<size_t>(col_off) * lda_local,
+                           lda_local, d_tmp, tmp_elems);
+    }
+}
+
+template <typename T>
+inline void StageRowBlockSlice(const T* d_block_w_tile,
+                               const T* d_block_y_tile,
+                               int block_rows,
+                               int row_begin,
+                               int row_count,
+                               int tile_k,
+                               T* d_rowblock_w,
+                               T* d_rowblock_y,
+                               cudaStream_t stage_stream) {
+    AssertCuda(cudaMemcpy2DAsync(d_rowblock_w, static_cast<size_t>(row_count) * sizeof(T),
+                                 d_block_w_tile + row_begin,
+                                 static_cast<size_t>(block_rows) * sizeof(T),
+                                 static_cast<size_t>(row_count) * sizeof(T), tile_k,
+                                 cudaMemcpyDeviceToDevice, stage_stream),
+               "cudaMemcpy2DAsync block_w_tile -> rowblock_w");
+    AssertCuda(cudaMemcpy2DAsync(d_rowblock_y, static_cast<size_t>(row_count) * sizeof(T),
+                                 d_block_y_tile + row_begin,
+                                 static_cast<size_t>(block_rows) * sizeof(T),
+                                 static_cast<size_t>(row_count) * sizeof(T), tile_k,
+                                 cudaMemcpyDeviceToDevice, stage_stream),
+               "cudaMemcpy2DAsync block_y_tile -> rowblock_y");
+}
+
+template <typename T>
+inline void RowBlockTailUpdateColTile(
+    cublasHandle_t tail_cublas_handle,
+    const T* d_block_w_tile,
+    const T* d_block_y_tile,
+    int block_rows,
+    int tile_k,
+    T* a_tile,
+    int lda_local,
+    int cols_tile,
+    DistributedQrColBlockCyclicPipelineWorkspace<T>* ws,
+    cudaStream_t stage_stream,
+    cudaStream_t tail_update_stream,
+    cudaEvent_t* rowblock_ready,
+    cudaEvent_t* rowblock_free,
+    const RowBlockPipelineConfig& pipeline_cfg,
+    PhaseProfile* phase_profile) {
+    if (cols_tile <= 0) {
+        return;
+    }
+
+    const size_t tmp_elems = static_cast<size_t>(tile_k) * static_cast<size_t>(cols_tile);
+    if (ws->tmp_elems < tmp_elems) {
+        spdlog::error("Pipeline tail tmp too small (need {} elems, got {}).", tmp_elems,
+                      ws->tmp_elems);
+        std::exit(1);
+    }
+
+    const int row_block_rows = std::max(1, pipeline_cfg.row_block_rows);
+    const int row_block_count = (block_rows + row_block_rows - 1) / row_block_rows;
+    const T one = static_cast<T>(1);
+    const T zero = static_cast<T>(0);
+    const T minus_one = static_cast<T>(-1);
+
+    auto stage_pass = [&](int rb_idx, int buf) {
+        const int row_begin = rb_idx * row_block_rows;
+        const int row_count = std::min(row_block_rows, block_rows - row_begin);
+        AssertCuda(cudaStreamWaitEvent(stage_stream, rowblock_free[buf], 0),
+                   "cudaStreamWaitEvent rowblock_stage_stream <- rowblock_free");
+        StageRowBlockSlice(d_block_w_tile, d_block_y_tile, block_rows, row_begin, row_count, tile_k,
+                           ws->d_rowblock_w[buf], ws->d_rowblock_y[buf], stage_stream);
+        AssertCuda(cudaEventRecord(rowblock_ready[buf], stage_stream),
+                   "cudaEventRecord rowblock_ready");
+    };
+
+    for (int buf = 0; buf < kRowBlockBufferCount; ++buf) {
+        AssertCuda(cudaEventRecord(rowblock_free[buf], tail_update_stream),
+                   "cudaEventRecord rowblock_free(reset)");
+    }
+
+    const size_t tail_acc_idx =
+        BeginPhaseInterval(phase_profile, PhaseKind::TailAccumulate, tail_update_stream);
+    AssertCuda(cudaMemsetAsync(ws->d_tmp0, 0, tmp_elems * sizeof(T), tail_update_stream),
+               "cudaMemsetAsync tail accumulate tmp");
+
+    int next_stage = 0;
+    const int initial_stage = std::min(row_block_count, kRowBlockBufferCount);
+    for (; next_stage < initial_stage; ++next_stage) {
+        stage_pass(next_stage, next_stage);
+    }
+
+    for (int rb_idx = 0; rb_idx < row_block_count; ++rb_idx) {
+        const int buf = rb_idx % kRowBlockBufferCount;
+        const int row_begin = rb_idx * row_block_rows;
+        const int row_count = std::min(row_block_rows, block_rows - row_begin);
+
+        AssertCuda(cudaStreamWaitEvent(tail_update_stream, rowblock_ready[buf], 0),
+                   "cudaStreamWaitEvent tail_update_stream <- rowblock_ready(acc)");
+        const T* w_rb = ws->d_rowblock_w[buf];
+        const T* a_rb = a_tile + row_begin;
+        const T* beta = (rb_idx == 0) ? &zero : &one;
+        AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, tile_k,
+                                               cols_tile, row_count, &one, w_rb, row_count, a_rb,
+                                               lda_local, beta, ws->d_tmp0, tile_k),
+                     "Pipeline tail accumulate tmp += W_rb^T * A_rb");
+        AssertCuda(cudaEventRecord(rowblock_free[buf], tail_update_stream),
+                   "cudaEventRecord rowblock_free(acc)");
+        if (next_stage < row_block_count) {
+            stage_pass(next_stage, buf);
+            ++next_stage;
+        }
+    }
+    EndPhaseInterval(phase_profile, tail_acc_idx, tail_update_stream);
+
+    for (int buf = 0; buf < kRowBlockBufferCount; ++buf) {
+        AssertCuda(cudaEventRecord(rowblock_free[buf], tail_update_stream),
+                   "cudaEventRecord rowblock_free(restart)");
+    }
+
+    const size_t tail_apply_idx =
+        BeginPhaseInterval(phase_profile, PhaseKind::TailApply, tail_update_stream);
+    next_stage = 0;
+    for (; next_stage < initial_stage; ++next_stage) {
+        stage_pass(next_stage, next_stage);
+    }
+
+    for (int rb_idx = 0; rb_idx < row_block_count; ++rb_idx) {
+        const int buf = rb_idx % kRowBlockBufferCount;
+        const int row_begin = rb_idx * row_block_rows;
+        const int row_count = std::min(row_block_rows, block_rows - row_begin);
+
+        AssertCuda(cudaStreamWaitEvent(tail_update_stream, rowblock_ready[buf], 0),
+                   "cudaStreamWaitEvent tail_update_stream <- rowblock_ready(apply)");
+        const T* y_rb = ws->d_rowblock_y[buf];
+        T* a_rb = a_tile + row_begin;
+        AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                               row_count, cols_tile, tile_k, &minus_one, y_rb,
+                                               row_count, ws->d_tmp0, tile_k, &one, a_rb,
+                                               lda_local),
+                     "Pipeline tail apply A_rb -= Y_rb * tmp");
+        AssertCuda(cudaEventRecord(rowblock_free[buf], tail_update_stream),
+                   "cudaEventRecord rowblock_free(apply)");
+        if (next_stage < row_block_count) {
+            stage_pass(next_stage, buf);
+            ++next_stage;
+        }
+    }
+    EndPhaseInterval(phase_profile, tail_apply_idx, tail_update_stream);
+}
+
+template <typename T>
 inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                                        ncclComm_t nccl_comm,
                                        const ColBlockCyclicPartition& part,
@@ -517,41 +769,177 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                                        const RowBlockPipelineConfig& pipeline_cfg,
                                        CommProfile* comm_profile,
                                        PhaseProfile* phase_profile) {
-    (void)cublas_handle;
-    (void)nccl_comm;
-    (void)part;
-    (void)m;
-    (void)n;
-    (void)d_A_local;
-    (void)lda_local;
-    (void)ws;
-    (void)compute_stream;
-    (void)comm_stream;
-    (void)pipeline_cfg;
-    (void)comm_profile;
-    (void)phase_profile;
-
     if (block_end >= n) {
         return;
     }
 
-    // This is the key piece that still needs to be implemented for the new
-    // pipeline design. The intended execution order is:
-    //
-    //   for each compact block-WY k-tile:
-    //     1. owner broadcasts the k-tile,
-    //     2. each rank streams the received tile as row-block slices,
-    //     3. pass 1 accumulates tmp_tile = sum_rb(W_rb^T * A_rb_tile),
-    //     4. pass 2 applies A_rb_tile -= Y_rb * tmp_tile.
-    //
-    // We fail explicitly here instead of silently reusing the old full-tile
-    // update path, because the whole point of this file is to make the new
-    // local row-block pipeline visible and hard to accidentally bypass.
-    spdlog::error(
-        "distributed_blocked_qr_col_blockcyclic_pipeline tail-update scaffold hit TODO at "
-        "block [{}, {}). Implement row-block streamed trailing update before using this path.",
-        block_begin, block_end);
-    std::exit(1);
+    const int block_rows = m - block_begin;
+    const int kb = block_end - block_begin;
+    const int block_owner = OwnerOfPanel(block_begin, part);
+    const int tile_k = std::min(pipeline_cfg.update_tile_cols, kb);
+    const int tile_count = (kb + tile_k - 1) / tile_k;
+    const bool self_has_tail = RankHasColsAfter(part, part.rank, block_end);
+
+    int block_receivers = 0;
+    if (part.world_size > 1) {
+        for (int r = 0; r < part.world_size; ++r) {
+            if (r == block_owner) {
+                continue;
+            }
+            if (!RankHasColsAfter(part, r, block_end)) {
+                continue;
+            }
+            ++block_receivers;
+        }
+    }
+
+    struct PersistentPipelineEvents {
+        bool initialized = false;
+        cudaStream_t rowblock_stage_stream = nullptr;
+        cudaStream_t tail_update_stream = nullptr;
+        cublasHandle_t tail_cublas_handle = nullptr;
+        cudaEvent_t rowblock_ready[kRowBlockBufferCount] = {};
+        cudaEvent_t rowblock_free[kRowBlockBufferCount] = {};
+        cudaEvent_t tail_update_done = nullptr;
+        std::vector<cudaEvent_t> tile_ready;
+        std::vector<cudaEvent_t> tile_comm_done;
+    };
+    static PersistentPipelineEvents events;
+    if (!events.initialized) {
+        AssertCuda(cudaStreamCreateWithFlags(&events.rowblock_stage_stream, cudaStreamNonBlocking),
+                   "cudaStreamCreate rowblock_stage_stream");
+        AssertCuda(cudaStreamCreateWithFlags(&events.tail_update_stream, cudaStreamNonBlocking),
+                   "cudaStreamCreate tail_update_stream");
+        AssertCublas(cublasCreate(&events.tail_cublas_handle), "cublasCreate tail_cublas_handle");
+        AssertCublas(cublasSetStream(events.tail_cublas_handle, events.tail_update_stream),
+                     "cublasSetStream(tail_update_stream)");
+        for (int i = 0; i < kRowBlockBufferCount; ++i) {
+            AssertCuda(cudaEventCreateWithFlags(&events.rowblock_ready[i], cudaEventDisableTiming),
+                       "cudaEventCreate rowblock_ready");
+            AssertCuda(cudaEventCreateWithFlags(&events.rowblock_free[i], cudaEventDisableTiming),
+                       "cudaEventCreate rowblock_free");
+        }
+        AssertCuda(cudaEventCreateWithFlags(&events.tail_update_done, cudaEventDisableTiming),
+                   "cudaEventCreate tail_update_done");
+        events.initialized = true;
+    }
+    while (static_cast<int>(events.tile_ready.size()) < tile_count) {
+        cudaEvent_t tile_ready = nullptr;
+        cudaEvent_t tile_comm_done = nullptr;
+        AssertCuda(cudaEventCreateWithFlags(&tile_ready, cudaEventDisableTiming),
+                   "cudaEventCreate tile_ready");
+        AssertCuda(cudaEventCreateWithFlags(&tile_comm_done, cudaEventDisableTiming),
+                   "cudaEventCreate tile_comm_done");
+        events.tile_ready.push_back(tile_ready);
+        events.tile_comm_done.push_back(tile_comm_done);
+    }
+    AssertCuda(cudaEventRecord(events.tail_update_done, events.tail_update_stream),
+               "cudaEventRecord tail_update_done(reset)");
+
+    const ncclDataType_t nccl_type = NcclType<T>();
+    for (int tile_idx = 0; tile_idx < tile_count; ++tile_idx) {
+        const int k_begin = tile_idx * tile_k;
+        const int this_tile_k = std::min(tile_k, kb - k_begin);
+        T* d_block_w_tile = ws->d_block_w + static_cast<size_t>(k_begin) * static_cast<size_t>(block_rows);
+        T* d_block_y_tile = ws->d_block_y + static_cast<size_t>(k_begin) * static_cast<size_t>(block_rows);
+
+        if (part.rank == block_owner) {
+            AssertCuda(cudaEventRecord(events.tile_ready[tile_idx], compute_stream),
+                       "cudaEventRecord tile_ready");
+        }
+        if (block_receivers > 0) {
+            if (part.rank == block_owner) {
+                AssertCuda(cudaStreamWaitEvent(comm_stream, events.tile_ready[tile_idx], 0),
+                           "cudaStreamWaitEvent comm_stream <- tile_ready");
+            }
+            const size_t comm_idx = BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+            AssertNccl(ncclBroadcast(d_block_w_tile, d_block_w_tile,
+                                     static_cast<size_t>(block_rows) *
+                                         static_cast<size_t>(this_tile_k),
+                                     nccl_type, block_owner, nccl_comm, comm_stream),
+                       "ncclBroadcast pipeline block W tile");
+            AssertNccl(ncclBroadcast(d_block_y_tile, d_block_y_tile,
+                                     static_cast<size_t>(block_rows) *
+                                         static_cast<size_t>(this_tile_k),
+                                     nccl_type, block_owner, nccl_comm, comm_stream),
+                       "ncclBroadcast pipeline block Y tile");
+            EndPhaseInterval(phase_profile, comm_idx, comm_stream);
+            if (comm_profile) {
+                comm_profile->bytes += 2ULL * static_cast<size_t>(block_rows) *
+                                       static_cast<size_t>(this_tile_k) * sizeof(T) *
+                                       static_cast<size_t>(block_receivers);
+            }
+        }
+        AssertCuda(cudaEventRecord(events.tile_comm_done[tile_idx], comm_stream),
+                   "cudaEventRecord tile_comm_done");
+    }
+
+    if (!self_has_tail) {
+        if (block_receivers > 0) {
+            AssertCuda(cudaStreamWaitEvent(compute_stream, events.tile_comm_done[tile_count - 1], 0),
+                       "cudaStreamWaitEvent compute_stream <- tile_comm_done[last]");
+        }
+        return;
+    }
+
+    int local_tail_cols = 0;
+    for (int tile_idx = 0; tile_idx < tile_count; ++tile_idx) {
+        const int k_begin = tile_idx * tile_k;
+        const int this_tile_k = std::min(tile_k, kb - k_begin);
+        T* d_block_w_tile = ws->d_block_w + static_cast<size_t>(k_begin) * static_cast<size_t>(block_rows);
+        T* d_block_y_tile = ws->d_block_y + static_cast<size_t>(k_begin) * static_cast<size_t>(block_rows);
+
+        if (part.rank == block_owner || block_receivers == 0) {
+            AssertCuda(cudaStreamWaitEvent(events.rowblock_stage_stream, events.tile_ready[tile_idx], 0),
+                       "cudaStreamWaitEvent rowblock_stage_stream <- tile_ready");
+            AssertCuda(cudaStreamWaitEvent(events.tail_update_stream, events.tile_ready[tile_idx], 0),
+                       "cudaStreamWaitEvent tail_update_stream <- tile_ready");
+        } else {
+            AssertCuda(
+                cudaStreamWaitEvent(events.rowblock_stage_stream, events.tile_comm_done[tile_idx], 0),
+                "cudaStreamWaitEvent rowblock_stage_stream <- tile_comm_done");
+            AssertCuda(
+                cudaStreamWaitEvent(events.tail_update_stream, events.tile_comm_done[tile_idx], 0),
+                "cudaStreamWaitEvent tail_update_stream <- tile_comm_done");
+        }
+
+        ForEachLocalSegment(
+            part, block_end, n, [&](int seg_begin, int seg_end, int local_begin) {
+                const int cols_local = seg_end - seg_begin;
+                if (tile_idx == 0) {
+                    local_tail_cols += cols_local;
+                }
+
+                const int max_cols_by_tmp =
+                    std::max(1, static_cast<int>(ws->tmp_elems / static_cast<size_t>(this_tile_k)));
+                const int target_cols = std::min(pipeline_cfg.trail_tile_cols, max_cols_by_tmp);
+                for (int col_off = 0; col_off < cols_local; col_off += target_cols) {
+                    const int cols_tile = std::min(target_cols, cols_local - col_off);
+                    T* a_tile = d_A_local + static_cast<size_t>(local_begin + col_off) * lda_local;
+                    RowBlockTailUpdateColTile(events.tail_cublas_handle, d_block_w_tile,
+                                              d_block_y_tile, block_rows, this_tile_k, a_tile,
+                                              lda_local, cols_tile, ws,
+                                              events.rowblock_stage_stream,
+                                              events.tail_update_stream, events.rowblock_ready,
+                                              events.rowblock_free, pipeline_cfg, phase_profile);
+                }
+            });
+    }
+
+    if (phase_profile && local_tail_cols > 0) {
+        phase_profile->tail_update_flops +=
+            4.0 * static_cast<double>(block_rows) * static_cast<double>(kb) *
+            static_cast<double>(local_tail_cols);
+    }
+
+    AssertCuda(cudaEventRecord(events.tail_update_done, events.tail_update_stream),
+               "cudaEventRecord tail_update_done");
+    AssertCuda(cudaStreamWaitEvent(compute_stream, events.tail_update_done, 0),
+               "cudaStreamWaitEvent compute_stream <- tail_update_done");
+    if (block_receivers > 0) {
+        AssertCuda(cudaStreamWaitEvent(compute_stream, events.tile_comm_done[tile_count - 1], 0),
+                   "cudaStreamWaitEvent compute_stream <- tile_comm_done[last]");
+    }
 }
 
 template <typename T>
@@ -595,6 +983,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
     }
 
     ValidateWorkspace(*ws, m, nb);
+    const RowBlockPipelineConfig cfg = NormalizePipelineConfig(pipeline_cfg, nb);
+    ValidatePipelineConfig(*ws, cfg, nb);
     if (comm_profile) {
         comm_profile->bytes = 0;
     }
@@ -604,12 +994,11 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
 
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
         const int block_end = std::min(block_begin + nb, n);
-        const int kb = block_end - block_begin;
         const int block_rows = m - block_begin;
         const int block_owner = OwnerOfPanel(block_begin, part);
 
-        // Compact block-WY is the canonical representation in this scaffold, so
-        // the owner clears it once per outer block and then appends each panel
+        // Compact block-WY is the canonical block representation here, so the
+        // owner clears it once per outer block and then appends each panel
         // directly into the compact layout.
         if (part.rank == block_owner) {
             AssertCuda(cudaMemsetAsync(ws->d_block_w, 0,
@@ -688,25 +1077,19 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
             SaveOwnerBlockW(block_begin, inner, m, local_panel_col, d_W_local, lda_local,
                             ws->d_block_w, compute_stream);
 
-            // The piece intentionally omitted from this scaffold is the in-block
-            // propagation that would make panel (inner + kPanelWidth) numerically
-            // ready. Rather than silently computing the next panel on stale data,
-            // we stop here as soon as the block needs a second panel.
-            if (inner + kPanelWidth < block_end) {
-                spdlog::error(
-                    "distributed_blocked_qr_col_blockcyclic_pipeline is currently a scaffold. "
-                    "In-block panel propagation/update is intentionally not migrated yet, so "
-                    "outer blocks wider than one panel are not executable.");
-                std::exit(1);
-            }
+            ForEachLocalSegment(
+                part, inner + kPanelWidth, block_end, [&](int seg_begin, int seg_end, int local_begin) {
+                    const int cols_local = seg_end - seg_begin;
+                    T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                    ApplyPanelToTrailingSegment(cublas_handle, inner, panel_rows, cols_local,
+                                                ws->d_panel_w, ws->d_panel_y, a_trail, lda_local,
+                                                ws->d_tmp0, ws->tmp_elems);
+                });
         }
 
-        // Once the owner has constructed compact block-WY, the new pipeline is
-        // supposed to take over here. Tail update becomes the dominant stage and
-        // is where the new row-block local streaming logic will live.
         StreamedTailUpdateScaffold(cublas_handle, nccl_comm, part, block_begin, block_end, m, n,
-                                   d_A_local, lda_local, ws, compute_stream, comm_stream,
-                                   pipeline_cfg, comm_profile, phase_profile);
+                                   d_A_local, lda_local, ws, compute_stream, comm_stream, cfg,
+                                   comm_profile, phase_profile);
     }
 }
 

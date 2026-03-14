@@ -164,8 +164,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         static_cast<size_t>(std::max(opts.row_block_rows, 1)) *
         static_cast<size_t>(std::max(opts.update_tile, kPanelWidth));
     ws.tmp_elems =
-        static_cast<size_t>(std::max(opts.nb, kPanelWidth)) *
-        static_cast<size_t>(std::max(opts.trail_tile_cols, 1));
+        std::max(static_cast<size_t>(std::max(opts.nb, kPanelWidth)) *
+                     static_cast<size_t>(kPanelWidth),
+                 static_cast<size_t>(std::max(opts.update_tile, kPanelWidth)) *
+                     static_cast<size_t>(std::max(opts.trail_tile_cols, 1)));
 
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_r_panel, static_cast<size_t>(kPanelWidth) * kPanelWidth * sizeof(T)),
@@ -181,18 +183,14 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         cudaMalloc(&ws.d_block_w, ws.block_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_block_y, ws.block_elems * sizeof(T)), "cudaMalloc ws.d_block_y");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-        cudaMalloc(&ws.d_rowblock_w[0], ws.rowblock_elems * sizeof(T)),
-        "cudaMalloc ws.d_rowblock_w[0]");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-        cudaMalloc(&ws.d_rowblock_w[1], ws.rowblock_elems * sizeof(T)),
-        "cudaMalloc ws.d_rowblock_w[1]");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-        cudaMalloc(&ws.d_rowblock_y[0], ws.rowblock_elems * sizeof(T)),
-        "cudaMalloc ws.d_rowblock_y[0]");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-        cudaMalloc(&ws.d_rowblock_y[1], ws.rowblock_elems * sizeof(T)),
-        "cudaMalloc ws.d_rowblock_y[1]");
+    for (int i = 0; i < distributed_qr_col_blockcyclic_pipeline::kRowBlockBufferCount; ++i) {
+        distributed_qr_col_blockcyclic_pipeline::AssertCuda(
+            cudaMalloc(&ws.d_rowblock_w[i], ws.rowblock_elems * sizeof(T)),
+            "cudaMalloc ws.d_rowblock_w[i]");
+        distributed_qr_col_blockcyclic_pipeline::AssertCuda(
+            cudaMalloc(&ws.d_rowblock_y[i], ws.rowblock_elems * sizeof(T)),
+            "cudaMalloc ws.d_rowblock_y[i]");
+    }
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(T)), "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
@@ -405,14 +403,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
 
     if (env.rank == 0) {
         spdlog::info(
-            "Distributed blocked QR [col-blockcyclic-pipeline scaffold] ({}): m={} n={} nb={} "
-            "block_cols={} update_tile={} row_block_rows={} trail_tile_cols={} np={} avg {:.3f} ms",
+            "Distributed blocked QR [col-blockcyclic-pipeline] ({}): m={} n={} nb={} "
+            "block_cols={} update_tile={} row_block_rows={} trail_tile_cols={} rowblock_buffers={} "
+            "np={} avg {:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
-            opts.row_block_rows, opts.trail_tile_cols, env.size, max_ms);
-        spdlog::info(
-            "Current scaffold constraint: benchmark is only executable when nb=={} and n==nb. "
-            "The in-block panel propagation and streamed tail update are still TODO.",
-            kPanelWidth);
+            opts.row_block_rows, opts.trail_tile_cols,
+            distributed_qr_col_blockcyclic_pipeline::kRowBlockBufferCount, env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms", r, all_local_ms[r]);
@@ -459,14 +455,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                                                         "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_block_y),
                                                         "cudaFree ws.d_block_y");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_w[0]),
-                                                        "cudaFree ws.d_rowblock_w[0]");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_w[1]),
-                                                        "cudaFree ws.d_rowblock_w[1]");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_y[0]),
-                                                        "cudaFree ws.d_rowblock_y[0]");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_y[1]),
-                                                        "cudaFree ws.d_rowblock_y[1]");
+    for (int i = 0; i < distributed_qr_col_blockcyclic_pipeline::kRowBlockBufferCount; ++i) {
+        distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_w[i]),
+                                                            "cudaFree ws.d_rowblock_w[i]");
+        distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_rowblock_y[i]),
+                                                            "cudaFree ws.d_rowblock_y[i]");
+    }
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
 
@@ -549,22 +543,6 @@ int main(int argc, char** argv) {
             spdlog::error(
                 "Invalid args: require row_block_rows > 0 and trail_tile_cols > 0 (got {} and {}).",
                 opts.row_block_rows, opts.trail_tile_cols);
-        }
-        finalize_nccl_if_needed(&env);
-        finalize_mpi_if_needed(env);
-        return 1;
-    }
-
-    // The current pipeline header is only a scaffold. Keep the benchmark
-    // executable in the exact range where the migrated code path is currently
-    // well-defined: one outer block, one panel, and no trailing update.
-    if (opts.nb != kPanelWidth || opts.n != opts.nb) {
-        if (env.rank == 0) {
-            spdlog::error(
-                "bench_dist_blocked_qr_col_blockcyclic_pipeline currently requires nb=={} and "
-                "n==nb. This keeps execution inside the migrated scaffold while in-block panel "
-                "propagation and streamed tail update are still TODO. Got n={} nb={}.",
-                kPanelWidth, opts.n, opts.nb);
         }
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);
