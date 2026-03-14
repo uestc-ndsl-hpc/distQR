@@ -345,6 +345,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> phase_inner_update_ms_per_iter;
     std::vector<double> phase_pack_ms_per_iter;
     std::vector<double> phase_unpack_ms_per_iter;
+    std::vector<double> phase_comm_w_ms_per_iter;
+    std::vector<double> phase_comm_y_ms_per_iter;
     std::vector<double> phase_comm_ms_per_iter;
     std::vector<double> phase_tail_wait_ms_per_iter;
     std::vector<double> phase_tail_acc_gemm_ms_per_iter;
@@ -358,6 +360,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         phase_inner_update_ms_per_iter.resize(opts.iters, 0.0);
         phase_pack_ms_per_iter.resize(opts.iters, 0.0);
         phase_unpack_ms_per_iter.resize(opts.iters, 0.0);
+        phase_comm_w_ms_per_iter.resize(opts.iters, 0.0);
+        phase_comm_y_ms_per_iter.resize(opts.iters, 0.0);
         phase_comm_ms_per_iter.resize(opts.iters, 0.0);
         phase_tail_wait_ms_per_iter.resize(opts.iters, 0.0);
         phase_tail_acc_gemm_ms_per_iter.resize(opts.iters, 0.0);
@@ -402,6 +406,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             phase_inner_update_ms_per_iter[i] = phase_profile.inner_block_update_ms;
             phase_pack_ms_per_iter[i] = phase_profile.rowblock_pack_ms;
             phase_unpack_ms_per_iter[i] = phase_profile.rowblock_unpack_ms;
+            phase_comm_w_ms_per_iter[i] = phase_profile.comm_w_ms;
+            phase_comm_y_ms_per_iter[i] = phase_profile.comm_y_ms;
             phase_comm_ms_per_iter[i] = phase_profile.comm_ms;
             phase_tail_wait_ms_per_iter[i] = phase_profile.tail_acc_wait_ms;
             phase_tail_acc_gemm_ms_per_iter[i] = phase_profile.tail_acc_gemm_ms;
@@ -427,6 +433,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> all_inner_update_ms;
     std::vector<double> all_pack_ms;
     std::vector<double> all_unpack_ms;
+    std::vector<double> all_comm_w_ms;
+    std::vector<double> all_comm_y_ms;
     std::vector<double> all_comm_ms;
     std::vector<double> all_tail_wait_ms;
     std::vector<double> all_tail_acc_gemm_ms;
@@ -442,6 +450,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     double local_inner_update_ms = 0.0;
     double local_pack_ms = 0.0;
     double local_unpack_ms = 0.0;
+    double local_comm_w_ms = 0.0;
+    double local_comm_y_ms = 0.0;
     double local_comm_ms = 0.0;
     double local_tail_wait_ms = 0.0;
     double local_tail_acc_gemm_ms = 0.0;
@@ -457,6 +467,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             local_inner_update_ms += phase_inner_update_ms_per_iter[i];
             local_pack_ms += phase_pack_ms_per_iter[i];
             local_unpack_ms += phase_unpack_ms_per_iter[i];
+            local_comm_w_ms += phase_comm_w_ms_per_iter[i];
+            local_comm_y_ms += phase_comm_y_ms_per_iter[i];
             local_comm_ms += phase_comm_ms_per_iter[i];
             local_tail_wait_ms += phase_tail_wait_ms_per_iter[i];
             local_tail_acc_gemm_ms += phase_tail_acc_gemm_ms_per_iter[i];
@@ -470,6 +482,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         local_inner_update_ms /= static_cast<double>(opts.iters);
         local_pack_ms /= static_cast<double>(opts.iters);
         local_unpack_ms /= static_cast<double>(opts.iters);
+        local_comm_w_ms /= static_cast<double>(opts.iters);
+        local_comm_y_ms /= static_cast<double>(opts.iters);
         local_comm_ms /= static_cast<double>(opts.iters);
         local_tail_wait_ms /= static_cast<double>(opts.iters);
         local_tail_acc_gemm_ms /= static_cast<double>(opts.iters);
@@ -497,6 +511,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         all_inner_update_ms.resize(env.size, 0.0);
         all_pack_ms.resize(env.size, 0.0);
         all_unpack_ms.resize(env.size, 0.0);
+        all_comm_w_ms.resize(env.size, 0.0);
+        all_comm_y_ms.resize(env.size, 0.0);
         all_comm_ms.resize(env.size, 0.0);
         all_tail_wait_ms.resize(env.size, 0.0);
         all_tail_acc_gemm_ms.resize(env.size, 0.0);
@@ -525,6 +541,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Gather(&local_unpack_ms, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_unpack_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_w_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_comm_w_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_y_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_comm_y_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
         MPI_Gather(&local_comm_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_comm_ms.data() : nullptr, 1,
                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
@@ -596,18 +618,21 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info(
                     "Per-rank summary: rank {} -> compute {:.3f} ms, comm {:.3f} ms, "
-                    "comm_bytes {:.3f} GB, comm_bw {:.3f} GB/s, local_copy {:.3f} ms, "
+                    "comm_w {:.3f} ms, comm_y {:.3f} ms, comm_bytes {:.3f} GB, "
+                    "comm_bw {:.3f} GB/s, local_copy {:.3f} ms, "
                     "tail_wait {:.3f} ms, tail_gemm {:.3f} TFLOP/s",
-                    r, all_compute_ms[r], all_comm_ms[r], all_comm_bytes[r] / 1.0e9,
-                    all_comm_gbps[r], all_local_copy_ms[r], all_tail_wait_ms[r],
-                    all_tail_gemm_tflops[r]);
+                    r, all_compute_ms[r], all_comm_ms[r], all_comm_w_ms[r], all_comm_y_ms[r],
+                    all_comm_bytes[r] / 1.0e9, all_comm_gbps[r], all_local_copy_ms[r],
+                    all_tail_wait_ms[r], all_tail_gemm_tflops[r]);
                 spdlog::info(
                     "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, merge {:.3f} ms, "
-                    "inner_update {:.3f} ms, pack {:.3f} ms, unpack {:.3f} ms, comm {:.3f} ms, "
-                    "tail_wait {:.3f} ms, tail_acc_gemm {:.3f} ms, tail_apply_gemm {:.3f} ms",
+                    "inner_update {:.3f} ms, pack {:.3f} ms, unpack {:.3f} ms, "
+                    "comm_w {:.3f} ms, comm_y {:.3f} ms, comm {:.3f} ms, tail_wait {:.3f} ms, "
+                    "tail_acc_gemm {:.3f} ms, tail_apply_gemm {:.3f} ms",
                     r, all_panel_ms[r], all_wy_ms[r], all_merge_ms[r], all_inner_update_ms[r],
-                    all_pack_ms[r], all_unpack_ms[r], all_comm_ms[r], all_tail_wait_ms[r],
-                    all_tail_acc_gemm_ms[r], all_tail_apply_gemm_ms[r]);
+                    all_pack_ms[r], all_unpack_ms[r], all_comm_w_ms[r], all_comm_y_ms[r],
+                    all_comm_ms[r], all_tail_wait_ms[r], all_tail_acc_gemm_ms[r],
+                    all_tail_apply_gemm_ms[r]);
             }
         }
         if (total_bad > 0) {

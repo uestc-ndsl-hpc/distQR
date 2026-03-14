@@ -250,7 +250,8 @@ enum class PhaseKind {
     TailAccWait = 6,
     TailAccGemm = 7,
     TailApplyGemm = 8,
-    Comm = 9,
+    CommW = 9,
+    CommY = 10,
 };
 
 struct PhaseInterval {
@@ -269,6 +270,8 @@ struct PhaseProfile {
     double tail_acc_wait_ms = 0.0;
     double tail_acc_gemm_ms = 0.0;
     double tail_apply_gemm_ms = 0.0;
+    double comm_w_ms = 0.0;
+    double comm_y_ms = 0.0;
     double comm_ms = 0.0;
     double tail_update_flops = 0.0;
     std::vector<PhaseInterval> intervals;
@@ -287,6 +290,8 @@ inline void ResetPhaseProfile(PhaseProfile* profile) {
     profile->tail_acc_wait_ms = 0.0;
     profile->tail_acc_gemm_ms = 0.0;
     profile->tail_apply_gemm_ms = 0.0;
+    profile->comm_w_ms = 0.0;
+    profile->comm_y_ms = 0.0;
     profile->comm_ms = 0.0;
     profile->tail_update_flops = 0.0;
     profile->intervals.clear();
@@ -348,7 +353,12 @@ inline void FinalizePhaseProfile(PhaseProfile* profile) {
             case PhaseKind::TailApplyGemm:
                 profile->tail_apply_gemm_ms += static_cast<double>(ms);
                 break;
-            case PhaseKind::Comm:
+            case PhaseKind::CommW:
+                profile->comm_w_ms += static_cast<double>(ms);
+                profile->comm_ms += static_cast<double>(ms);
+                break;
+            case PhaseKind::CommY:
+                profile->comm_y_ms += static_cast<double>(ms);
                 profile->comm_ms += static_cast<double>(ms);
                 break;
         }
@@ -1203,7 +1213,7 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
 
             if (block_receivers > 0) {
                 const size_t comm_idx =
-                    BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+                    BeginPhaseInterval(phase_profile, PhaseKind::CommW, comm_stream);
                 AssertNccl(ncclBroadcast(d_rowblock_w, d_rowblock_w, elems, nccl_type, block_owner,
                                          nccl_comm, comm_stream),
                            "ncclBroadcast overlap rowblock W");
@@ -1220,7 +1230,7 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             static_cast<size_t>(block_rows) * static_cast<size_t>(kb);
         if (block_receivers > 0) {
             const size_t comm_idx =
-                BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+                BeginPhaseInterval(phase_profile, PhaseKind::CommY, comm_stream);
             AssertNccl(ncclBroadcast(ws->d_block_y, ws->d_block_y, compact_y_elems, nccl_type,
                                      block_owner, nccl_comm, comm_stream),
                        "ncclBroadcast overlap compact Y");
@@ -1309,7 +1319,8 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         }
 
         if (block_receivers > 0) {
-            const size_t comm_idx = BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+            const size_t comm_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::CommW, comm_stream);
             AssertNccl(ncclBroadcast(d_rowblock_wy_packed, d_rowblock_wy_packed, 2 * elems,
                                      nccl_type, block_owner, nccl_comm, comm_stream),
                        "ncclBroadcast pipeline packed rowblock WY");
