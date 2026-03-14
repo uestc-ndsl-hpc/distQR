@@ -99,25 +99,42 @@ bool ParseType(const char* type_str, bool* out_use_double) {
 
 Options ParseArgs(int argc, char** argv) {
     Options opts;
+    auto parse_prefixed_int = [](const char* arg, const char* prefix, int* out_value) {
+        const size_t prefix_len = std::strlen(prefix);
+        if (std::strncmp(arg, prefix, prefix_len) != 0 || arg[prefix_len] != '=') {
+            return false;
+        }
+        *out_value = std::atoi(arg + prefix_len + 1);
+        return true;
+    };
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--m") == 0 && i + 1 < argc) {
             opts.m = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--m", &opts.m)) {
         } else if (std::strcmp(argv[i], "--n") == 0 && i + 1 < argc) {
             opts.n = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--n", &opts.n)) {
         } else if (std::strcmp(argv[i], "--nb") == 0 && i + 1 < argc) {
             opts.nb = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--nb", &opts.nb)) {
         } else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             opts.warmup = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--warmup", &opts.warmup)) {
         } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             opts.iters = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--iters", &opts.iters)) {
         } else if (std::strcmp(argv[i], "--block_cols") == 0 && i + 1 < argc) {
             opts.block_cols = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--block_cols", &opts.block_cols)) {
         } else if (std::strcmp(argv[i], "--update_tile") == 0 && i + 1 < argc) {
             opts.update_tile = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--update_tile", &opts.update_tile)) {
         } else if (std::strcmp(argv[i], "--row_block_rows") == 0 && i + 1 < argc) {
             opts.row_block_rows = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--row_block_rows", &opts.row_block_rows)) {
         } else if (std::strcmp(argv[i], "--trail_tile_cols") == 0 && i + 1 < argc) {
             opts.trail_tile_cols = std::atoi(argv[++i]);
+        } else if (parse_prefixed_int(argv[i], "--trail_tile_cols", &opts.trail_tile_cols)) {
         } else if (std::strcmp(argv[i], "--print_per_rank") == 0) {
             opts.print_per_rank = true;
         } else if (std::strcmp(argv[i], "--print_phase_timing") == 0) {
@@ -125,6 +142,12 @@ Options ParseArgs(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
             opts.type_value = argv[++i];
             opts.type_valid = ParseType(opts.type_value.c_str(), &opts.use_double);
+        } else if (std::strncmp(argv[i], "--type=", 7) == 0) {
+            opts.type_value = argv[i] + 7;
+            opts.type_valid = ParseType(opts.type_value.c_str(), &opts.use_double);
+        } else if (std::strcmp(argv[i], "--rowblock_buffers") == 0 && i + 1 < argc) {
+            ++i;
+        } else if (std::strncmp(argv[i], "--rowblock_buffers=", 19) == 0) {
         }
     }
     return opts;

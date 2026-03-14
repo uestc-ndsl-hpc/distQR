@@ -649,6 +649,7 @@ inline void TailUpdateColTileFromRowBlockCache(
     cublasHandle_t tail_cublas_handle,
     const T* d_block_w_rowmajor,
     const T* d_block_y_rowmajor,
+    int row_offset,
     int block_rows,
     int kb,
     int row_block_rows,
@@ -686,7 +687,7 @@ inline void TailUpdateColTileFromRowBlockCache(
         AssertCuda(cudaStreamWaitEvent(tail_update_stream, rowblock_comm_done[rb_idx], 0),
                    "cudaStreamWaitEvent tail_update_stream <- rowblock_comm_done");
         const T* w_rb = d_block_w_rowmajor + off;
-        const T* a_rb = a_tile + row_begin;
+        const T* a_rb = a_tile + row_offset + row_begin;
         const T* beta = (rb_idx == 0) ? &zero : &one;
         AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
                                                cols_tile, row_count, &one, w_rb, row_count, a_rb,
@@ -702,7 +703,7 @@ inline void TailUpdateColTileFromRowBlockCache(
         const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
         const size_t off = RowBlockOffsetElems(row_block_rows, kb, rb_idx);
         const T* y_rb = d_block_y_rowmajor + off;
-        T* a_rb = a_tile + row_begin;
+        T* a_rb = a_tile + row_offset + row_begin;
         AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                                row_count, cols_tile, kb, &minus_one, y_rb,
                                                row_count, d_tmp, kb, &one, a_rb, lda_local),
@@ -850,11 +851,11 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         for (int col_off = 0; col_off < cols_local; col_off += target_cols) {
             const int cols_tile = std::min(target_cols, cols_local - col_off);
             T* a_tile = d_A_local + static_cast<size_t>(local_begin + col_off) * lda_local;
-            TailUpdateColTileFromRowBlockCache(events.tail_cublas_handle, ws->d_block_w_rowmajor,
-                                               ws->d_block_y_rowmajor, block_rows, kb,
-                                               row_block_rows, a_tile, lda_local, cols_tile,
-                                               ws->d_tmp0, ws->tmp_elems, events.tail_update_stream,
-                                               events.rowblock_comm_done, phase_profile);
+            TailUpdateColTileFromRowBlockCache(
+                events.tail_cublas_handle, ws->d_block_w_rowmajor, ws->d_block_y_rowmajor,
+                block_begin, block_rows, kb, row_block_rows, a_tile, lda_local, cols_tile,
+                ws->d_tmp0, ws->tmp_elems, events.tail_update_stream,
+                events.rowblock_comm_done, phase_profile);
         }
     });
 
