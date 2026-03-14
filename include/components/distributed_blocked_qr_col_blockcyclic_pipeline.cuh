@@ -244,9 +244,12 @@ enum class PhaseKind {
     WyBuild = 1,
     BlockWyMerge = 2,
     InnerBlockUpdate = 3,
-    TailAccumulate = 4,
-    TailApply = 5,
-    Comm = 6,
+    RowBlockPack = 4,
+    RowBlockUnpack = 5,
+    TailAccWait = 6,
+    TailAccGemm = 7,
+    TailApplyGemm = 8,
+    Comm = 9,
 };
 
 struct PhaseInterval {
@@ -260,8 +263,11 @@ struct PhaseProfile {
     double wy_build_ms = 0.0;
     double block_wy_merge_ms = 0.0;
     double inner_block_update_ms = 0.0;
-    double tail_accumulate_ms = 0.0;
-    double tail_apply_ms = 0.0;
+    double rowblock_pack_ms = 0.0;
+    double rowblock_unpack_ms = 0.0;
+    double tail_acc_wait_ms = 0.0;
+    double tail_acc_gemm_ms = 0.0;
+    double tail_apply_gemm_ms = 0.0;
     double comm_ms = 0.0;
     double tail_update_flops = 0.0;
     std::vector<PhaseInterval> intervals;
@@ -275,8 +281,11 @@ inline void ResetPhaseProfile(PhaseProfile* profile) {
     profile->wy_build_ms = 0.0;
     profile->block_wy_merge_ms = 0.0;
     profile->inner_block_update_ms = 0.0;
-    profile->tail_accumulate_ms = 0.0;
-    profile->tail_apply_ms = 0.0;
+    profile->rowblock_pack_ms = 0.0;
+    profile->rowblock_unpack_ms = 0.0;
+    profile->tail_acc_wait_ms = 0.0;
+    profile->tail_acc_gemm_ms = 0.0;
+    profile->tail_apply_gemm_ms = 0.0;
     profile->comm_ms = 0.0;
     profile->tail_update_flops = 0.0;
     profile->intervals.clear();
@@ -323,11 +332,20 @@ inline void FinalizePhaseProfile(PhaseProfile* profile) {
             case PhaseKind::InnerBlockUpdate:
                 profile->inner_block_update_ms += static_cast<double>(ms);
                 break;
-            case PhaseKind::TailAccumulate:
-                profile->tail_accumulate_ms += static_cast<double>(ms);
+            case PhaseKind::RowBlockPack:
+                profile->rowblock_pack_ms += static_cast<double>(ms);
                 break;
-            case PhaseKind::TailApply:
-                profile->tail_apply_ms += static_cast<double>(ms);
+            case PhaseKind::RowBlockUnpack:
+                profile->rowblock_unpack_ms += static_cast<double>(ms);
+                break;
+            case PhaseKind::TailAccWait:
+                profile->tail_acc_wait_ms += static_cast<double>(ms);
+                break;
+            case PhaseKind::TailAccGemm:
+                profile->tail_acc_gemm_ms += static_cast<double>(ms);
+                break;
+            case PhaseKind::TailApplyGemm:
+                profile->tail_apply_gemm_ms += static_cast<double>(ms);
                 break;
             case PhaseKind::Comm:
                 profile->comm_ms += static_cast<double>(ms);
@@ -780,8 +798,6 @@ inline void TailAccumulateColTileFromRowBlockCache(
     const int row_block_count = RowBlockCount(block_rows, row_block_rows);
     const T one = static_cast<T>(1);
     const T zero = static_cast<T>(0);
-    const size_t tail_acc_idx =
-        BeginPhaseInterval(phase_profile, PhaseKind::TailAccumulate, tail_update_stream);
     AssertCuda(cudaMemsetAsync(d_tmp, 0, need * sizeof(T), tail_update_stream),
                "cudaMemsetAsync tail accumulate tmp");
     for (int rb_idx = 0; rb_idx < row_block_count; ++rb_idx) {
@@ -789,18 +805,23 @@ inline void TailAccumulateColTileFromRowBlockCache(
         const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
         const size_t off = RowBlockOffsetElems(row_block_rows, kb, rb_idx);
         if (wait_for_each_rowblock) {
+            const size_t tail_wait_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, tail_update_stream);
             AssertCuda(cudaStreamWaitEvent(tail_update_stream, rowblock_comm_done[rb_idx], 0),
                        "cudaStreamWaitEvent tail_update_stream <- rowblock_comm_done");
+            EndPhaseInterval(phase_profile, tail_wait_idx, tail_update_stream);
         }
         const T* w_rb = d_block_w_rowmajor + off;
         const T* a_rb = a_tile + row_offset + row_begin;
         const T* beta = (rb_idx == 0) ? &zero : &one;
+        const size_t tail_acc_gemm_idx =
+            BeginPhaseInterval(phase_profile, PhaseKind::TailAccGemm, tail_update_stream);
         AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
                                                cols_tile, row_count, &one, w_rb, row_count, a_rb,
                                                lda_local, beta, d_tmp, kb),
                      "Pipeline tail accumulate tmp += W_rb^T * A_rb");
+        EndPhaseInterval(phase_profile, tail_acc_gemm_idx, tail_update_stream);
     }
-    EndPhaseInterval(phase_profile, tail_acc_idx, tail_update_stream);
 }
 
 template <typename T>
@@ -824,20 +845,20 @@ inline void TailApplyColTileFromRowBlockCache(cublasHandle_t tail_cublas_handle,
     const T one = static_cast<T>(1);
     const T minus_one = static_cast<T>(-1);
 
-    const size_t tail_apply_idx =
-        BeginPhaseInterval(phase_profile, PhaseKind::TailApply, tail_update_stream);
     for (int rb_idx = 0; rb_idx < row_block_count; ++rb_idx) {
         const int row_begin = rb_idx * row_block_rows;
         const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
         const size_t off = RowBlockOffsetElems(row_block_rows, kb, rb_idx);
         const T* y_rb = d_block_y_rowmajor + off;
         T* a_rb = a_tile + row_offset + row_begin;
+        const size_t tail_apply_gemm_idx =
+            BeginPhaseInterval(phase_profile, PhaseKind::TailApplyGemm, tail_update_stream);
         AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                                row_count, cols_tile, kb, &minus_one, y_rb,
                                                row_count, d_tmp, kb, &one, a_rb, lda_local),
                      "Pipeline tail apply A_rb -= Y_rb * tmp");
+        EndPhaseInterval(phase_profile, tail_apply_gemm_idx, tail_update_stream);
     }
-    EndPhaseInterval(phase_profile, tail_apply_idx, tail_update_stream);
 }
 
 template <typename T>
@@ -995,9 +1016,12 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         T* d_rowblock_wy_packed = ws->d_rowblock_wy_packed + packed_off;
 
         if (part.rank == block_owner) {
+            const size_t pack_idx = BeginPhaseInterval(phase_profile, PhaseKind::RowBlockPack,
+                                                       events.rowblock_pack_stream);
             PackCompactRowBlockToPackedBroadcastCache(
                 rb_idx, block_rows, kb, row_block_rows, ws->d_block_w, ws->d_block_y,
                 ws->d_rowblock_wy_packed, events.rowblock_pack_stream);
+            EndPhaseInterval(phase_profile, pack_idx, events.rowblock_pack_stream);
             AssertCuda(cudaEventRecord(events.rowblock_ready[rb_idx], events.rowblock_pack_stream),
                        "cudaEventRecord rowblock_ready");
             AssertCuda(cudaStreamWaitEvent(comm_stream, events.rowblock_ready[rb_idx], 0),
@@ -1016,9 +1040,12 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             }
         }
         if (part.rank == block_owner || block_receivers > 0) {
+            const size_t unpack_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::RowBlockUnpack, comm_stream);
             UnpackPackedRowBlockToRowMajorCache(rb_idx, block_rows, kb, row_block_rows,
                                                 ws->d_rowblock_wy_packed, ws->d_block_w_rowmajor,
                                                 ws->d_block_y_rowmajor, comm_stream);
+            EndPhaseInterval(phase_profile, unpack_idx, comm_stream);
         }
         AssertCuda(cudaEventRecord(events.rowblock_comm_done[rb_idx], comm_stream),
                    "cudaEventRecord rowblock_comm_done");
@@ -1034,9 +1061,12 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
     }
 
     if (!overlap_tail && row_block_count > 0) {
+        const size_t tail_wait_idx =
+            BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, events.tail_acc_stream);
         AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream,
                                        events.rowblock_comm_done[row_block_count - 1], 0),
                    "cudaStreamWaitEvent tail_acc_stream <- rowblock_comm_done[last]");
+        EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
     }
 
     struct TailTileTask {

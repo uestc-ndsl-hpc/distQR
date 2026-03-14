@@ -68,6 +68,19 @@ const char* DataTypeString() {
     return "double";
 }
 
+double QrFactorizationFlops(int m, int n) {
+    const double m_d = static_cast<double>(m);
+    const double n_d = static_cast<double>(n);
+    return 2.0 * m_d * n_d * n_d - (2.0 / 3.0) * n_d * n_d * n_d;
+}
+
+double TflopsFromFlopsAndMs(double flops, double ms) {
+    if (ms <= 0.0) {
+        return 0.0;
+    }
+    return flops / (ms * 1.0e9);
+}
+
 struct Options {
     int m = 16384;
     int n = 32;
@@ -310,17 +323,25 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> phase_wy_ms_per_iter;
     std::vector<double> phase_merge_ms_per_iter;
     std::vector<double> phase_inner_update_ms_per_iter;
+    std::vector<double> phase_pack_ms_per_iter;
+    std::vector<double> phase_unpack_ms_per_iter;
     std::vector<double> phase_comm_ms_per_iter;
-    std::vector<double> phase_tail_acc_ms_per_iter;
-    std::vector<double> phase_tail_apply_ms_per_iter;
+    std::vector<double> phase_tail_wait_ms_per_iter;
+    std::vector<double> phase_tail_acc_gemm_ms_per_iter;
+    std::vector<double> phase_tail_apply_gemm_ms_per_iter;
+    std::vector<double> phase_tail_flops_per_iter;
     if (opts.print_phase_timing) {
         phase_panel_ms_per_iter.resize(opts.iters, 0.0);
         phase_wy_ms_per_iter.resize(opts.iters, 0.0);
         phase_merge_ms_per_iter.resize(opts.iters, 0.0);
         phase_inner_update_ms_per_iter.resize(opts.iters, 0.0);
+        phase_pack_ms_per_iter.resize(opts.iters, 0.0);
+        phase_unpack_ms_per_iter.resize(opts.iters, 0.0);
         phase_comm_ms_per_iter.resize(opts.iters, 0.0);
-        phase_tail_acc_ms_per_iter.resize(opts.iters, 0.0);
-        phase_tail_apply_ms_per_iter.resize(opts.iters, 0.0);
+        phase_tail_wait_ms_per_iter.resize(opts.iters, 0.0);
+        phase_tail_acc_gemm_ms_per_iter.resize(opts.iters, 0.0);
+        phase_tail_apply_gemm_ms_per_iter.resize(opts.iters, 0.0);
+        phase_tail_flops_per_iter.resize(opts.iters, 0.0);
     }
 
     for (int i = 0; i < opts.iters; ++i) {
@@ -355,9 +376,13 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             phase_wy_ms_per_iter[i] = phase_profile.wy_build_ms;
             phase_merge_ms_per_iter[i] = phase_profile.block_wy_merge_ms;
             phase_inner_update_ms_per_iter[i] = phase_profile.inner_block_update_ms;
+            phase_pack_ms_per_iter[i] = phase_profile.rowblock_pack_ms;
+            phase_unpack_ms_per_iter[i] = phase_profile.rowblock_unpack_ms;
             phase_comm_ms_per_iter[i] = phase_profile.comm_ms;
-            phase_tail_acc_ms_per_iter[i] = phase_profile.tail_accumulate_ms;
-            phase_tail_apply_ms_per_iter[i] = phase_profile.tail_apply_ms;
+            phase_tail_wait_ms_per_iter[i] = phase_profile.tail_acc_wait_ms;
+            phase_tail_acc_gemm_ms_per_iter[i] = phase_profile.tail_acc_gemm_ms;
+            phase_tail_apply_gemm_ms_per_iter[i] = phase_profile.tail_apply_gemm_ms;
+            phase_tail_flops_per_iter[i] = phase_profile.tail_update_flops;
         }
 
         float iter_ms = 0.0f;
@@ -375,16 +400,26 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> all_wy_ms;
     std::vector<double> all_merge_ms;
     std::vector<double> all_inner_update_ms;
+    std::vector<double> all_pack_ms;
+    std::vector<double> all_unpack_ms;
     std::vector<double> all_comm_ms;
-    std::vector<double> all_tail_acc_ms;
-    std::vector<double> all_tail_apply_ms;
+    std::vector<double> all_tail_wait_ms;
+    std::vector<double> all_tail_acc_gemm_ms;
+    std::vector<double> all_tail_apply_gemm_ms;
+    std::vector<double> all_compute_ms;
+    std::vector<double> all_local_copy_ms;
+    std::vector<double> all_tail_gemm_tflops;
     double local_panel_ms = 0.0;
     double local_wy_ms = 0.0;
     double local_merge_ms = 0.0;
     double local_inner_update_ms = 0.0;
+    double local_pack_ms = 0.0;
+    double local_unpack_ms = 0.0;
     double local_comm_ms = 0.0;
-    double local_tail_acc_ms = 0.0;
-    double local_tail_apply_ms = 0.0;
+    double local_tail_wait_ms = 0.0;
+    double local_tail_acc_gemm_ms = 0.0;
+    double local_tail_apply_gemm_ms = 0.0;
+    double local_tail_flops = 0.0;
 
     if (opts.print_phase_timing) {
         for (int i = 0; i < opts.iters; ++i) {
@@ -392,18 +427,33 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             local_wy_ms += phase_wy_ms_per_iter[i];
             local_merge_ms += phase_merge_ms_per_iter[i];
             local_inner_update_ms += phase_inner_update_ms_per_iter[i];
+            local_pack_ms += phase_pack_ms_per_iter[i];
+            local_unpack_ms += phase_unpack_ms_per_iter[i];
             local_comm_ms += phase_comm_ms_per_iter[i];
-            local_tail_acc_ms += phase_tail_acc_ms_per_iter[i];
-            local_tail_apply_ms += phase_tail_apply_ms_per_iter[i];
+            local_tail_wait_ms += phase_tail_wait_ms_per_iter[i];
+            local_tail_acc_gemm_ms += phase_tail_acc_gemm_ms_per_iter[i];
+            local_tail_apply_gemm_ms += phase_tail_apply_gemm_ms_per_iter[i];
+            local_tail_flops += phase_tail_flops_per_iter[i];
         }
         local_panel_ms /= static_cast<double>(opts.iters);
         local_wy_ms /= static_cast<double>(opts.iters);
         local_merge_ms /= static_cast<double>(opts.iters);
         local_inner_update_ms /= static_cast<double>(opts.iters);
+        local_pack_ms /= static_cast<double>(opts.iters);
+        local_unpack_ms /= static_cast<double>(opts.iters);
         local_comm_ms /= static_cast<double>(opts.iters);
-        local_tail_acc_ms /= static_cast<double>(opts.iters);
-        local_tail_apply_ms /= static_cast<double>(opts.iters);
+        local_tail_wait_ms /= static_cast<double>(opts.iters);
+        local_tail_acc_gemm_ms /= static_cast<double>(opts.iters);
+        local_tail_apply_gemm_ms /= static_cast<double>(opts.iters);
+        local_tail_flops /= static_cast<double>(opts.iters);
     }
+
+    const double local_compute_ms = local_panel_ms + local_wy_ms + local_merge_ms +
+                                    local_inner_update_ms + local_tail_acc_gemm_ms +
+                                    local_tail_apply_gemm_ms;
+    const double local_local_copy_ms = local_pack_ms + local_unpack_ms;
+    const double local_tail_gemm_tflops =
+        TflopsFromFlopsAndMs(local_tail_flops, local_tail_acc_gemm_ms + local_tail_apply_gemm_ms);
 
     if (opts.print_per_rank && env.rank == 0) {
         all_local_ms.resize(env.size, 0.0);
@@ -413,9 +463,15 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         all_wy_ms.resize(env.size, 0.0);
         all_merge_ms.resize(env.size, 0.0);
         all_inner_update_ms.resize(env.size, 0.0);
+        all_pack_ms.resize(env.size, 0.0);
+        all_unpack_ms.resize(env.size, 0.0);
         all_comm_ms.resize(env.size, 0.0);
-        all_tail_acc_ms.resize(env.size, 0.0);
-        all_tail_apply_ms.resize(env.size, 0.0);
+        all_tail_wait_ms.resize(env.size, 0.0);
+        all_tail_acc_gemm_ms.resize(env.size, 0.0);
+        all_tail_apply_gemm_ms.resize(env.size, 0.0);
+        all_compute_ms.resize(env.size, 0.0);
+        all_local_copy_ms.resize(env.size, 0.0);
+        all_tail_gemm_tflops.resize(env.size, 0.0);
     }
     if (opts.print_per_rank) {
         MPI_Gather(&local_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_local_ms.data() : nullptr, 1,
@@ -431,13 +487,30 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         MPI_Gather(&local_inner_update_ms, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_inner_update_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
+        MPI_Gather(&local_pack_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_pack_ms.data() : nullptr, 1,
+                   MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Gather(&local_unpack_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_unpack_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
         MPI_Gather(&local_comm_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_comm_ms.data() : nullptr, 1,
                    MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Gather(&local_tail_acc_ms, 1, MPI_DOUBLE,
-                   (env.rank == 0) ? all_tail_acc_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+        MPI_Gather(&local_tail_wait_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_tail_wait_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
-        MPI_Gather(&local_tail_apply_ms, 1, MPI_DOUBLE,
-                   (env.rank == 0) ? all_tail_apply_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+        MPI_Gather(&local_tail_acc_gemm_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_tail_acc_gemm_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_tail_apply_gemm_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_tail_apply_gemm_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_compute_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_compute_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_local_copy_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_local_copy_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_tail_gemm_tflops, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_tail_gemm_tflops.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
     }
 
@@ -462,14 +535,16 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     MPI_Allreduce(&h_bad, &total_bad, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
 
     if (env.rank == 0) {
+        const double overall_tflops =
+            TflopsFromFlopsAndMs(QrFactorizationFlops(opts.m, opts.n), max_ms);
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic-pipeline] ({}): m={} n={} nb={} "
             "block_cols={} update_tile(compat)={} row_block_rows={} trail_tile_cols={} "
-            "row_block_mode={} skip_tail_update={} np={} avg {:.3f} ms",
+            "row_block_mode={} skip_tail_update={} np={} avg {:.3f} ms overall {:.3f} TFLOP/s",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
             opts.row_block_rows, opts.trail_tile_cols,
             distributed_qr_col_blockcyclic_pipeline::TailModeString(opts.row_block_mode),
-            opts.skip_tail_update, env.size, max_ms);
+            opts.skip_tail_update, env.size, max_ms, overall_tflops);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms", r, all_local_ms[r]);
@@ -478,11 +553,17 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         if (opts.print_phase_timing) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info(
+                    "Per-rank summary: rank {} -> compute {:.3f} ms, comm {:.3f} ms, "
+                    "local_copy {:.3f} ms, tail_wait {:.3f} ms, tail_gemm {:.3f} TFLOP/s",
+                    r, all_compute_ms[r], all_comm_ms[r], all_local_copy_ms[r], all_tail_wait_ms[r],
+                    all_tail_gemm_tflops[r]);
+                spdlog::info(
                     "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, merge {:.3f} ms, "
-                    "inner_update {:.3f} ms, comm {:.3f} ms, tail_acc {:.3f} ms, tail_apply {:.3f} "
-                    "ms",
+                    "inner_update {:.3f} ms, pack {:.3f} ms, unpack {:.3f} ms, comm {:.3f} ms, "
+                    "tail_wait {:.3f} ms, tail_acc_gemm {:.3f} ms, tail_apply_gemm {:.3f} ms",
                     r, all_panel_ms[r], all_wy_ms[r], all_merge_ms[r], all_inner_update_ms[r],
-                    all_comm_ms[r], all_tail_acc_ms[r], all_tail_apply_ms[r]);
+                    all_pack_ms[r], all_unpack_ms[r], all_comm_ms[r], all_tail_wait_ms[r],
+                    all_tail_acc_gemm_ms[r], all_tail_apply_gemm_ms[r]);
             }
         }
         if (total_bad > 0) {
