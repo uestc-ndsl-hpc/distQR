@@ -238,6 +238,10 @@ struct RowBlockPipelineConfig {
 
 struct CommProfile {
     size_t bytes = 0;
+    size_t bytes_w = 0;
+    size_t bytes_y = 0;
+    size_t useful_bytes_w = 0;
+    size_t useful_bytes_y = 0;
 };
 
 enum class PhaseKind {
@@ -691,6 +695,39 @@ inline int RowBlockCount(int block_rows, int row_block_rows) {
 inline int RowBlockRowsAt(int block_rows, int row_block_rows, int rb_idx) {
     const int row_begin = rb_idx * row_block_rows;
     return std::min(row_block_rows, block_rows - row_begin);
+}
+
+inline size_t CompactLowerTrapezoidElems(int block_rows, int kb) {
+    if (kb <= 0 || block_rows <= 0) {
+        return 0;
+    }
+    const size_t block_rows_sz = static_cast<size_t>(block_rows);
+    const size_t kb_sz = static_cast<size_t>(kb);
+    return kb_sz * block_rows_sz - kb_sz * (kb_sz - 1) / 2;
+}
+
+inline size_t UsefulCompactWRowBlockElems(int block_rows, int kb, int row_block_rows, int rb_idx) {
+    const int row_begin = rb_idx * row_block_rows;
+    const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
+    const int row_end = row_begin + row_count;
+    if (row_count <= 0 || kb <= 0) {
+        return 0;
+    }
+    if (row_begin >= kb) {
+        return static_cast<size_t>(row_count) * static_cast<size_t>(kb);
+    }
+
+    const int prefix_cols = std::min(row_begin, kb);
+    const int diag_begin = std::min(row_begin, kb);
+    const int diag_end = std::min(row_end, kb);
+    const int diag_cols = std::max(0, diag_end - diag_begin);
+
+    const size_t prefix_elems =
+        static_cast<size_t>(prefix_cols) * static_cast<size_t>(row_count);
+    const size_t diag_elems =
+        static_cast<size_t>(diag_cols) * static_cast<size_t>(row_end) -
+        static_cast<size_t>(diag_begin + diag_end - 1) * static_cast<size_t>(diag_cols) / 2;
+    return prefix_elems + diag_elems;
 }
 
 inline size_t RowBlockOffsetElems(int row_block_rows, int kb, int rb_idx) {
@@ -1342,7 +1379,14 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                            "ncclBroadcast overlap rowblock W");
                 EndPhaseInterval(phase_profile, comm_idx, comm_stream);
                 if (comm_profile) {
-                    comm_profile->bytes += elems * sizeof(T) * static_cast<size_t>(block_receivers);
+                    const size_t actual_bytes =
+                        elems * sizeof(T) * static_cast<size_t>(block_receivers);
+                    const size_t useful_bytes =
+                        UsefulCompactWRowBlockElems(block_rows, kb, row_block_rows, rb_idx) *
+                        sizeof(T) * static_cast<size_t>(block_receivers);
+                    comm_profile->bytes += actual_bytes;
+                    comm_profile->bytes_w += actual_bytes;
+                    comm_profile->useful_bytes_w += useful_bytes;
                 }
             }
             AssertCuda(cudaEventRecord(events.rowblock_comm_done[rb_idx], comm_stream),
@@ -1357,8 +1401,14 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                        "ncclBroadcast overlap compact Y");
             EndPhaseInterval(phase_profile, comm_idx, comm_stream);
             if (comm_profile) {
-                comm_profile->bytes +=
+                const size_t actual_bytes =
                     compact_y_elems * sizeof(T) * static_cast<size_t>(block_receivers);
+                const size_t useful_bytes =
+                    CompactLowerTrapezoidElems(block_rows, kb) * sizeof(T) *
+                    static_cast<size_t>(block_receivers);
+                comm_profile->bytes += actual_bytes;
+                comm_profile->bytes_y += actual_bytes;
+                comm_profile->useful_bytes_y += useful_bytes;
             }
         }
         AssertCuda(cudaEventRecord(events.compact_y_comm_done, comm_stream),
@@ -1448,8 +1498,16 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                        "ncclBroadcast pipeline packed rowblock WY");
             EndPhaseInterval(phase_profile, comm_idx, comm_stream);
             if (comm_profile) {
-                comm_profile->bytes +=
-                    2ULL * elems * sizeof(T) * static_cast<size_t>(block_receivers);
+                const size_t one_actual_bytes =
+                    elems * sizeof(T) * static_cast<size_t>(block_receivers);
+                const size_t one_useful_bytes =
+                    UsefulCompactWRowBlockElems(block_rows, kb, row_block_rows, rb_idx) *
+                    sizeof(T) * static_cast<size_t>(block_receivers);
+                comm_profile->bytes += 2 * one_actual_bytes;
+                comm_profile->bytes_w += one_actual_bytes;
+                comm_profile->bytes_y += one_actual_bytes;
+                comm_profile->useful_bytes_w += one_useful_bytes;
+                comm_profile->useful_bytes_y += one_useful_bytes;
             }
         }
         if (part.rank == block_owner || block_receivers > 0) {
@@ -1629,6 +1687,10 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
     ValidatePipelineConfig(*ws, cfg, nb);
     if (comm_profile) {
         comm_profile->bytes = 0;
+        comm_profile->bytes_w = 0;
+        comm_profile->bytes_y = 0;
+        comm_profile->useful_bytes_w = 0;
+        comm_profile->useful_bytes_y = 0;
     }
     ResetPhaseProfile(phase_profile);
 
