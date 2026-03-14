@@ -994,6 +994,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
 
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
         const int block_end = std::min(block_begin + nb, n);
+        const int kb = block_end - block_begin;
         const int block_rows = m - block_begin;
         const int block_owner = OwnerOfPanel(block_begin, part);
 
