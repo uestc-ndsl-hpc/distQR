@@ -272,12 +272,21 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
 
     cudaStream_t compute_stream = nullptr;
     cudaStream_t comm_stream = nullptr;
+    int stream_priority_low = 0;
+    int stream_priority_high = 0;
+    int comm_stream_priority = 0;
+    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
+        cudaDeviceGetStreamPriorityRange(&stream_priority_low, &stream_priority_high),
+        "cudaDeviceGetStreamPriorityRange");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking),
         "cudaStreamCreate compute_stream");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-        cudaStreamCreateWithFlags(&comm_stream, cudaStreamNonBlocking),
-        "cudaStreamCreate comm_stream");
+        cudaStreamCreateWithPriority(&comm_stream, cudaStreamNonBlocking, stream_priority_high),
+        "cudaStreamCreateWithPriority comm_stream");
+    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
+        cudaStreamGetPriority(comm_stream, &comm_stream_priority),
+        "cudaStreamGetPriority comm_stream");
 
     cublasHandle_t cublas_handle = nullptr;
     distributed_qr_col_blockcyclic_pipeline::AssertCublas(cublasCreate(&cublas_handle),
@@ -571,11 +580,13 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic-pipeline] ({}): m={} n={} nb={} "
             "block_cols={} update_tile_cols={} row_block_rows={} trail_tile_cols={} "
-            "row_block_mode={} skip_tail_update={} np={} avg {:.3f} ms overall {:.3f} TFLOP/s",
+            "row_block_mode={} skip_tail_update={} comm_stream_priority={} "
+            "(priority_range=[{}, {}]) np={} avg {:.3f} ms overall {:.3f} TFLOP/s",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
             opts.row_block_rows, opts.trail_tile_cols,
             distributed_qr_col_blockcyclic_pipeline::TailModeString(opts.row_block_mode),
-            opts.skip_tail_update, env.size, max_ms, overall_tflops);
+            opts.skip_tail_update, comm_stream_priority, stream_priority_high, stream_priority_low,
+            env.size, max_ms, overall_tflops);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms", r, all_local_ms[r]);
