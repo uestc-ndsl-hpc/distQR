@@ -219,6 +219,7 @@ struct RowBlockPipelineConfig {
     enum class TailMode {
         Baseline = 0,
         Overlap = 1,
+        Chained = 2,
     };
 
     // Reserved compatibility knob from the previous k-tile version.
@@ -420,6 +421,8 @@ inline const char* TailModeString(RowBlockPipelineConfig::TailMode mode) {
             return "baseline";
         case RowBlockPipelineConfig::TailMode::Overlap:
             return "overlap";
+        case RowBlockPipelineConfig::TailMode::Chained:
+            return "chained";
     }
     return "unknown";
 }
@@ -442,7 +445,8 @@ inline void ValidatePipelineConfig(const DistributedQrColBlockCyclicPipelineWork
         std::exit(1);
     }
     if (cfg.tail_mode != RowBlockPipelineConfig::TailMode::Baseline &&
-        cfg.tail_mode != RowBlockPipelineConfig::TailMode::Overlap) {
+        cfg.tail_mode != RowBlockPipelineConfig::TailMode::Overlap &&
+        cfg.tail_mode != RowBlockPipelineConfig::TailMode::Chained) {
         spdlog::error("Pipeline tail_mode is invalid.");
         std::exit(1);
     }
@@ -769,6 +773,35 @@ inline void UnpackPackedRowBlockToRowMajorCache(int rb_idx,
 }
 
 template <typename T>
+struct CublasAxpyTraits;
+
+template <>
+struct CublasAxpyTraits<float> {
+    static cublasStatus_t Axpy(cublasHandle_t handle,
+                               int n,
+                               const float* alpha,
+                               const float* x,
+                               int incx,
+                               float* y,
+                               int incy) {
+        return cublasSaxpy(handle, n, alpha, x, incx, y, incy);
+    }
+};
+
+template <>
+struct CublasAxpyTraits<double> {
+    static cublasStatus_t Axpy(cublasHandle_t handle,
+                               int n,
+                               const double* alpha,
+                               const double* x,
+                               int incx,
+                               double* y,
+                               int incy) {
+        return cublasDaxpy(handle, n, alpha, x, incx, y, incy);
+    }
+};
+
+template <typename T>
 inline void TailAccumulateColTileFromRowBlockCache(
     cublasHandle_t tail_cublas_handle,
     const T* d_block_w_rowmajor,
@@ -822,6 +855,91 @@ inline void TailAccumulateColTileFromRowBlockCache(
                      "Pipeline tail accumulate tmp += W_rb^T * A_rb");
         EndPhaseInterval(phase_profile, tail_acc_gemm_idx, tail_update_stream);
     }
+}
+
+template <typename T>
+inline void TailAccumulateSingleRowBlockFromRowBlockCache(
+    cublasHandle_t tail_cublas_handle,
+    const T* d_block_w_rowmajor,
+    int row_offset,
+    int block_rows,
+    int kb,
+    int row_block_rows,
+    int source_rb_idx,
+    const T* a_tile,
+    int lda_local,
+    int cols_tile,
+    T* d_tmp_partial,
+    size_t tmp_elems,
+    cudaStream_t tail_update_stream,
+    const std::vector<cudaEvent_t>& rowblock_comm_done,
+    PhaseProfile* phase_profile) {
+    if (cols_tile <= 0) {
+        return;
+    }
+
+    const size_t need = static_cast<size_t>(kb) * static_cast<size_t>(cols_tile);
+    if (tmp_elems < need) {
+        spdlog::error("Pipeline tail tmp too small (need {} elems, got {}).", need, tmp_elems);
+        std::exit(1);
+    }
+
+    const int row_begin = source_rb_idx * row_block_rows;
+    const int row_count = RowBlockRowsAt(block_rows, row_block_rows, source_rb_idx);
+    const size_t off = RowBlockOffsetElems(row_block_rows, kb, source_rb_idx);
+    const T one = static_cast<T>(1);
+    const T zero = static_cast<T>(0);
+
+    const size_t tail_wait_idx =
+        BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, tail_update_stream);
+    AssertCuda(cudaStreamWaitEvent(tail_update_stream, rowblock_comm_done[source_rb_idx], 0),
+               "cudaStreamWaitEvent tail_update_stream <- rowblock_comm_done[source]");
+    EndPhaseInterval(phase_profile, tail_wait_idx, tail_update_stream);
+
+    const T* w_rb = d_block_w_rowmajor + off;
+    const T* a_rb = a_tile + row_offset + row_begin;
+    const size_t tail_acc_gemm_idx =
+        BeginPhaseInterval(phase_profile, PhaseKind::TailAccGemm, tail_update_stream);
+    AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, kb,
+                                           cols_tile, row_count, &one, w_rb, row_count, a_rb,
+                                           lda_local, &zero, d_tmp_partial, kb),
+                 "Pipeline chained tail tmp_partial = W_rb^T * A_rb");
+    EndPhaseInterval(phase_profile, tail_acc_gemm_idx, tail_update_stream);
+}
+
+template <typename T>
+inline void TailApplySingleRowBlockFromRowBlockCache(cublasHandle_t tail_cublas_handle,
+                                                     const T* d_block_y_rowmajor,
+                                                     int row_offset,
+                                                     int block_rows,
+                                                     int kb,
+                                                     int row_block_rows,
+                                                     int target_rb_idx,
+                                                     T* a_tile,
+                                                     int lda_local,
+                                                     int cols_tile,
+                                                     const T* d_tmp,
+                                                     cudaStream_t tail_update_stream,
+                                                     PhaseProfile* phase_profile) {
+    if (cols_tile <= 0) {
+        return;
+    }
+
+    const int row_begin = target_rb_idx * row_block_rows;
+    const int row_count = RowBlockRowsAt(block_rows, row_block_rows, target_rb_idx);
+    const size_t off = RowBlockOffsetElems(row_block_rows, kb, target_rb_idx);
+    const T one = static_cast<T>(1);
+    const T minus_one = static_cast<T>(-1);
+    const T* y_rb = d_block_y_rowmajor + off;
+    T* a_rb = a_tile + row_offset + row_begin;
+
+    const size_t tail_apply_gemm_idx =
+        BeginPhaseInterval(phase_profile, PhaseKind::TailApplyGemm, tail_update_stream);
+    AssertCublas(CublasGemmTraits<T>::Gemm(tail_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, row_count,
+                                           cols_tile, kb, &minus_one, y_rb, row_count, d_tmp, kb,
+                                           &one, a_rb, lda_local),
+                 "Pipeline chained tail apply A_rb -= Y_rb * tmp");
+    EndPhaseInterval(phase_profile, tail_apply_gemm_idx, tail_update_stream);
 }
 
 template <typename T>
@@ -915,6 +1033,7 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
     const int row_block_count = RowBlockCount(block_rows, row_block_rows);
     const bool self_has_tail = RankHasColsAfter(part, part.rank, block_end);
     const bool overlap_tail = pipeline_cfg.tail_mode == RowBlockPipelineConfig::TailMode::Overlap;
+    const bool chained_tail = pipeline_cfg.tail_mode == RowBlockPipelineConfig::TailMode::Chained;
 
     const size_t rowmajor_need = static_cast<size_t>(block_rows) * static_cast<size_t>(kb);
     if (ws->block_rowmajor_elems < rowmajor_need) {
@@ -1060,7 +1179,7 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         return;
     }
 
-    if (!overlap_tail && row_block_count > 0) {
+    if (!overlap_tail && !chained_tail && row_block_count > 0) {
         const size_t tail_wait_idx =
             BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, events.tail_acc_stream);
         AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream,
@@ -1086,7 +1205,38 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         }
     });
 
-    if (overlap_tail) {
+    if (chained_tail) {
+        const T one = static_cast<T>(1);
+        T* tmp_prefix = ws->d_tmp0;
+        T* tmp_partial = ws->d_tmp1;
+        for (const auto& tile : tail_tiles) {
+            const size_t tile_need = static_cast<size_t>(kb) * static_cast<size_t>(tile.cols_tile);
+            AssertCuda(
+                cudaMemsetAsync(tmp_prefix, 0, tile_need * sizeof(T), events.tail_acc_stream),
+                "cudaMemsetAsync chained tail tmp_prefix");
+            for (int source_rb_idx = 0; source_rb_idx < row_block_count; ++source_rb_idx) {
+                TailAccumulateSingleRowBlockFromRowBlockCache(
+                    events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, block_begin, block_rows,
+                    kb, row_block_rows, source_rb_idx, tile.a_tile, lda_local, tile.cols_tile,
+                    tmp_partial, ws->tmp_elems, events.tail_acc_stream, events.rowblock_comm_done,
+                    phase_profile);
+                AssertCublas(CublasAxpyTraits<T>::Axpy(events.tail_acc_cublas_handle,
+                                                       static_cast<int>(tile_need), &one,
+                                                       tmp_partial, 1, tmp_prefix, 1),
+                             "Pipeline chained tmp_prefix += tmp_partial");
+                for (int target_rb_idx = 0; target_rb_idx < source_rb_idx; ++target_rb_idx) {
+                    TailApplySingleRowBlockFromRowBlockCache(
+                        events.tail_acc_cublas_handle, ws->d_block_y_rowmajor, block_begin,
+                        block_rows, kb, row_block_rows, target_rb_idx, tile.a_tile, lda_local,
+                        tile.cols_tile, tmp_partial, events.tail_acc_stream, phase_profile);
+                }
+                TailApplySingleRowBlockFromRowBlockCache(
+                    events.tail_acc_cublas_handle, ws->d_block_y_rowmajor, block_begin, block_rows,
+                    kb, row_block_rows, source_rb_idx, tile.a_tile, lda_local, tile.cols_tile,
+                    tmp_prefix, events.tail_acc_stream, phase_profile);
+            }
+        }
+    } else if (overlap_tail) {
         T* tmp_buffers[2] = {ws->d_tmp0, ws->d_tmp1};
         for (size_t tile_idx = 0; tile_idx < tail_tiles.size(); ++tile_idx) {
             const int buf_idx = static_cast<int>(tile_idx % 2);
@@ -1112,9 +1262,21 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
     }
 
     if (phase_profile && local_tail_cols > 0) {
-        phase_profile->tail_update_flops += 4.0 * static_cast<double>(block_rows) *
-                                            static_cast<double>(kb) *
-                                            static_cast<double>(local_tail_cols);
+        if (chained_tail) {
+            double apply_rows_weighted = 0.0;
+            for (int rb_idx = 0; rb_idx < row_block_count; ++rb_idx) {
+                apply_rows_weighted +=
+                    static_cast<double>(RowBlockRowsAt(block_rows, row_block_rows, rb_idx)) *
+                    static_cast<double>(row_block_count - rb_idx);
+            }
+            phase_profile->tail_update_flops +=
+                2.0 * static_cast<double>(kb) * static_cast<double>(local_tail_cols) *
+                (static_cast<double>(block_rows) + apply_rows_weighted);
+        } else {
+            phase_profile->tail_update_flops += 4.0 * static_cast<double>(block_rows) *
+                                                static_cast<double>(kb) *
+                                                static_cast<double>(local_tail_cols);
+        }
     }
 
     AssertCuda(cudaEventRecord(events.tail_update_done, events.tail_acc_stream),

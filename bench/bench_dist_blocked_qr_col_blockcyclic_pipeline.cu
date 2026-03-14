@@ -134,6 +134,10 @@ bool ParseRowBlockMode(
         *out_mode = TailMode::Overlap;
         return true;
     }
+    if (std::strcmp(mode_str, "chained") == 0) {
+        *out_mode = TailMode::Chained;
+        return true;
+    }
     return false;
 }
 
@@ -704,7 +708,8 @@ int main(int argc, char** argv) {
     if (!opts.row_block_mode_valid) {
         if (env.rank == 0) {
             spdlog::error(
-                "Invalid --row_block_mode value '{}'. Supported values: baseline, overlap.",
+                "Invalid --row_block_mode value '{}'. Supported values: baseline, overlap, "
+                "chained.",
                 opts.row_block_mode_value);
         }
         finalize_nccl_if_needed(&env);
