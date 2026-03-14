@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <mpi.h>
 #include <nccl.h>
 #include <spdlog/spdlog.h>
 
@@ -242,7 +243,20 @@ struct CommProfile {
     size_t bytes_y = 0;
     size_t useful_bytes_w = 0;
     size_t useful_bytes_y = 0;
+    double w_enter_skew_ms = 0.0;
+    double y_enter_skew_ms = 0.0;
+    double w_enter_skew_max_ms = 0.0;
+    double y_enter_skew_max_ms = 0.0;
 };
+
+inline double MeasureCollectiveEnterSkewMs() {
+    const double t_local = MPI_Wtime();
+    double t_min = t_local;
+    double t_max = t_local;
+    MPI_Allreduce(&t_local, &t_min, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+    MPI_Allreduce(&t_local, &t_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    return (t_max - t_min) * 1.0e3;
+}
 
 enum class PhaseKind {
     PanelFactor = 0,
@@ -1372,6 +1386,12 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
             }
 
             if (block_receivers > 0) {
+                if (comm_profile && rb_idx == 0) {
+                    const double skew_ms = MeasureCollectiveEnterSkewMs();
+                    comm_profile->w_enter_skew_ms += skew_ms;
+                    comm_profile->w_enter_skew_max_ms =
+                        std::max(comm_profile->w_enter_skew_max_ms, skew_ms);
+                }
                 const size_t comm_idx =
                     BeginPhaseInterval(phase_profile, PhaseKind::CommW, comm_stream);
                 AssertNccl(ncclBroadcast(d_rowblock_w, d_rowblock_w, elems, nccl_type, block_owner,
@@ -1395,6 +1415,12 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
 
         const size_t compact_y_elems = static_cast<size_t>(block_rows) * static_cast<size_t>(kb);
         if (block_receivers > 0) {
+            if (comm_profile) {
+                const double skew_ms = MeasureCollectiveEnterSkewMs();
+                comm_profile->y_enter_skew_ms += skew_ms;
+                comm_profile->y_enter_skew_max_ms =
+                    std::max(comm_profile->y_enter_skew_max_ms, skew_ms);
+            }
             const size_t comm_idx = BeginPhaseInterval(phase_profile, PhaseKind::CommY, comm_stream);
             AssertNccl(ncclBroadcast(ws->d_block_y, ws->d_block_y, compact_y_elems, nccl_type,
                                      block_owner, nccl_comm, comm_stream),
@@ -1691,6 +1717,10 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
         comm_profile->bytes_y = 0;
         comm_profile->useful_bytes_w = 0;
         comm_profile->useful_bytes_y = 0;
+        comm_profile->w_enter_skew_ms = 0.0;
+        comm_profile->y_enter_skew_ms = 0.0;
+        comm_profile->w_enter_skew_max_ms = 0.0;
+        comm_profile->y_enter_skew_max_ms = 0.0;
     }
     ResetPhaseProfile(phase_profile);
 

@@ -357,6 +357,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> comm_y_bytes_per_iter;
     std::vector<double> comm_w_useful_bytes_per_iter;
     std::vector<double> comm_y_useful_bytes_per_iter;
+    std::vector<double> comm_w_enter_skew_ms_per_iter;
+    std::vector<double> comm_y_enter_skew_ms_per_iter;
+    std::vector<double> comm_w_enter_skew_max_ms_per_iter;
+    std::vector<double> comm_y_enter_skew_max_ms_per_iter;
     if (opts.print_phase_timing) {
         phase_panel_ms_per_iter.resize(opts.iters, 0.0);
         phase_wy_ms_per_iter.resize(opts.iters, 0.0);
@@ -376,6 +380,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         comm_y_bytes_per_iter.resize(opts.iters, 0.0);
         comm_w_useful_bytes_per_iter.resize(opts.iters, 0.0);
         comm_y_useful_bytes_per_iter.resize(opts.iters, 0.0);
+        comm_w_enter_skew_ms_per_iter.resize(opts.iters, 0.0);
+        comm_y_enter_skew_ms_per_iter.resize(opts.iters, 0.0);
+        comm_w_enter_skew_max_ms_per_iter.resize(opts.iters, 0.0);
+        comm_y_enter_skew_max_ms_per_iter.resize(opts.iters, 0.0);
     }
 
     for (int i = 0; i < opts.iters; ++i) {
@@ -426,6 +434,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             comm_y_bytes_per_iter[i] = static_cast<double>(comm_profile.bytes_y);
             comm_w_useful_bytes_per_iter[i] = static_cast<double>(comm_profile.useful_bytes_w);
             comm_y_useful_bytes_per_iter[i] = static_cast<double>(comm_profile.useful_bytes_y);
+            comm_w_enter_skew_ms_per_iter[i] = comm_profile.w_enter_skew_ms;
+            comm_y_enter_skew_ms_per_iter[i] = comm_profile.y_enter_skew_ms;
+            comm_w_enter_skew_max_ms_per_iter[i] = comm_profile.w_enter_skew_max_ms;
+            comm_y_enter_skew_max_ms_per_iter[i] = comm_profile.y_enter_skew_max_ms;
         }
 
         float iter_ms = 0.0f;
@@ -461,6 +473,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> all_comm_y_useful_bytes;
     std::vector<double> all_comm_w_gbps;
     std::vector<double> all_comm_y_gbps;
+    std::vector<double> all_comm_w_enter_skew_ms;
+    std::vector<double> all_comm_y_enter_skew_ms;
+    std::vector<double> all_comm_w_enter_skew_max_ms;
+    std::vector<double> all_comm_y_enter_skew_max_ms;
     std::vector<double> all_comm_gbps;
     double local_panel_ms = 0.0;
     double local_wy_ms = 0.0;
@@ -480,6 +496,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     double local_comm_y_bytes = 0.0;
     double local_comm_w_useful_bytes = 0.0;
     double local_comm_y_useful_bytes = 0.0;
+    double local_comm_w_enter_skew_ms = 0.0;
+    double local_comm_y_enter_skew_ms = 0.0;
+    double local_comm_w_enter_skew_max_ms = 0.0;
+    double local_comm_y_enter_skew_max_ms = 0.0;
 
     if (opts.print_phase_timing) {
         for (int i = 0; i < opts.iters; ++i) {
@@ -501,6 +521,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             local_comm_y_bytes += comm_y_bytes_per_iter[i];
             local_comm_w_useful_bytes += comm_w_useful_bytes_per_iter[i];
             local_comm_y_useful_bytes += comm_y_useful_bytes_per_iter[i];
+            local_comm_w_enter_skew_ms += comm_w_enter_skew_ms_per_iter[i];
+            local_comm_y_enter_skew_ms += comm_y_enter_skew_ms_per_iter[i];
+            local_comm_w_enter_skew_max_ms += comm_w_enter_skew_max_ms_per_iter[i];
+            local_comm_y_enter_skew_max_ms += comm_y_enter_skew_max_ms_per_iter[i];
         }
         local_panel_ms /= static_cast<double>(opts.iters);
         local_wy_ms /= static_cast<double>(opts.iters);
@@ -520,6 +544,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         local_comm_y_bytes /= static_cast<double>(opts.iters);
         local_comm_w_useful_bytes /= static_cast<double>(opts.iters);
         local_comm_y_useful_bytes /= static_cast<double>(opts.iters);
+        local_comm_w_enter_skew_ms /= static_cast<double>(opts.iters);
+        local_comm_y_enter_skew_ms /= static_cast<double>(opts.iters);
+        local_comm_w_enter_skew_max_ms /= static_cast<double>(opts.iters);
+        local_comm_y_enter_skew_max_ms /= static_cast<double>(opts.iters);
     }
 
     const double local_compute_ms = local_panel_ms + local_wy_ms + local_merge_ms +
@@ -561,6 +589,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         all_comm_y_useful_bytes.resize(env.size, 0.0);
         all_comm_w_gbps.resize(env.size, 0.0);
         all_comm_y_gbps.resize(env.size, 0.0);
+        all_comm_w_enter_skew_ms.resize(env.size, 0.0);
+        all_comm_y_enter_skew_ms.resize(env.size, 0.0);
+        all_comm_w_enter_skew_max_ms.resize(env.size, 0.0);
+        all_comm_y_enter_skew_max_ms.resize(env.size, 0.0);
         all_comm_gbps.resize(env.size, 0.0);
     }
     if (opts.print_per_rank) {
@@ -629,6 +661,18 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         MPI_Gather(&local_comm_y_gbps, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_comm_y_gbps.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_w_enter_skew_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_comm_w_enter_skew_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_y_enter_skew_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_comm_y_enter_skew_ms.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_w_enter_skew_max_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_comm_w_enter_skew_max_ms.data() : nullptr, 1,
+                   MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_y_enter_skew_max_ms, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_comm_y_enter_skew_max_ms.data() : nullptr, 1,
+                   MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Gather(&local_comm_gbps, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_comm_gbps.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
@@ -678,15 +722,20 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                     "Per-rank summary: rank {} -> compute {:.3f} ms, comm {:.3f} ms, "
                     "comm_w {:.3f} ms, comm_y {:.3f} ms, comm_bytes {:.3f} GB, "
                     "comm_w_bytes {:.3f} GB, comm_w_useful {:.3f} GB, comm_w_waste {:.3f} GB, "
-                    "comm_w_bw {:.3f} GB/s, comm_y_bytes {:.3f} GB, comm_y_bw {:.3f} GB/s, "
+                    "comm_w_bw {:.3f} GB/s, comm_w_enter_skew {:.3f} ms, "
+                    "comm_w_enter_skew_max {:.3f} ms, comm_y_bytes {:.3f} GB, "
+                    "comm_y_bw {:.3f} GB/s, comm_y_enter_skew {:.3f} ms, "
+                    "comm_y_enter_skew_max {:.3f} ms, "
                     "comm_bw {:.3f} GB/s, local_copy {:.3f} ms, "
                     "tail_wait {:.3f} ms, tail_gemm {:.3f} TFLOP/s",
                     r, all_compute_ms[r], all_comm_ms[r], all_comm_w_ms[r], all_comm_y_ms[r],
                     all_comm_bytes[r] / 1.0e9, all_comm_w_bytes[r] / 1.0e9,
                     all_comm_w_useful_bytes[r] / 1.0e9,
                     (all_comm_w_bytes[r] - all_comm_w_useful_bytes[r]) / 1.0e9,
-                    all_comm_w_gbps[r], all_comm_y_bytes[r] / 1.0e9, all_comm_y_gbps[r],
-                    all_comm_gbps[r], all_local_copy_ms[r],
+                    all_comm_w_gbps[r], all_comm_w_enter_skew_ms[r],
+                    all_comm_w_enter_skew_max_ms[r], all_comm_y_bytes[r] / 1.0e9,
+                    all_comm_y_gbps[r], all_comm_y_enter_skew_ms[r],
+                    all_comm_y_enter_skew_max_ms[r], all_comm_gbps[r], all_local_copy_ms[r],
                     all_tail_wait_ms[r], all_tail_gemm_tflops[r]);
                 spdlog::info(
                     "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, merge {:.3f} ms, "
