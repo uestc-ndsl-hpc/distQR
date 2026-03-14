@@ -210,6 +210,11 @@ struct DistributedQrColBlockCyclicPipelineWorkspace {
 };
 
 struct RowBlockPipelineConfig {
+    enum class TailMode {
+        Baseline = 0,
+        Overlap = 1,
+    };
+
     // Reserved compatibility knob from the previous k-tile version.
     // The row-block communication path does not use it to partition traffic.
     int update_tile_cols = 0;
@@ -219,6 +224,8 @@ struct RowBlockPipelineConfig {
 
     // Number of trailing local columns processed per local GEMM tile.
     int trail_tile_cols = 0;
+
+    TailMode tail_mode = TailMode::Baseline;
 };
 
 struct CommProfile {
@@ -370,6 +377,16 @@ inline RowBlockPipelineConfig NormalizePipelineConfig(const RowBlockPipelineConf
     return cfg;
 }
 
+inline const char* TailModeString(RowBlockPipelineConfig::TailMode mode) {
+    switch (mode) {
+        case RowBlockPipelineConfig::TailMode::Baseline:
+            return "baseline";
+        case RowBlockPipelineConfig::TailMode::Overlap:
+            return "overlap";
+    }
+    return "unknown";
+}
+
 template <typename T>
 inline void ValidatePipelineConfig(const DistributedQrColBlockCyclicPipelineWorkspace<T>& ws,
                                    const RowBlockPipelineConfig& cfg,
@@ -385,6 +402,11 @@ inline void ValidatePipelineConfig(const DistributedQrColBlockCyclicPipelineWork
     }
     if (cfg.trail_tile_cols <= 0) {
         spdlog::error("Pipeline trail_tile_cols must be positive (got {}).", cfg.trail_tile_cols);
+        std::exit(1);
+    }
+    if (cfg.tail_mode != RowBlockPipelineConfig::TailMode::Baseline &&
+        cfg.tail_mode != RowBlockPipelineConfig::TailMode::Overlap) {
+        spdlog::error("Pipeline tail_mode is invalid.");
         std::exit(1);
     }
 
@@ -660,6 +682,7 @@ inline void TailUpdateColTileFromRowBlockCache(cublasHandle_t tail_cublas_handle
                                                T* d_tmp,
                                                size_t tmp_elems,
                                                cudaStream_t tail_update_stream,
+                                               bool wait_for_each_rowblock,
                                                const std::vector<cudaEvent_t>& rowblock_comm_done,
                                                PhaseProfile* phase_profile) {
     if (cols_tile <= 0) {
@@ -685,8 +708,10 @@ inline void TailUpdateColTileFromRowBlockCache(cublasHandle_t tail_cublas_handle
         const int row_begin = rb_idx * row_block_rows;
         const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
         const size_t off = RowBlockOffsetElems(row_block_rows, kb, rb_idx);
-        AssertCuda(cudaStreamWaitEvent(tail_update_stream, rowblock_comm_done[rb_idx], 0),
-                   "cudaStreamWaitEvent tail_update_stream <- rowblock_comm_done");
+        if (wait_for_each_rowblock) {
+            AssertCuda(cudaStreamWaitEvent(tail_update_stream, rowblock_comm_done[rb_idx], 0),
+                       "cudaStreamWaitEvent tail_update_stream <- rowblock_comm_done");
+        }
         const T* w_rb = d_block_w_rowmajor + off;
         const T* a_rb = a_tile + row_offset + row_begin;
         const T* beta = (rb_idx == 0) ? &zero : &one;
@@ -740,6 +765,8 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
     const int row_block_rows = std::max(1, pipeline_cfg.row_block_rows);
     const int row_block_count = RowBlockCount(block_rows, row_block_rows);
     const bool self_has_tail = RankHasColsAfter(part, part.rank, block_end);
+    const bool overlap_tail =
+        pipeline_cfg.tail_mode == RowBlockPipelineConfig::TailMode::Overlap;
 
     const size_t rowmajor_need = static_cast<size_t>(block_rows) * static_cast<size_t>(kb);
     if (ws->block_rowmajor_elems < rowmajor_need) {
@@ -852,6 +879,13 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         return;
     }
 
+    if (!overlap_tail && row_block_count > 0) {
+        AssertCuda(
+            cudaStreamWaitEvent(events.tail_update_stream, events.rowblock_comm_done[row_block_count - 1],
+                                0),
+            "cudaStreamWaitEvent tail_update_stream <- rowblock_comm_done[last]");
+    }
+
     int local_tail_cols = 0;
     ForEachLocalSegment(part, block_end, n, [&](int seg_begin, int seg_end, int local_begin) {
         const int cols_local = seg_end - seg_begin;
@@ -864,7 +898,8 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                                                ws->d_block_y_rowmajor, block_begin, block_rows, kb,
                                                row_block_rows, a_tile, lda_local, cols_tile,
                                                ws->d_tmp0, ws->tmp_elems, events.tail_update_stream,
-                                               events.rowblock_comm_done, phase_profile);
+                                               overlap_tail, events.rowblock_comm_done,
+                                               phase_profile);
         }
     });
 

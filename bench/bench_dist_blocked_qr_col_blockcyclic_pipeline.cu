@@ -83,6 +83,10 @@ struct Options {
     bool use_double = false;
     bool type_valid = true;
     std::string type_value = "float";
+    distributed_qr_col_blockcyclic_pipeline::RowBlockPipelineConfig::TailMode row_block_mode =
+        distributed_qr_col_blockcyclic_pipeline::RowBlockPipelineConfig::TailMode::Baseline;
+    bool row_block_mode_valid = true;
+    std::string row_block_mode_value = "baseline";
 };
 
 bool ParseType(const char* type_str, bool* out_use_double) {
@@ -92,6 +96,21 @@ bool ParseType(const char* type_str, bool* out_use_double) {
     }
     if (std::strcmp(type_str, "double") == 0 || std::strcmp(type_str, "fp64") == 0) {
         *out_use_double = true;
+        return true;
+    }
+    return false;
+}
+
+bool ParseRowBlockMode(
+    const char* mode_str,
+    distributed_qr_col_blockcyclic_pipeline::RowBlockPipelineConfig::TailMode* out_mode) {
+    using TailMode = distributed_qr_col_blockcyclic_pipeline::RowBlockPipelineConfig::TailMode;
+    if (std::strcmp(mode_str, "baseline") == 0) {
+        *out_mode = TailMode::Baseline;
+        return true;
+    }
+    if (std::strcmp(mode_str, "overlap") == 0) {
+        *out_mode = TailMode::Overlap;
         return true;
     }
     return false;
@@ -145,6 +164,14 @@ Options ParseArgs(int argc, char** argv) {
         } else if (std::strncmp(argv[i], "--type=", 7) == 0) {
             opts.type_value = argv[i] + 7;
             opts.type_valid = ParseType(opts.type_value.c_str(), &opts.use_double);
+        } else if (std::strcmp(argv[i], "--row_block_mode") == 0 && i + 1 < argc) {
+            opts.row_block_mode_value = argv[++i];
+            opts.row_block_mode_valid =
+                ParseRowBlockMode(opts.row_block_mode_value.c_str(), &opts.row_block_mode);
+        } else if (std::strncmp(argv[i], "--row_block_mode=", 17) == 0) {
+            opts.row_block_mode_value = argv[i] + 17;
+            opts.row_block_mode_valid =
+                ParseRowBlockMode(opts.row_block_mode_value.c_str(), &opts.row_block_mode);
         } else if (std::strcmp(argv[i], "--rowblock_buffers") == 0 && i + 1 < argc) {
             ++i;
         } else if (std::strncmp(argv[i], "--rowblock_buffers=", 19) == 0) {
@@ -231,6 +258,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     pipeline_cfg.update_tile_cols = opts.update_tile;
     pipeline_cfg.row_block_rows = opts.row_block_rows;
     pipeline_cfg.trail_tile_cols = opts.trail_tile_cols;
+    pipeline_cfg.tail_mode = opts.row_block_mode;
 
     auto run_once = [&](distributed_qr_col_blockcyclic_pipeline::CommProfile* comm_profile,
                         distributed_qr_col_blockcyclic_pipeline::PhaseProfile* phase_profile) {
@@ -420,9 +448,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (env.rank == 0) {
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic-pipeline] ({}): m={} n={} nb={} "
-            "block_cols={} update_tile(compat)={} row_block_rows={} trail_tile_cols={} np={} avg {:.3f} ms",
+            "block_cols={} update_tile(compat)={} row_block_rows={} trail_tile_cols={} "
+            "row_block_mode={} np={} avg {:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
-            opts.row_block_rows, opts.trail_tile_cols, env.size, max_ms);
+            opts.row_block_rows, opts.trail_tile_cols,
+            distributed_qr_col_blockcyclic_pipeline::TailModeString(opts.row_block_mode),
+            env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms", r, all_local_ms[r]);
@@ -536,6 +567,16 @@ int main(int argc, char** argv) {
         if (env.rank == 0) {
             spdlog::error("Invalid --type value '{}'. Supported values: float, double.",
                           opts.type_value);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (!opts.row_block_mode_valid) {
+        if (env.rank == 0) {
+            spdlog::error(
+                "Invalid --row_block_mode value '{}'. Supported values: baseline, overlap.",
+                opts.row_block_mode_value);
         }
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);
