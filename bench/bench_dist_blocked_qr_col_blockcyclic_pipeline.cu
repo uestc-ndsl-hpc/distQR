@@ -81,6 +81,13 @@ double TflopsFromFlopsAndMs(double flops, double ms) {
     return flops / (ms * 1.0e9);
 }
 
+double GigabytesPerSecondFromBytesAndMs(double bytes, double ms) {
+    if (ms <= 0.0) {
+        return 0.0;
+    }
+    return bytes / (ms * 1.0e6);
+}
+
 struct Options {
     int m = 16384;
     int n = 32;
@@ -330,6 +337,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> phase_tail_acc_gemm_ms_per_iter;
     std::vector<double> phase_tail_apply_gemm_ms_per_iter;
     std::vector<double> phase_tail_flops_per_iter;
+    std::vector<double> comm_bytes_per_iter;
     if (opts.print_phase_timing) {
         phase_panel_ms_per_iter.resize(opts.iters, 0.0);
         phase_wy_ms_per_iter.resize(opts.iters, 0.0);
@@ -342,6 +350,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         phase_tail_acc_gemm_ms_per_iter.resize(opts.iters, 0.0);
         phase_tail_apply_gemm_ms_per_iter.resize(opts.iters, 0.0);
         phase_tail_flops_per_iter.resize(opts.iters, 0.0);
+        comm_bytes_per_iter.resize(opts.iters, 0.0);
     }
 
     for (int i = 0; i < opts.iters; ++i) {
@@ -359,7 +368,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         distributed_qr_col_blockcyclic_pipeline::AssertCuda(
             cudaEventRecord(timed_start, compute_stream), "cudaEventRecord timed_start");
         distributed_qr_col_blockcyclic_pipeline::PhaseProfile phase_profile{};
-        run_once(nullptr, opts.print_phase_timing ? &phase_profile : nullptr);
+        distributed_qr_col_blockcyclic_pipeline::CommProfile comm_profile{};
+        run_once(opts.print_phase_timing ? &comm_profile : nullptr,
+                 opts.print_phase_timing ? &phase_profile : nullptr);
         distributed_qr_col_blockcyclic_pipeline::AssertCuda(
             cudaEventRecord(timed_comm_done, comm_stream), "cudaEventRecord timed_comm_done");
         distributed_qr_col_blockcyclic_pipeline::AssertCuda(
@@ -383,6 +394,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             phase_tail_acc_gemm_ms_per_iter[i] = phase_profile.tail_acc_gemm_ms;
             phase_tail_apply_gemm_ms_per_iter[i] = phase_profile.tail_apply_gemm_ms;
             phase_tail_flops_per_iter[i] = phase_profile.tail_update_flops;
+            comm_bytes_per_iter[i] = static_cast<double>(comm_profile.bytes);
         }
 
         float iter_ms = 0.0f;
@@ -409,6 +421,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     std::vector<double> all_compute_ms;
     std::vector<double> all_local_copy_ms;
     std::vector<double> all_tail_gemm_tflops;
+    std::vector<double> all_comm_bytes;
+    std::vector<double> all_comm_gbps;
     double local_panel_ms = 0.0;
     double local_wy_ms = 0.0;
     double local_merge_ms = 0.0;
@@ -420,6 +434,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     double local_tail_acc_gemm_ms = 0.0;
     double local_tail_apply_gemm_ms = 0.0;
     double local_tail_flops = 0.0;
+    double local_comm_bytes = 0.0;
 
     if (opts.print_phase_timing) {
         for (int i = 0; i < opts.iters; ++i) {
@@ -434,6 +449,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             local_tail_acc_gemm_ms += phase_tail_acc_gemm_ms_per_iter[i];
             local_tail_apply_gemm_ms += phase_tail_apply_gemm_ms_per_iter[i];
             local_tail_flops += phase_tail_flops_per_iter[i];
+            local_comm_bytes += comm_bytes_per_iter[i];
         }
         local_panel_ms /= static_cast<double>(opts.iters);
         local_wy_ms /= static_cast<double>(opts.iters);
@@ -446,6 +462,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         local_tail_acc_gemm_ms /= static_cast<double>(opts.iters);
         local_tail_apply_gemm_ms /= static_cast<double>(opts.iters);
         local_tail_flops /= static_cast<double>(opts.iters);
+        local_comm_bytes /= static_cast<double>(opts.iters);
     }
 
     const double local_compute_ms = local_panel_ms + local_wy_ms + local_merge_ms +
@@ -454,6 +471,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     const double local_local_copy_ms = local_pack_ms + local_unpack_ms;
     const double local_tail_gemm_tflops =
         TflopsFromFlopsAndMs(local_tail_flops, local_tail_acc_gemm_ms + local_tail_apply_gemm_ms);
+    const double local_comm_gbps =
+        GigabytesPerSecondFromBytesAndMs(local_comm_bytes, local_comm_ms);
 
     if (opts.print_per_rank && env.rank == 0) {
         all_local_ms.resize(env.size, 0.0);
@@ -472,6 +491,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         all_compute_ms.resize(env.size, 0.0);
         all_local_copy_ms.resize(env.size, 0.0);
         all_tail_gemm_tflops.resize(env.size, 0.0);
+        all_comm_bytes.resize(env.size, 0.0);
+        all_comm_gbps.resize(env.size, 0.0);
     }
     if (opts.print_per_rank) {
         MPI_Gather(&local_ms, 1, MPI_DOUBLE, (env.rank == 0) ? all_local_ms.data() : nullptr, 1,
@@ -511,6 +532,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                    MPI_COMM_WORLD);
         MPI_Gather(&local_tail_gemm_tflops, 1, MPI_DOUBLE,
                    (env.rank == 0) ? all_tail_gemm_tflops.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_bytes, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_comm_bytes.data() : nullptr, 1, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        MPI_Gather(&local_comm_gbps, 1, MPI_DOUBLE,
+                   (env.rank == 0) ? all_comm_gbps.data() : nullptr, 1, MPI_DOUBLE, 0,
                    MPI_COMM_WORLD);
     }
 
@@ -554,8 +581,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info(
                     "Per-rank summary: rank {} -> compute {:.3f} ms, comm {:.3f} ms, "
-                    "local_copy {:.3f} ms, tail_wait {:.3f} ms, tail_gemm {:.3f} TFLOP/s",
-                    r, all_compute_ms[r], all_comm_ms[r], all_local_copy_ms[r], all_tail_wait_ms[r],
+                    "comm_bytes {:.3f} GB, comm_bw {:.3f} GB/s, local_copy {:.3f} ms, "
+                    "tail_wait {:.3f} ms, tail_gemm {:.3f} TFLOP/s",
+                    r, all_compute_ms[r], all_comm_ms[r], all_comm_bytes[r] / 1.0e9,
+                    all_comm_gbps[r], all_local_copy_ms[r], all_tail_wait_ms[r],
                     all_tail_gemm_tflops[r]);
                 spdlog::info(
                     "Per-rank phase: rank {} -> panel {:.3f} ms, WY {:.3f} ms, merge {:.3f} ms, "
