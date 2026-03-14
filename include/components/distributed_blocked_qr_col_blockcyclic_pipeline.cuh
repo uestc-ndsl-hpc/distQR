@@ -1091,46 +1091,15 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         for (size_t tile_idx = 0; tile_idx < tail_tiles.size(); ++tile_idx) {
             const int buf_idx = static_cast<int>(tile_idx % 2);
             const auto& tile = tail_tiles[tile_idx];
-            AssertCuda(
-                cudaStreamWaitEvent(events.tail_acc_stream, events.tail_apply_done[buf_idx], 0),
-                "cudaStreamWaitEvent tail_acc_stream <- tail_apply_done");
             TailAccumulateColTileFromRowBlockCache(
                 events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, block_begin, block_rows, kb,
                 row_block_rows, tile.a_tile, lda_local, tile.cols_tile, tmp_buffers[buf_idx],
                 ws->tmp_elems, events.tail_acc_stream, true, events.rowblock_comm_done,
                 phase_profile);
-            AssertCuda(cudaEventRecord(events.tail_acc_done[buf_idx], events.tail_acc_stream),
-                       "cudaEventRecord tail_acc_done");
-
-            if (tile_idx > 0) {
-                const int prev_buf_idx = static_cast<int>((tile_idx - 1) % 2);
-                const auto& prev_tile = tail_tiles[tile_idx - 1];
-                AssertCuda(cudaStreamWaitEvent(events.tail_apply_stream,
-                                               events.tail_acc_done[prev_buf_idx], 0),
-                           "cudaStreamWaitEvent tail_apply_stream <- tail_acc_done");
-                TailApplyColTileFromRowBlockCache(events.tail_apply_cublas_handle,
-                                                  ws->d_block_y_rowmajor, block_begin, block_rows,
-                                                  kb, row_block_rows, prev_tile.a_tile, lda_local,
-                                                  prev_tile.cols_tile, tmp_buffers[prev_buf_idx],
-                                                  events.tail_apply_stream, phase_profile);
-                AssertCuda(
-                    cudaEventRecord(events.tail_apply_done[prev_buf_idx], events.tail_apply_stream),
-                    "cudaEventRecord tail_apply_done");
-            }
-        }
-        if (!tail_tiles.empty()) {
-            const int last_buf_idx = static_cast<int>((tail_tiles.size() - 1) % 2);
-            const auto& last_tile = tail_tiles.back();
-            AssertCuda(cudaStreamWaitEvent(events.tail_apply_stream,
-                                           events.tail_acc_done[last_buf_idx], 0),
-                       "cudaStreamWaitEvent tail_apply_stream <- tail_acc_done(last)");
             TailApplyColTileFromRowBlockCache(
-                events.tail_apply_cublas_handle, ws->d_block_y_rowmajor, block_begin, block_rows,
-                kb, row_block_rows, last_tile.a_tile, lda_local, last_tile.cols_tile,
-                tmp_buffers[last_buf_idx], events.tail_apply_stream, phase_profile);
-            AssertCuda(
-                cudaEventRecord(events.tail_apply_done[last_buf_idx], events.tail_apply_stream),
-                "cudaEventRecord tail_apply_done(last)");
+                events.tail_acc_cublas_handle, ws->d_block_y_rowmajor, block_begin, block_rows, kb,
+                row_block_rows, tile.a_tile, lda_local, tile.cols_tile, tmp_buffers[buf_idx],
+                events.tail_acc_stream, phase_profile);
         }
     } else {
         for (const auto& tile : tail_tiles) {
@@ -1148,8 +1117,7 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                                             static_cast<double>(local_tail_cols);
     }
 
-    AssertCuda(cudaEventRecord(events.tail_update_done,
-                               overlap_tail ? events.tail_apply_stream : events.tail_acc_stream),
+    AssertCuda(cudaEventRecord(events.tail_update_done, events.tail_acc_stream),
                "cudaEventRecord tail_update_done");
     AssertCuda(cudaStreamWaitEvent(compute_stream, events.tail_update_done, 0),
                "cudaStreamWaitEvent compute_stream <- tail_update_done");
