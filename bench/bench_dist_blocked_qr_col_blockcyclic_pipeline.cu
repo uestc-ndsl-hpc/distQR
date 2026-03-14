@@ -87,6 +87,7 @@ struct Options {
         distributed_qr_col_blockcyclic_pipeline::RowBlockPipelineConfig::TailMode::Baseline;
     bool row_block_mode_valid = true;
     std::string row_block_mode_value = "baseline";
+    bool skip_tail_update = false;
 };
 
 bool ParseType(const char* type_str, bool* out_use_double) {
@@ -175,6 +176,8 @@ Options ParseArgs(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--rowblock_buffers") == 0 && i + 1 < argc) {
             ++i;
         } else if (std::strncmp(argv[i], "--rowblock_buffers=", 19) == 0) {
+        } else if (std::strcmp(argv[i], "--skip_tail_update") == 0) {
+            opts.skip_tail_update = true;
         }
     }
     return opts;
@@ -263,6 +266,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     pipeline_cfg.row_block_rows = opts.row_block_rows;
     pipeline_cfg.trail_tile_cols = opts.trail_tile_cols;
     pipeline_cfg.tail_mode = opts.row_block_mode;
+    pipeline_cfg.skip_tail_update = opts.skip_tail_update;
 
     auto run_once = [&](distributed_qr_col_blockcyclic_pipeline::CommProfile* comm_profile,
                         distributed_qr_col_blockcyclic_pipeline::PhaseProfile* phase_profile) {
@@ -450,11 +454,11 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic-pipeline] ({}): m={} n={} nb={} "
             "block_cols={} update_tile(compat)={} row_block_rows={} trail_tile_cols={} "
-            "row_block_mode={} np={} avg {:.3f} ms",
+            "row_block_mode={} skip_tail_update={} np={} avg {:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
             opts.row_block_rows, opts.trail_tile_cols,
-            distributed_qr_col_blockcyclic_pipeline::TailModeString(opts.row_block_mode), env.size,
-            max_ms);
+            distributed_qr_col_blockcyclic_pipeline::TailModeString(opts.row_block_mode),
+            opts.skip_tail_update, env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms", r, all_local_ms[r]);

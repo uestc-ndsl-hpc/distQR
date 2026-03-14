@@ -232,6 +232,7 @@ struct RowBlockPipelineConfig {
     int trail_tile_cols = 0;
 
     TailMode tail_mode = TailMode::Baseline;
+    bool skip_tail_update = false;
 };
 
 struct CommProfile {
@@ -875,7 +876,7 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                                        const RowBlockPipelineConfig& pipeline_cfg,
                                        CommProfile* comm_profile,
                                        PhaseProfile* phase_profile) {
-    if (block_end >= n) {
+    if (block_end >= n || pipeline_cfg.skip_tail_update) {
         return;
     }
 
