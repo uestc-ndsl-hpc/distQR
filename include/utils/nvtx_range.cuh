@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -8,19 +11,56 @@
 #if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
 #define DISTQR_HAS_NVTX 1
+#define DISTQR_NVTX_BACKEND_NAME "nvtx3"
 #elif __has_include(<nvToolsExt.h>)
 #include <nvToolsExt.h>
 #define DISTQR_HAS_NVTX 1
+#define DISTQR_NVTX_BACKEND_NAME "nvToolsExt"
 #else
 #define DISTQR_HAS_NVTX 0
+#define DISTQR_NVTX_BACKEND_NAME "disabled"
 #endif
 #else
 #define DISTQR_HAS_NVTX 0
+#define DISTQR_NVTX_BACKEND_NAME "disabled"
 #endif
 
 namespace distqr::nvtx {
 
-inline constexpr bool kEnabled = DISTQR_HAS_NVTX != 0;
+inline constexpr bool kCompiledIn = DISTQR_HAS_NVTX != 0;
+inline constexpr const char* kBackendName = DISTQR_NVTX_BACKEND_NAME;
+inline constexpr const char* kEnableEnvVarName = "DISTQR_ENABLE_NVTX";
+
+inline bool ParseEnabledValue(const char* value) {
+    if (!value || value[0] == '\0') {
+        return true;
+    }
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "False") != 0 && std::strcmp(value, "FALSE") != 0 &&
+           std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0 &&
+           std::strcmp(value, "no") != 0 && std::strcmp(value, "NO") != 0;
+}
+
+inline bool DefaultEnabled() {
+#if DISTQR_HAS_NVTX
+    return ParseEnabledValue(std::getenv(kEnableEnvVarName));
+#else
+    return false;
+#endif
+}
+
+inline std::atomic<bool>& EnabledFlag() {
+    static std::atomic<bool> enabled(DefaultEnabled());
+    return enabled;
+}
+
+inline bool IsEnabled() {
+    return kCompiledIn && EnabledFlag().load(std::memory_order_relaxed);
+}
+
+inline void SetEnabled(bool enabled) {
+    EnabledFlag().store(kCompiledIn && enabled, std::memory_order_relaxed);
+}
 
 class ScopedRange {
 public:
@@ -59,6 +99,9 @@ public:
 private:
     void Start(const char* label) {
 #if DISTQR_HAS_NVTX
+        if (!IsEnabled()) {
+            return;
+        }
         nvtxRangePushA(label ? label : "");
         active_ = true;
 #else
@@ -68,6 +111,9 @@ private:
 
     void Start(std::string label) {
 #if DISTQR_HAS_NVTX
+        if (!IsEnabled()) {
+            return;
+        }
         label_ = std::move(label);
         nvtxRangePushA(label_.c_str());
         active_ = true;
@@ -103,12 +149,20 @@ inline std::string Format(const char* fmt, Args... args) {
 }
 
 inline ScopedRange MakeScopedRange(const char* label) {
+#if DISTQR_HAS_NVTX
+    if (!IsEnabled()) {
+        return ScopedRange();
+    }
+#endif
     return ScopedRange(label);
 }
 
 template <typename... Args>
 inline ScopedRange MakeScopedRangef(const char* fmt, Args... args) {
 #if DISTQR_HAS_NVTX
+    if (!IsEnabled()) {
+        return ScopedRange();
+    }
     return ScopedRange(Format(fmt, args...));
 #else
     (void)fmt;

@@ -16,6 +16,7 @@
 
 #include "components/distributed_blocked_qr_col_blockcyclic.cuh"
 #include "components/resourse_initial.cuh"
+#include "utils/nvtx_range.cuh"
 
 namespace {
 
@@ -545,6 +546,13 @@ int main(int argc, char** argv) {
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);
         return 1;
+    }
+    if (env.rank == 0) {
+        spdlog::info(
+            "Custom NVTX backend: {} (compiled={}, runtime={}, set {}=0 to disable)",
+            distqr::nvtx::kBackendName, distqr::nvtx::kCompiledIn ? "yes" : "no",
+            distqr::nvtx::IsEnabled() ? "enabled" : "disabled",
+            distqr::nvtx::kEnableEnvVarName);
     }
 
     const int local_ret = opts.use_double ? RunBenchmarkTyped<double>(env, opts, block_cols)
