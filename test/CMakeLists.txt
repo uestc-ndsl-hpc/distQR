@@ -32,3 +32,36 @@ target_link_libraries(test_dist_blocked_qr_col_correctness PRIVATE GTest::gtest 
 add_executable(test_dist_blocked_qr_col_blockcyclic_correctness test_dist_blocked_qr_col_blockcyclic_correctness.cu)
 target_include_directories(test_dist_blocked_qr_col_blockcyclic_correctness PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_dist_blocked_qr_col_blockcyclic_correctness PRIVATE GTest::gtest CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL distqr_nvtx_headers)
+
+set(_CUSOLVERMP_ROOT_HINTS $ENV{CUSOLVERMP_ROOT} $ENV{CUSOLVERMP_HOME} $ENV{CUSOLVERMP_DIR})
+
+find_path(CUSOLVERMP_INCLUDE_DIR
+  NAMES cusolverMp.h
+  HINTS
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${_DISTQR_CUDA_ROOT_FROM_BIN}
+    ${_CUSOLVERMP_ROOT_HINTS}
+  PATH_SUFFIXES include targets/x86_64-linux/include)
+
+find_library(CUSOLVERMP_LIBRARY
+  NAMES cusolverMp
+  HINTS
+    ${CUDAToolkit_LIBRARY_DIR}
+    ${CUDAToolkit_LIBRARY_ROOT}
+    ${_DISTQR_CUDA_ROOT_FROM_BIN}
+    ${_CUSOLVERMP_ROOT_HINTS}
+  PATH_SUFFIXES lib lib64 targets/x86_64-linux/lib targets/x86_64-linux/lib/stubs)
+
+if(CUSOLVERMP_INCLUDE_DIR AND CUSOLVERMP_LIBRARY)
+  add_executable(test_cusolvermp_geqrf_ormqr test_cusolvermp_geqrf_ormqr.cu)
+  target_include_directories(test_cusolvermp_geqrf_ormqr PRIVATE ${CMAKE_SOURCE_DIR}/include ${CUSOLVERMP_INCLUDE_DIR})
+  target_link_libraries(test_cusolvermp_geqrf_ormqr PRIVATE
+    GTest::gtest
+    CUDA::cudart
+    MPI::MPI_CXX
+    spdlog::spdlog
+    NCCL::NCCL
+    ${CUSOLVERMP_LIBRARY})
+else()
+  message(STATUS "Skip test_cusolvermp_geqrf_ormqr: cuSOLVERMp not found (need cusolverMp.h and libcusolverMp).")
+endif()
