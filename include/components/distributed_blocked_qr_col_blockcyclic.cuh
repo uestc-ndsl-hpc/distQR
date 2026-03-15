@@ -635,6 +635,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
             if (part.world_size > 1) {
                 if (panel_comm_mode == PanelCommMode::Broadcast) {
+                    // Broadcast receives into d_pack_* on non-owners, so the comm stream must not
+                    // reuse a pack buffer until the previous panel's compute has finished reading
+                    // it. Send/recv mode enforces this in prefetch_recv(); broadcast needs the
+                    // same reuse guard here.
+                    AssertCuda(cudaStreamWaitEvent(comm_stream, events.compute_done[buf], 0),
+                               "cudaStreamWaitEvent comm_stream <- compute_done[buf](bcast)");
                     {
                         auto panel_bcast_w_range = distqr::nvtx::MakeScopedRangef(
                             "panel_bcast_w r=%d b=%d i=%d o=%d", part.rank, block_begin, inner,
