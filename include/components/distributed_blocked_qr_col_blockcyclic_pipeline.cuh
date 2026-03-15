@@ -247,10 +247,6 @@ struct DistributedQrColBlockCyclicPipelineWorkspace {
     T* d_tmp1 = nullptr;
     size_t tmp_elems = 0;
 
-    // Dedicated tail-update workspace for the optional progressive compact
-    // chunk path so it does not alias the main compute tmp buffers.
-    T* d_tail_tmp0 = nullptr;
-    size_t tail_tmp_elems = 0;
 };
 
 struct RowBlockPipelineConfig {
@@ -271,7 +267,7 @@ struct RowBlockPipelineConfig {
     int trail_tile_cols = 0;
 
     TailMode tail_mode = TailMode::Baseline;
-    bool progressive_chained_tail_launch = false;
+    bool early_overlap_launch = false;
     bool skip_tail_update = false;
 };
 
@@ -489,10 +485,9 @@ inline void ValidatePipelineConfig(const DistributedQrColBlockCyclicPipelineWork
         spdlog::error("Pipeline tail_mode is invalid.");
         std::exit(1);
     }
-    if (cfg.progressive_chained_tail_launch &&
-        cfg.tail_mode != RowBlockPipelineConfig::TailMode::Chained) {
-        spdlog::error(
-            "Pipeline progressive_chained_tail_launch requires tail_mode=chained.");
+    if (cfg.early_overlap_launch &&
+        cfg.tail_mode != RowBlockPipelineConfig::TailMode::Overlap) {
+        spdlog::error("Pipeline early_overlap_launch requires tail_mode=overlap.");
         std::exit(1);
     }
 
@@ -517,13 +512,6 @@ inline void ValidatePipelineConfig(const DistributedQrColBlockCyclicPipelineWork
         static_cast<size_t>(block_cols) * static_cast<size_t>(cfg.trail_tile_cols);
     if (ws.tmp_elems < tmp_need) {
         spdlog::error("Pipeline tmp too small (need {} elems, got {}).", tmp_need, ws.tmp_elems);
-        std::exit(1);
-    }
-    if (cfg.progressive_chained_tail_launch &&
-        (!ws.d_tail_tmp0 || ws.tail_tmp_elems < tmp_need)) {
-        spdlog::error(
-            "Pipeline progressive tail tmp too small or null (need {} elems, got {}).",
-            tmp_need, ws.tail_tmp_elems);
         std::exit(1);
     }
 }
@@ -790,6 +778,11 @@ inline size_t RowBlockPackedOffsetElems(int row_block_rows, int kb, int rb_idx) 
     return 2 * RowBlockOffsetElems(row_block_rows, kb, rb_idx);
 }
 
+inline size_t RowBlockActualElems(int block_rows, int kb, int row_block_rows, int rb_idx) {
+    return static_cast<size_t>(RowBlockRowsAt(block_rows, row_block_rows, rb_idx)) *
+           static_cast<size_t>(kb);
+}
+
 struct ChainedChunkPlan {
     int k_chunk_cols = 0;
     int packed_buffer_count = 1;
@@ -892,6 +885,81 @@ inline void UnpackPackedRowBlockToRowMajorCache(int rb_idx,
                "cudaMemcpyAsync packed rowblock W -> rowmajor cache");
     AssertCuda(cudaMemcpyAsync(dst_y, src_y, elems * sizeof(T), cudaMemcpyDeviceToDevice, stream),
                "cudaMemcpyAsync packed rowblock Y -> rowmajor cache");
+}
+
+template <typename T>
+inline void PackCompactRowBlockChunkToPackedBroadcastCache(int rb_idx,
+                                                           int block_rows,
+                                                           int kb,
+                                                           int k_chunk_begin,
+                                                           int kc,
+                                                           int row_block_rows,
+                                                           const T* d_block_w,
+                                                           const T* d_block_y,
+                                                           T* d_rowblock_wy_packed,
+                                                           cudaStream_t stream) {
+    if (kc <= 0) {
+        return;
+    }
+
+    const int row_begin = rb_idx * row_block_rows;
+    const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
+    const size_t packed_off = RowBlockPackedOffsetElems(row_block_rows, kb, rb_idx);
+    const size_t rowblock_elems = RowBlockActualElems(block_rows, kb, row_block_rows, rb_idx);
+    const size_t chunk_off =
+        static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(row_count);
+    T* dst_w = d_rowblock_wy_packed + packed_off + chunk_off;
+    T* dst_y = d_rowblock_wy_packed + packed_off + rowblock_elems + chunk_off;
+    const T* src_w =
+        d_block_w + static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows) + row_begin;
+    const T* src_y =
+        d_block_y + static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(block_rows) + row_begin;
+
+    AssertCuda(cudaMemcpy2DAsync(dst_w, static_cast<size_t>(row_count) * sizeof(T), src_w,
+                                 static_cast<size_t>(block_rows) * sizeof(T),
+                                 static_cast<size_t>(row_count) * sizeof(T), kc,
+                                 cudaMemcpyDeviceToDevice, stream),
+               "cudaMemcpy2DAsync compact rowblock chunk W -> packed cache");
+    AssertCuda(cudaMemcpy2DAsync(dst_y, static_cast<size_t>(row_count) * sizeof(T), src_y,
+                                 static_cast<size_t>(block_rows) * sizeof(T),
+                                 static_cast<size_t>(row_count) * sizeof(T), kc,
+                                 cudaMemcpyDeviceToDevice, stream),
+               "cudaMemcpy2DAsync compact rowblock chunk Y -> packed cache");
+}
+
+template <typename T>
+inline void UnpackPackedRowBlockChunkToRowMajorCache(int rb_idx,
+                                                     int block_rows,
+                                                     int kb,
+                                                     int k_chunk_begin,
+                                                     int kc,
+                                                     int row_block_rows,
+                                                     const T* d_rowblock_wy_packed,
+                                                     T* d_block_w_rowmajor,
+                                                     T* d_block_y_rowmajor,
+                                                     cudaStream_t stream) {
+    if (kc <= 0) {
+        return;
+    }
+
+    const int row_count = RowBlockRowsAt(block_rows, row_block_rows, rb_idx);
+    const size_t packed_off = RowBlockPackedOffsetElems(row_block_rows, kb, rb_idx);
+    const size_t rowmajor_off = RowBlockOffsetElems(row_block_rows, kb, rb_idx);
+    const size_t rowblock_elems = RowBlockActualElems(block_rows, kb, row_block_rows, rb_idx);
+    const size_t chunk_off =
+        static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(row_count);
+    const size_t chunk_elems = static_cast<size_t>(row_count) * static_cast<size_t>(kc);
+    const T* src_w = d_rowblock_wy_packed + packed_off + chunk_off;
+    const T* src_y = d_rowblock_wy_packed + packed_off + rowblock_elems + chunk_off;
+    T* dst_w = d_block_w_rowmajor + rowmajor_off + chunk_off;
+    T* dst_y = d_block_y_rowmajor + rowmajor_off + chunk_off;
+
+    AssertCuda(cudaMemcpyAsync(dst_w, src_w, chunk_elems * sizeof(T), cudaMemcpyDeviceToDevice,
+                               stream),
+               "cudaMemcpyAsync packed rowblock chunk W -> rowmajor cache");
+    AssertCuda(cudaMemcpyAsync(dst_y, src_y, chunk_elems * sizeof(T), cudaMemcpyDeviceToDevice,
+                               stream),
+               "cudaMemcpyAsync packed rowblock chunk Y -> rowmajor cache");
 }
 
 template <typename T>
@@ -1083,6 +1151,116 @@ inline void TailUpdateColTileFromRowBlockCache(cublasHandle_t tail_cublas_handle
 }
 
 template <typename T>
+inline void LaunchTailUpdateFromRowBlockCache(
+    cublasHandle_t tail_cublas_handle,
+    const ColBlockCyclicPartition& part,
+    int block_begin,
+    int block_end,
+    int n,
+    int block_rows,
+    int kb,
+    const RowBlockPipelineConfig& pipeline_cfg,
+    const T* d_block_w_rowmajor,
+    const T* d_block_y_rowmajor,
+    T* d_A_local,
+    int lda_local,
+    T* d_tmp0,
+    T* d_tmp1,
+    size_t tmp_elems,
+    cudaStream_t tail_acc_stream,
+    cudaStream_t compute_stream,
+    const std::vector<cudaEvent_t>& rowblock_comm_done,
+    cudaEvent_t tail_update_done,
+    PhaseProfile* phase_profile) {
+    if (pipeline_cfg.tail_mode == RowBlockPipelineConfig::TailMode::Chained) {
+        spdlog::error("LaunchTailUpdateFromRowBlockCache does not support chained tail mode.");
+        std::exit(1);
+    }
+
+    const int row_block_rows = std::max(1, pipeline_cfg.row_block_rows);
+    const int row_block_count = RowBlockCount(block_rows, row_block_rows);
+    const bool self_has_tail = RankHasColsAfter(part, part.rank, block_end);
+    if (!self_has_tail) {
+        if (row_block_count > 0) {
+            AssertCuda(cudaStreamWaitEvent(compute_stream,
+                                           rowblock_comm_done[row_block_count - 1], 0),
+                       "cudaStreamWaitEvent compute_stream <- rowblock_comm_done[last]");
+        }
+        return;
+    }
+
+    const bool overlap_tail =
+        pipeline_cfg.tail_mode == RowBlockPipelineConfig::TailMode::Overlap;
+    if (!overlap_tail && row_block_count > 0) {
+        const size_t tail_wait_idx =
+            BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, tail_acc_stream);
+        AssertCuda(cudaStreamWaitEvent(tail_acc_stream, rowblock_comm_done[row_block_count - 1], 0),
+                   "cudaStreamWaitEvent tail_acc_stream <- rowblock_comm_done[last]");
+        EndPhaseInterval(phase_profile, tail_wait_idx, tail_acc_stream);
+    }
+
+    struct TailTileTask {
+        T* a_tile = nullptr;
+        int cols_tile = 0;
+    };
+    std::vector<TailTileTask> tail_tiles;
+    const LocalColRange local_tail = LocalColRangeForInterval(part, block_end, n);
+    const int local_tail_cols = local_tail.cols;
+    if (local_tail_cols > 0) {
+        const int target_cols = std::min(pipeline_cfg.trail_tile_cols, local_tail_cols);
+        T* a_tail = d_A_local + static_cast<size_t>(local_tail.local_begin) * lda_local;
+        for (int col_off = 0; col_off < local_tail_cols; col_off += target_cols) {
+            const int cols_tile = std::min(target_cols, local_tail_cols - col_off);
+            tail_tiles.push_back({a_tail + static_cast<size_t>(col_off) * lda_local, cols_tile});
+        }
+    }
+
+    T* tmp_buffers[2] = {d_tmp0, d_tmp1};
+    if (overlap_tail) {
+        if (!tail_tiles.empty()) {
+            TailUpdateColTileFromRowBlockCache(
+                tail_cublas_handle, d_block_w_rowmajor, d_block_y_rowmajor, block_begin, block_rows,
+                kb, row_block_rows, tail_tiles.front().a_tile, lda_local,
+                tail_tiles.front().cols_tile, tmp_buffers[0], tmp_elems, tail_acc_stream, true,
+                rowblock_comm_done, phase_profile);
+        }
+        if (tail_tiles.size() > 1 && row_block_count > 0) {
+            const size_t tail_wait_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, tail_acc_stream);
+            AssertCuda(cudaStreamWaitEvent(tail_acc_stream, rowblock_comm_done[row_block_count - 1], 0),
+                       "cudaStreamWaitEvent tail_acc_stream <- rowblock_comm_done[last]");
+            EndPhaseInterval(phase_profile, tail_wait_idx, tail_acc_stream);
+        }
+        for (size_t tile_idx = 1; tile_idx < tail_tiles.size(); ++tile_idx) {
+            const int buf_idx = static_cast<int>(tile_idx % 2);
+            const auto& tile = tail_tiles[tile_idx];
+            TailUpdateColTileFromRowBlockCache(
+                tail_cublas_handle, d_block_w_rowmajor, d_block_y_rowmajor, block_begin, block_rows,
+                kb, row_block_rows, tile.a_tile, lda_local, tile.cols_tile, tmp_buffers[buf_idx],
+                tmp_elems, tail_acc_stream, false, rowblock_comm_done, phase_profile);
+        }
+    } else {
+        for (const auto& tile : tail_tiles) {
+            TailUpdateColTileFromRowBlockCache(
+                tail_cublas_handle, d_block_w_rowmajor, d_block_y_rowmajor, block_begin, block_rows,
+                kb, row_block_rows, tile.a_tile, lda_local, tile.cols_tile, d_tmp0, tmp_elems,
+                tail_acc_stream, false, rowblock_comm_done, phase_profile);
+        }
+    }
+
+    if (phase_profile && local_tail_cols > 0) {
+        phase_profile->tail_update_flops += 4.0 * static_cast<double>(block_rows) *
+                                            static_cast<double>(kb) *
+                                            static_cast<double>(local_tail_cols);
+    }
+
+    AssertCuda(cudaEventRecord(tail_update_done, tail_acc_stream),
+               "cudaEventRecord tail_update_done");
+    AssertCuda(cudaStreamWaitEvent(compute_stream, tail_update_done, 0),
+               "cudaStreamWaitEvent compute_stream <- tail_update_done");
+}
+
+template <typename T>
 inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                                        ncclComm_t nccl_comm,
                                        const ColBlockCyclicPartition& part,
@@ -1108,8 +1286,6 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
     const int block_owner = OwnerOfPanel(block_begin, part);
     const int row_block_rows = std::max(1, pipeline_cfg.row_block_rows);
     const int row_block_count = RowBlockCount(block_rows, row_block_rows);
-    const bool self_has_tail = RankHasColsAfter(part, part.rank, block_end);
-    const bool overlap_tail = pipeline_cfg.tail_mode == RowBlockPipelineConfig::TailMode::Overlap;
     const bool chained_tail = pipeline_cfg.tail_mode == RowBlockPipelineConfig::TailMode::Chained;
 
     const size_t rowmajor_need = static_cast<size_t>(block_rows) * static_cast<size_t>(kb);
@@ -1248,32 +1424,29 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
                        "cudaEventRecord rowblock_comm_done");
         }
 
-        if (!self_has_tail) {
-            if (row_block_count > 0) {
-                AssertCuda(cudaStreamWaitEvent(compute_stream,
-                                               events.rowblock_comm_done[row_block_count - 1], 0),
-                           "cudaStreamWaitEvent compute_stream <- rowblock_comm_done[last]");
-            }
-            return;
+        LaunchTailUpdateFromRowBlockCache(
+            events.tail_acc_cublas_handle, part, block_begin, block_end, n, block_rows, kb,
+            pipeline_cfg, ws->d_block_w_rowmajor, ws->d_block_y_rowmajor, d_A_local, lda_local,
+            ws->d_tmp0, ws->d_tmp1, ws->tmp_elems, events.tail_acc_stream, compute_stream,
+            events.rowblock_comm_done, events.tail_update_done, phase_profile);
+        if (row_block_count > 0) {
+            AssertCuda(
+                cudaStreamWaitEvent(compute_stream, events.rowblock_comm_done[row_block_count - 1], 0),
+                "cudaStreamWaitEvent compute_stream <- rowblock_comm_done[last]");
         }
+        return;
     }
 
-    if (!overlap_tail && !chained_tail && row_block_count > 0) {
-        const size_t tail_wait_idx =
-            BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, events.tail_acc_stream);
-        AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream,
-                                       events.rowblock_comm_done[row_block_count - 1], 0),
-                   "cudaStreamWaitEvent tail_acc_stream <- rowblock_comm_done[last]");
-        EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
-    }
-
+    int chained_k_chunk_cols = 0;
+    int chained_packed_buffer_count = 1;
+    const bool self_has_tail = RankHasColsAfter(part, part.rank, block_end);
+    const LocalColRange local_tail = LocalColRangeForInterval(part, block_end, n);
+    const int local_tail_cols = local_tail.cols;
     struct TailTileTask {
         T* a_tile = nullptr;
         int cols_tile = 0;
     };
     std::vector<TailTileTask> tail_tiles;
-    const LocalColRange local_tail = LocalColRangeForInterval(part, block_end, n);
-    const int local_tail_cols = local_tail.cols;
     if (local_tail_cols > 0) {
         const int target_cols = std::min(pipeline_cfg.trail_tile_cols, local_tail_cols);
         T* a_tail = d_A_local + static_cast<size_t>(local_tail.local_begin) * lda_local;
@@ -1283,124 +1456,81 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         }
     }
 
-    int chained_k_chunk_cols = 0;
-    int chained_packed_buffer_count = 1;
-    if (chained_tail) {
-        const ChainedChunkPlan chunk_plan =
-            MakeChainedChunkPlan(part.block_cols, block_rows, kb, pipeline_cfg.update_tile_cols);
-        chained_k_chunk_cols = chunk_plan.k_chunk_cols;
-        chained_packed_buffer_count = chunk_plan.packed_buffer_count;
-        const size_t packed_buffer_stride = chunk_plan.packed_buffer_stride;
+    const ChainedChunkPlan chunk_plan =
+        MakeChainedChunkPlan(part.block_cols, block_rows, kb, pipeline_cfg.update_tile_cols);
+    chained_k_chunk_cols = chunk_plan.k_chunk_cols;
+    chained_packed_buffer_count = chunk_plan.packed_buffer_count;
+    const size_t packed_buffer_stride = chunk_plan.packed_buffer_stride;
 
-        for (int k_chunk_begin = 0, chunk_idx = 0; k_chunk_begin < kb;
-             k_chunk_begin += chained_k_chunk_cols, ++chunk_idx) {
-            const int kc = std::min(chained_k_chunk_cols, kb - k_chunk_begin);
-            const int buf_idx = chunk_idx % chained_packed_buffer_count;
-            T* d_wy_packed = ws->d_rowblock_wy_packed +
-                             static_cast<size_t>(buf_idx) * packed_buffer_stride;
-            const size_t elems = static_cast<size_t>(block_rows) * static_cast<size_t>(kc);
-            const T* chunk_w = ws->d_block_w + static_cast<size_t>(k_chunk_begin) * block_rows;
-            const T* chunk_y = ws->d_block_y + static_cast<size_t>(k_chunk_begin) * block_rows;
-            const T* recv_w = d_wy_packed;
-            const T* recv_y = d_wy_packed + elems;
+    for (int k_chunk_begin = 0, chunk_idx = 0; k_chunk_begin < kb;
+         k_chunk_begin += chained_k_chunk_cols, ++chunk_idx) {
+        const int kc = std::min(chained_k_chunk_cols, kb - k_chunk_begin);
+        const int buf_idx = chunk_idx % chained_packed_buffer_count;
+        T* d_wy_packed = ws->d_rowblock_wy_packed +
+                         static_cast<size_t>(buf_idx) * packed_buffer_stride;
+        const size_t elems = static_cast<size_t>(block_rows) * static_cast<size_t>(kc);
+        const T* chunk_w = ws->d_block_w + static_cast<size_t>(k_chunk_begin) * block_rows;
+        const T* chunk_y = ws->d_block_y + static_cast<size_t>(k_chunk_begin) * block_rows;
+        const T* recv_w = d_wy_packed;
+        const T* recv_y = d_wy_packed + elems;
 
-            if (part.rank == block_owner) {
-                AssertCuda(cudaStreamWaitEvent(events.rowblock_pack_stream,
-                                               events.chunk_comm_done[buf_idx], 0),
-                           "cudaStreamWaitEvent rowblock_pack_stream <- chunk_comm_done");
-                const size_t pack_idx =
-                    BeginPhaseInterval(phase_profile, PhaseKind::RowBlockPack,
-                                       events.rowblock_pack_stream);
-                PackCompactBlockChunkToPackedBroadcastCache(block_rows, kc, chunk_w, chunk_y,
-                                                            d_wy_packed,
-                                                            events.rowblock_pack_stream);
-                EndPhaseInterval(phase_profile, pack_idx, events.rowblock_pack_stream);
-                AssertCuda(cudaEventRecord(events.chunk_pack_ready[buf_idx],
-                                           events.rowblock_pack_stream),
-                           "cudaEventRecord chunk_pack_ready");
-                AssertCuda(cudaStreamWaitEvent(comm_stream, events.chunk_pack_ready[buf_idx], 0),
-                           "cudaStreamWaitEvent comm_stream <- chunk_pack_ready");
-            } else if (self_has_tail) {
-                AssertCuda(cudaStreamWaitEvent(comm_stream, events.chunk_compute_done[buf_idx], 0),
-                           "cudaStreamWaitEvent comm_stream <- chunk_compute_done");
-            }
-
-            if (block_receivers > 0) {
-                const size_t comm_idx =
-                    BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
-                AssertNccl(ncclBroadcast(d_wy_packed, d_wy_packed, 2 * elems, nccl_type,
-                                         block_owner, nccl_comm, comm_stream),
-                           "ncclBroadcast pipeline packed compact WY(chunk)");
-                EndPhaseInterval(phase_profile, comm_idx, comm_stream);
-                if (comm_profile) {
-                    comm_profile->bytes +=
-                        2ULL * elems * sizeof(T) * static_cast<size_t>(block_receivers);
-                }
-            }
-            AssertCuda(cudaEventRecord(events.chunk_comm_done[buf_idx], comm_stream),
-                       "cudaEventRecord chunk_comm_done");
-
-            if (!self_has_tail) {
-                continue;
-            }
-
-            const T* source_w = chunk_w;
-            const T* source_y = chunk_y;
-            if (part.rank != block_owner) {
-                const size_t tail_wait_idx =
-                    BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait,
-                                       events.tail_acc_stream);
-                AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream,
-                                               events.chunk_comm_done[buf_idx], 0),
-                           "cudaStreamWaitEvent tail_acc_stream <- chunk_comm_done");
-                EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
-                source_w = recv_w;
-                source_y = recv_y;
-            }
-
-            for (const auto& tile : tail_tiles) {
-                TailUpdateCompactBlockChunkToSegment(
-                    events.tail_acc_cublas_handle, block_begin, block_rows, kc, tile.cols_tile,
-                    source_w, source_y, tile.a_tile, lda_local, ws->d_tmp0, ws->tmp_elems,
-                    events.tail_acc_stream, phase_profile);
-            }
-            AssertCuda(cudaEventRecord(events.chunk_compute_done[buf_idx], events.tail_acc_stream),
-                       "cudaEventRecord chunk_compute_done");
+        if (part.rank == block_owner) {
+            AssertCuda(cudaStreamWaitEvent(events.rowblock_pack_stream,
+                                           events.chunk_comm_done[buf_idx], 0),
+                       "cudaStreamWaitEvent rowblock_pack_stream <- chunk_comm_done");
+            const size_t pack_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::RowBlockPack,
+                                   events.rowblock_pack_stream);
+            PackCompactBlockChunkToPackedBroadcastCache(block_rows, kc, chunk_w, chunk_y, d_wy_packed,
+                                                        events.rowblock_pack_stream);
+            EndPhaseInterval(phase_profile, pack_idx, events.rowblock_pack_stream);
+            AssertCuda(cudaEventRecord(events.chunk_pack_ready[buf_idx], events.rowblock_pack_stream),
+                       "cudaEventRecord chunk_pack_ready");
+            AssertCuda(cudaStreamWaitEvent(comm_stream, events.chunk_pack_ready[buf_idx], 0),
+                       "cudaStreamWaitEvent comm_stream <- chunk_pack_ready");
+        } else if (self_has_tail) {
+            AssertCuda(cudaStreamWaitEvent(comm_stream, events.chunk_compute_done[buf_idx], 0),
+                       "cudaStreamWaitEvent comm_stream <- chunk_compute_done");
         }
-    } else if (overlap_tail) {
-        T* tmp_buffers[2] = {ws->d_tmp0, ws->d_tmp1};
-        if (!tail_tiles.empty()) {
-            TailUpdateColTileFromRowBlockCache(
-                events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, ws->d_block_y_rowmajor,
-                block_begin, block_rows, kb, row_block_rows, tail_tiles.front().a_tile, lda_local,
-                tail_tiles.front().cols_tile, tmp_buffers[0], ws->tmp_elems,
-                events.tail_acc_stream, true, events.rowblock_comm_done, phase_profile);
+
+        if (block_receivers > 0) {
+            const size_t comm_idx = BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+            AssertNccl(ncclBroadcast(d_wy_packed, d_wy_packed, 2 * elems, nccl_type, block_owner,
+                                     nccl_comm, comm_stream),
+                       "ncclBroadcast pipeline packed compact WY(chunk)");
+            EndPhaseInterval(phase_profile, comm_idx, comm_stream);
+            if (comm_profile) {
+                comm_profile->bytes +=
+                    2ULL * elems * sizeof(T) * static_cast<size_t>(block_receivers);
+            }
         }
-        if (tail_tiles.size() > 1 && row_block_count > 0) {
+        AssertCuda(cudaEventRecord(events.chunk_comm_done[buf_idx], comm_stream),
+                   "cudaEventRecord chunk_comm_done");
+
+        if (!self_has_tail) {
+            continue;
+        }
+
+        const T* source_w = chunk_w;
+        const T* source_y = chunk_y;
+        if (part.rank != block_owner) {
             const size_t tail_wait_idx =
                 BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, events.tail_acc_stream);
-            AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream,
-                                           events.rowblock_comm_done[row_block_count - 1], 0),
-                       "cudaStreamWaitEvent tail_acc_stream <- rowblock_comm_done[last]");
+            AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream, events.chunk_comm_done[buf_idx], 0),
+                       "cudaStreamWaitEvent tail_acc_stream <- chunk_comm_done");
             EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
+            source_w = recv_w;
+            source_y = recv_y;
         }
-        for (size_t tile_idx = 1; tile_idx < tail_tiles.size(); ++tile_idx) {
-            const int buf_idx = static_cast<int>(tile_idx % 2);
-            const auto& tile = tail_tiles[tile_idx];
-            TailUpdateColTileFromRowBlockCache(
-                events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, ws->d_block_y_rowmajor,
-                block_begin, block_rows, kb, row_block_rows, tile.a_tile, lda_local,
-                tile.cols_tile, tmp_buffers[buf_idx], ws->tmp_elems, events.tail_acc_stream,
-                false, events.rowblock_comm_done, phase_profile);
-        }
-    } else {
+
         for (const auto& tile : tail_tiles) {
-            TailUpdateColTileFromRowBlockCache(
-                events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, ws->d_block_y_rowmajor,
-                block_begin, block_rows, kb, row_block_rows, tile.a_tile, lda_local, tile.cols_tile,
-                ws->d_tmp0, ws->tmp_elems, events.tail_acc_stream, false, events.rowblock_comm_done,
-                phase_profile);
+            TailUpdateCompactBlockChunkToSegment(
+                events.tail_acc_cublas_handle, block_begin, block_rows, kc, tile.cols_tile, source_w,
+                source_y, tile.a_tile, lda_local, ws->d_tmp0, ws->tmp_elems,
+                events.tail_acc_stream, phase_profile);
         }
+        AssertCuda(cudaEventRecord(events.chunk_compute_done[buf_idx], events.tail_acc_stream),
+                   "cudaEventRecord chunk_compute_done");
     }
 
     if (phase_profile && local_tail_cols > 0) {
@@ -1415,17 +1545,11 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         AssertCuda(cudaStreamWaitEvent(compute_stream, events.tail_update_done, 0),
                    "cudaStreamWaitEvent compute_stream <- tail_update_done");
     }
-    if (chained_tail) {
-        const int final_buf_idx =
-            ((kb + chained_k_chunk_cols - 1) / chained_k_chunk_cols - 1) %
-            chained_packed_buffer_count;
-        AssertCuda(cudaStreamWaitEvent(compute_stream, events.chunk_comm_done[final_buf_idx], 0),
-                   "cudaStreamWaitEvent compute_stream <- chunk_comm_done[last]");
-    } else if (row_block_count > 0) {
-        AssertCuda(
-            cudaStreamWaitEvent(compute_stream, events.rowblock_comm_done[row_block_count - 1], 0),
-            "cudaStreamWaitEvent compute_stream <- rowblock_comm_done[last]");
-    }
+    const int final_buf_idx =
+        ((kb + chained_k_chunk_cols - 1) / chained_k_chunk_cols - 1) %
+        chained_packed_buffer_count;
+    AssertCuda(cudaStreamWaitEvent(compute_stream, events.chunk_comm_done[final_buf_idx], 0),
+               "cudaStreamWaitEvent compute_stream <- chunk_comm_done[last]");
 }
 
 template <typename T>
@@ -1478,75 +1602,52 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
 
     AssertCublas(cublasSetStream(cublas_handle, compute_stream), "cublasSetStream(compute_stream)");
 
-    struct ProgressiveChainedTailEvents {
+    struct EarlyOverlapTailEvents {
         bool initialized = false;
-        cudaStream_t pack_stream = nullptr;
         cudaStream_t tail_acc_stream = nullptr;
         cublasHandle_t tail_acc_cublas_handle = nullptr;
         cudaEvent_t tail_update_done = nullptr;
-        cudaEvent_t chunk_ready[2] = {nullptr, nullptr};
-        cudaEvent_t chunk_pack_ready[2] = {nullptr, nullptr};
-        cudaEvent_t chunk_comm_done[2] = {nullptr, nullptr};
-        cudaEvent_t chunk_compute_done[2] = {nullptr, nullptr};
+        cudaEvent_t block_cols_ready = nullptr;
+        std::vector<cudaEvent_t> rowblock_comm_done;
     };
-    static ProgressiveChainedTailEvents progressive_events;
-    if (!progressive_events.initialized) {
-        AssertCuda(cudaStreamCreateWithFlags(&progressive_events.pack_stream, cudaStreamNonBlocking),
-                   "cudaStreamCreate progressive pack_stream");
-        AssertCuda(
-            cudaStreamCreateWithFlags(&progressive_events.tail_acc_stream, cudaStreamNonBlocking),
-            "cudaStreamCreate progressive tail_acc_stream");
-        AssertCublas(cublasCreate(&progressive_events.tail_acc_cublas_handle),
-                     "cublasCreate progressive tail_acc_cublas_handle");
-        AssertCublas(cublasSetStream(progressive_events.tail_acc_cublas_handle,
-                                     progressive_events.tail_acc_stream),
-                     "cublasSetStream(progressive tail_acc_stream)");
-        AssertCuda(cudaEventCreateWithFlags(&progressive_events.tail_update_done,
+    static EarlyOverlapTailEvents early_overlap_events;
+    if (!early_overlap_events.initialized) {
+        AssertCuda(cudaStreamCreateWithFlags(&early_overlap_events.tail_acc_stream,
+                                             cudaStreamNonBlocking),
+                   "cudaStreamCreate early_overlap tail_acc_stream");
+        AssertCublas(cublasCreate(&early_overlap_events.tail_acc_cublas_handle),
+                     "cublasCreate early_overlap tail_acc_cublas_handle");
+        AssertCublas(cublasSetStream(early_overlap_events.tail_acc_cublas_handle,
+                                     early_overlap_events.tail_acc_stream),
+                     "cublasSetStream(early_overlap tail_acc_stream)");
+        AssertCuda(cudaEventCreateWithFlags(&early_overlap_events.tail_update_done,
                                             cudaEventDisableTiming),
-                   "cudaEventCreate progressive tail_update_done");
-        for (int i = 0; i < 2; ++i) {
-            AssertCuda(cudaEventCreateWithFlags(&progressive_events.chunk_ready[i],
-                                                cudaEventDisableTiming),
-                       "cudaEventCreate progressive chunk_ready");
-            AssertCuda(cudaEventCreateWithFlags(&progressive_events.chunk_pack_ready[i],
-                                                cudaEventDisableTiming),
-                       "cudaEventCreate progressive chunk_pack_ready");
-            AssertCuda(cudaEventCreateWithFlags(&progressive_events.chunk_comm_done[i],
-                                                cudaEventDisableTiming),
-                       "cudaEventCreate progressive chunk_comm_done");
-            AssertCuda(cudaEventCreateWithFlags(&progressive_events.chunk_compute_done[i],
-                                                cudaEventDisableTiming),
-                       "cudaEventCreate progressive chunk_compute_done");
-        }
-        progressive_events.initialized = true;
+                   "cudaEventCreate early_overlap tail_update_done");
+        AssertCuda(cudaEventCreateWithFlags(&early_overlap_events.block_cols_ready,
+                                            cudaEventDisableTiming),
+                   "cudaEventCreate early_overlap block_cols_ready");
+        early_overlap_events.initialized = true;
     }
+
+    const ncclDataType_t nccl_type = NcclType<T>();
 
     for (int owner_block_begin = 0; owner_block_begin < n; owner_block_begin += part.block_cols) {
         const int owner_block_end = std::min(owner_block_begin + part.block_cols, n);
         const int owner_block_k = owner_block_end - owner_block_begin;
         const int owner_block_rows = m - owner_block_begin;
         const int block_owner = OwnerOfPanel(owner_block_begin, part);
-        const bool progressive_chained_tail =
-            cfg.progressive_chained_tail_launch &&
-            cfg.tail_mode == RowBlockPipelineConfig::TailMode::Chained &&
+        const bool early_overlap_tail =
+            cfg.early_overlap_launch &&
+            cfg.tail_mode == RowBlockPipelineConfig::TailMode::Overlap &&
             owner_block_end < n && !cfg.skip_tail_update;
 
-        int progressive_block_receivers = 0;
-        LocalColRange progressive_local_tail{};
-        int progressive_local_tail_cols = 0;
-        int progressive_chunk_cols = 0;
-        int progressive_packed_buffer_count = 1;
-        size_t progressive_packed_buffer_stride = 0;
-        int progressive_flushed_block_cols = 0;
-        int progressive_flushed_chunks = 0;
+        int early_overlap_block_receivers = 0;
+        int early_overlap_row_block_rows = std::max(1, cfg.row_block_rows);
+        int early_overlap_row_block_count =
+            RowBlockCount(owner_block_rows, early_overlap_row_block_rows);
+        int early_overlap_flushed_block_cols = 0;
 
-        struct ProgressiveTailTileTask {
-            T* a_tile = nullptr;
-            int cols_tile = 0;
-        };
-        std::vector<ProgressiveTailTileTask> progressive_tail_tiles;
-
-        if (progressive_chained_tail) {
+        if (early_overlap_tail) {
             if (part.world_size > 1) {
                 for (int r = 0; r < part.world_size; ++r) {
                     if (r == block_owner) {
@@ -1555,167 +1656,98 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
                     if (!RankHasColsAfter(part, r, owner_block_end)) {
                         continue;
                     }
-                    ++progressive_block_receivers;
+                    ++early_overlap_block_receivers;
                 }
             }
-
-            progressive_local_tail = LocalColRangeForInterval(part, owner_block_end, n);
-            progressive_local_tail_cols = progressive_local_tail.cols;
-            if (progressive_local_tail_cols > 0) {
-                const int target_cols = std::min(cfg.trail_tile_cols, progressive_local_tail_cols);
-                T* a_tail =
-                    d_A_local + static_cast<size_t>(progressive_local_tail.local_begin) * lda_local;
-                for (int col_off = 0; col_off < progressive_local_tail_cols;
-                     col_off += target_cols) {
-                    const int cols_tile =
-                        std::min(target_cols, progressive_local_tail_cols - col_off);
-                    progressive_tail_tiles.push_back(
-                        {a_tail + static_cast<size_t>(col_off) * lda_local, cols_tile});
-                }
-            }
-
-            const ChainedChunkPlan chunk_plan =
-                MakeChainedChunkPlan(part.block_cols, owner_block_rows, owner_block_k,
-                                     cfg.update_tile_cols);
-            progressive_chunk_cols = chunk_plan.k_chunk_cols;
-            progressive_packed_buffer_count = chunk_plan.packed_buffer_count;
-            progressive_packed_buffer_stride = chunk_plan.packed_buffer_stride;
-
-            AssertCuda(
-                cudaEventRecord(progressive_events.tail_update_done,
-                                progressive_events.tail_acc_stream),
-                "cudaEventRecord progressive tail_update_done(reset)");
-            for (int i = 0; i < 2; ++i) {
-                AssertCuda(cudaEventRecord(progressive_events.chunk_comm_done[i], comm_stream),
-                           "cudaEventRecord progressive chunk_comm_done(reset)");
-                AssertCuda(
-                    cudaEventRecord(progressive_events.chunk_compute_done[i],
-                                    progressive_events.tail_acc_stream),
-                    "cudaEventRecord progressive chunk_compute_done(reset)");
+            while (static_cast<int>(early_overlap_events.rowblock_comm_done.size()) <
+                   early_overlap_row_block_count) {
+                cudaEvent_t rowblock_comm_done = nullptr;
+                AssertCuda(cudaEventCreateWithFlags(&rowblock_comm_done, cudaEventDisableTiming),
+                           "cudaEventCreate early_overlap rowblock_comm_done");
+                early_overlap_events.rowblock_comm_done.push_back(rowblock_comm_done);
             }
         }
 
-        auto flush_progressive_chunk = [&](int ready_block_cols) {
-            if (!progressive_chained_tail) {
+        auto flush_early_overlap = [&](int ready_block_cols, bool flush_remainder = false) {
+            if (!early_overlap_tail) {
                 return;
             }
-            while (progressive_flushed_block_cols < ready_block_cols) {
-                const int k_chunk_begin = progressive_flushed_block_cols;
+            int flush_target = std::min(ready_block_cols, owner_block_k);
+            if (!flush_remainder) {
+                flush_target = (flush_target / cfg.update_tile_cols) * cfg.update_tile_cols;
+            }
+            if (flush_target <= early_overlap_flushed_block_cols) {
+                return;
+            }
+            if (part.rank == block_owner) {
+                AssertCuda(cudaStreamWaitEvent(comm_stream, early_overlap_events.block_cols_ready, 0),
+                           "cudaStreamWaitEvent comm_stream <- early_overlap block_cols_ready");
+            }
+            while (early_overlap_flushed_block_cols < flush_target) {
+                const int k_chunk_begin = early_overlap_flushed_block_cols;
                 const int kc =
-                    std::min(progressive_chunk_cols, ready_block_cols - progressive_flushed_block_cols);
-                const int chunk_idx = progressive_flushed_chunks++;
-                const int buf_idx = chunk_idx % progressive_packed_buffer_count;
-                const size_t elems =
-                    static_cast<size_t>(owner_block_rows) * static_cast<size_t>(kc);
-                const T* chunk_w =
-                    ws->d_block_w + static_cast<size_t>(k_chunk_begin) * owner_block_rows;
-                const T* chunk_y =
-                    ws->d_block_y + static_cast<size_t>(k_chunk_begin) * owner_block_rows;
-                T* d_wy_packed = ws->d_rowblock_wy_packed +
-                                 static_cast<size_t>(buf_idx) * progressive_packed_buffer_stride;
-                T* recv_w = d_wy_packed;
-                T* recv_y = d_wy_packed + elems;
+                    std::min(cfg.update_tile_cols, flush_target - early_overlap_flushed_block_cols);
+                for (int rb_idx = 0; rb_idx < early_overlap_row_block_count; ++rb_idx) {
+                    const int row_count =
+                        RowBlockRowsAt(owner_block_rows, early_overlap_row_block_rows, rb_idx);
+                    const size_t chunk_elems =
+                        static_cast<size_t>(row_count) * static_cast<size_t>(kc);
+                    const size_t packed_off =
+                        RowBlockPackedOffsetElems(early_overlap_row_block_rows, owner_block_k, rb_idx);
+                    const size_t rowblock_elems =
+                        RowBlockActualElems(owner_block_rows, owner_block_k,
+                                            early_overlap_row_block_rows, rb_idx);
+                    const size_t chunk_off =
+                        static_cast<size_t>(k_chunk_begin) * static_cast<size_t>(row_count);
+                    T* d_chunk_w = ws->d_rowblock_wy_packed + packed_off + chunk_off;
+                    T* d_chunk_y = ws->d_rowblock_wy_packed + packed_off + rowblock_elems + chunk_off;
 
-                if (part.rank == block_owner) {
-                    AssertCuda(cudaEventRecord(progressive_events.chunk_ready[buf_idx],
-                                               compute_stream),
-                               "cudaEventRecord progressive chunk_ready");
-                    if (progressive_block_receivers > 0) {
-                        AssertCuda(
-                            cudaStreamWaitEvent(progressive_events.pack_stream,
-                                                progressive_events.chunk_comm_done[buf_idx], 0),
-                            "cudaStreamWaitEvent progressive pack_stream <- chunk_comm_done");
-                        AssertCuda(
-                            cudaStreamWaitEvent(progressive_events.pack_stream,
-                                                progressive_events.chunk_ready[buf_idx], 0),
-                            "cudaStreamWaitEvent progressive pack_stream <- chunk_ready");
-                        const size_t pack_idx =
-                            BeginPhaseInterval(phase_profile, PhaseKind::RowBlockPack,
-                                               progressive_events.pack_stream);
-                        PackCompactBlockChunkToPackedBroadcastCache(owner_block_rows, kc, chunk_w,
-                                                                    chunk_y, d_wy_packed,
-                                                                    progressive_events.pack_stream);
-                        EndPhaseInterval(phase_profile, pack_idx, progressive_events.pack_stream);
-                        AssertCuda(cudaEventRecord(progressive_events.chunk_pack_ready[buf_idx],
-                                                   progressive_events.pack_stream),
-                                   "cudaEventRecord progressive chunk_pack_ready");
-                        AssertCuda(cudaStreamWaitEvent(comm_stream,
-                                                       progressive_events.chunk_pack_ready[buf_idx],
-                                                       0),
-                                   "cudaStreamWaitEvent comm_stream <- progressive chunk_pack_ready");
-                    }
-                } else if (progressive_block_receivers > 0 &&
-                           progressive_local_tail_cols > 0) {
-                    AssertCuda(cudaStreamWaitEvent(comm_stream,
-                                                   progressive_events.chunk_compute_done[buf_idx],
-                                                   0),
-                               "cudaStreamWaitEvent comm_stream <- progressive chunk_compute_done");
-                }
-
-                if (progressive_block_receivers > 0) {
-                    T* comm_w = (part.rank == block_owner) ? d_wy_packed : recv_w;
-                    T* comm_y = (part.rank == block_owner) ? (d_wy_packed + elems) : recv_y;
-                    const size_t comm_idx =
-                        BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
-                    AssertNccl(ncclBroadcast(comm_w, comm_w, elems, NcclType<T>(), block_owner,
-                                             nccl_comm, comm_stream),
-                               "ncclBroadcast progressive chained chunk W");
-                    AssertNccl(ncclBroadcast(comm_y, comm_y, elems, NcclType<T>(), block_owner,
-                                             nccl_comm, comm_stream),
-                               "ncclBroadcast progressive chained chunk Y");
-                    EndPhaseInterval(phase_profile, comm_idx, comm_stream);
-                    if (comm_profile) {
-                        comm_profile->bytes +=
-                            2ULL * elems * sizeof(T) *
-                            static_cast<size_t>(progressive_block_receivers);
-                    }
-                }
-                AssertCuda(cudaEventRecord(progressive_events.chunk_comm_done[buf_idx], comm_stream),
-                           "cudaEventRecord progressive chunk_comm_done");
-
-                if (progressive_local_tail_cols > 0) {
-                    const T* source_w = chunk_w;
-                    const T* source_y = chunk_y;
-                    const size_t tail_wait_idx = BeginPhaseInterval(
-                        phase_profile, PhaseKind::TailAccWait, progressive_events.tail_acc_stream);
                     if (part.rank == block_owner) {
-                        AssertCuda(
-                            cudaStreamWaitEvent(progressive_events.tail_acc_stream,
-                                                progressive_events.chunk_ready[buf_idx], 0),
-                            "cudaStreamWaitEvent progressive tail_acc_stream <- chunk_ready");
-                    } else {
-                        AssertCuda(
-                            cudaStreamWaitEvent(progressive_events.tail_acc_stream,
-                                                progressive_events.chunk_comm_done[buf_idx], 0),
-                            "cudaStreamWaitEvent progressive tail_acc_stream <- chunk_comm_done");
-                        source_w = recv_w;
-                        source_y = recv_y;
+                        const size_t pack_idx =
+                            BeginPhaseInterval(phase_profile, PhaseKind::RowBlockPack, comm_stream);
+                        PackCompactRowBlockChunkToPackedBroadcastCache(
+                            rb_idx, owner_block_rows, owner_block_k, k_chunk_begin, kc,
+                            early_overlap_row_block_rows, ws->d_block_w, ws->d_block_y,
+                            ws->d_rowblock_wy_packed, comm_stream);
+                        EndPhaseInterval(phase_profile, pack_idx, comm_stream);
                     }
-                    EndPhaseInterval(phase_profile, tail_wait_idx,
-                                     progressive_events.tail_acc_stream);
 
-                    for (const auto& tile : progressive_tail_tiles) {
-                        TailUpdateCompactBlockChunkToSegment(
-                            progressive_events.tail_acc_cublas_handle, owner_block_begin,
-                            owner_block_rows, kc, tile.cols_tile, source_w, source_y, tile.a_tile,
-                            lda_local, ws->d_tail_tmp0, ws->tail_tmp_elems,
-                            progressive_events.tail_acc_stream, phase_profile);
+                    if (early_overlap_block_receivers > 0) {
+                        const size_t comm_idx =
+                            BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+                        AssertNccl(ncclGroupStart(), "ncclGroupStart early_overlap rowblock chunk");
+                        AssertNccl(ncclBroadcast(d_chunk_w, d_chunk_w, chunk_elems, nccl_type,
+                                                 block_owner, nccl_comm, comm_stream),
+                                   "ncclBroadcast early_overlap rowblock chunk W");
+                        AssertNccl(ncclBroadcast(d_chunk_y, d_chunk_y, chunk_elems, nccl_type,
+                                                 block_owner, nccl_comm, comm_stream),
+                                   "ncclBroadcast early_overlap rowblock chunk Y");
+                        AssertNccl(ncclGroupEnd(), "ncclGroupEnd early_overlap rowblock chunk");
+                        EndPhaseInterval(phase_profile, comm_idx, comm_stream);
+                        if (comm_profile) {
+                            comm_profile->bytes += 2ULL * chunk_elems * sizeof(T) *
+                                                   static_cast<size_t>(early_overlap_block_receivers);
+                        }
                     }
-                    AssertCuda(cudaEventRecord(progressive_events.chunk_compute_done[buf_idx],
-                                               progressive_events.tail_acc_stream),
-                               "cudaEventRecord progressive chunk_compute_done");
-                    if (phase_profile) {
-                        phase_profile->tail_update_flops +=
-                            4.0 * static_cast<double>(owner_block_rows) *
-                            static_cast<double>(kc) *
-                            static_cast<double>(progressive_local_tail_cols);
+
+                    if (part.rank == block_owner || early_overlap_block_receivers > 0) {
+                        const size_t unpack_idx =
+                            BeginPhaseInterval(phase_profile, PhaseKind::RowBlockUnpack, comm_stream);
+                        UnpackPackedRowBlockChunkToRowMajorCache(
+                            rb_idx, owner_block_rows, owner_block_k, k_chunk_begin, kc,
+                            early_overlap_row_block_rows, ws->d_rowblock_wy_packed,
+                            ws->d_block_w_rowmajor, ws->d_block_y_rowmajor, comm_stream);
+                        EndPhaseInterval(phase_profile, unpack_idx, comm_stream);
                     }
-                    AssertCuda(cudaEventRecord(progressive_events.tail_update_done,
-                                               progressive_events.tail_acc_stream),
-                               "cudaEventRecord progressive tail_update_done");
+
+                    if (k_chunk_begin + kc == owner_block_k) {
+                        AssertCuda(
+                            cudaEventRecord(early_overlap_events.rowblock_comm_done[rb_idx], comm_stream),
+                            "cudaEventRecord early_overlap rowblock_comm_done");
+                    }
                 }
 
-                progressive_flushed_block_cols += kc;
+                early_overlap_flushed_block_cols += kc;
             }
         };
 
@@ -1816,6 +1848,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
                                                  ws->tmp_elems);
                     EndPhaseInterval(phase_profile, merge_idx, compute_stream);
 
+                    if (early_overlap_tail) {
+                        AssertCuda(
+                            cudaEventRecord(early_overlap_events.block_cols_ready, compute_stream),
+                            "cudaEventRecord early_overlap block_cols_ready");
+                    }
+
                     SaveOwnerBlockW(owner_block_begin, inner, m, local_panel_col, d_W_local,
                                     lda_local, ws->d_block_w, compute_stream);
 
@@ -1834,25 +1872,28 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
                         });
                 }
 
-                if (progressive_chained_tail) {
-                    flush_progressive_chunk(inner + kPanelWidth - owner_block_begin);
+                if (early_overlap_tail) {
+                    flush_early_overlap(inner + kPanelWidth - owner_block_begin);
                 }
             }
         }
 
-        if (progressive_chained_tail) {
-            if (progressive_flushed_chunks > 0) {
-                const int final_buf_idx =
-                    (progressive_flushed_chunks - 1) % progressive_packed_buffer_count;
-                AssertCuda(
-                    cudaStreamWaitEvent(compute_stream,
-                                        progressive_events.chunk_comm_done[final_buf_idx], 0),
-                    "cudaStreamWaitEvent compute_stream <- progressive chunk_comm_done[last]");
-            }
-            if (progressive_local_tail_cols > 0) {
-                AssertCuda(
-                    cudaStreamWaitEvent(compute_stream, progressive_events.tail_update_done, 0),
-                    "cudaStreamWaitEvent compute_stream <- progressive tail_update_done");
+        if (early_overlap_tail) {
+            flush_early_overlap(owner_block_k, true);
+            LaunchTailUpdateFromRowBlockCache(
+                early_overlap_events.tail_acc_cublas_handle, part, owner_block_begin,
+                owner_block_end, n, owner_block_rows, owner_block_k, cfg,
+                ws->d_block_w_rowmajor, ws->d_block_y_rowmajor, d_A_local, lda_local, ws->d_tmp0,
+                ws->d_tmp1, ws->tmp_elems, early_overlap_events.tail_acc_stream, compute_stream,
+                early_overlap_events.rowblock_comm_done, early_overlap_events.tail_update_done,
+                phase_profile);
+            if (early_overlap_row_block_count > 0) {
+                AssertCuda(cudaStreamWaitEvent(
+                               compute_stream,
+                               early_overlap_events
+                                   .rowblock_comm_done[early_overlap_row_block_count - 1],
+                               0),
+                           "cudaStreamWaitEvent compute_stream <- early_overlap rowblock_comm_done[last]");
             }
         } else {
             StreamedTailUpdateScaffold(cublas_handle, nccl_comm, part, owner_block_begin,

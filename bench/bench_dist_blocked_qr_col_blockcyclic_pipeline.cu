@@ -107,7 +107,7 @@ struct Options {
         distributed_qr_col_blockcyclic_pipeline::RowBlockPipelineConfig::TailMode::Baseline;
     bool row_block_mode_valid = true;
     std::string row_block_mode_value = "baseline";
-    bool progressive_chained_tail_launch = false;
+    bool early_overlap_launch = false;
     bool skip_tail_update = false;
 };
 
@@ -201,8 +201,8 @@ Options ParseArgs(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--rowblock_buffers") == 0 && i + 1 < argc) {
             ++i;
         } else if (std::strncmp(argv[i], "--rowblock_buffers=", 19) == 0) {
-        } else if (std::strcmp(argv[i], "--progressive_chained_tail_launch") == 0) {
-            opts.progressive_chained_tail_launch = true;
+        } else if (std::strcmp(argv[i], "--early_overlap_launch") == 0) {
+            opts.early_overlap_launch = true;
         } else if (std::strcmp(argv[i], "--skip_tail_update") == 0) {
             opts.skip_tail_update = true;
         }
@@ -244,8 +244,6 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     ws.rowblock_wy_packed_elems = 2 * ws.block_elems;
     ws.tmp_elems = static_cast<size_t>(std::max(block_cols, kPanelWidth)) *
                    static_cast<size_t>(std::max(opts.trail_tile_cols, 1));
-    ws.tail_tmp_elems = ws.tmp_elems;
-
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_r_panel, static_cast<size_t>(kPanelWidth) * kPanelWidth * sizeof(T)),
         "cudaMalloc ws.d_r_panel");
@@ -273,9 +271,6 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(T)), "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(
         cudaMalloc(&ws.d_tmp1, ws.tmp_elems * sizeof(T)), "cudaMalloc ws.d_tmp1");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(
-        cudaMalloc(&ws.d_tail_tmp0, ws.tail_tmp_elems * sizeof(T)),
-        "cudaMalloc ws.d_tail_tmp0");
 
     cudaStream_t compute_stream = nullptr;
     cudaStream_t comm_stream = nullptr;
@@ -306,7 +301,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     pipeline_cfg.row_block_rows = opts.row_block_rows;
     pipeline_cfg.trail_tile_cols = opts.trail_tile_cols;
     pipeline_cfg.tail_mode = opts.row_block_mode;
-    pipeline_cfg.progressive_chained_tail_launch = opts.progressive_chained_tail_launch;
+    pipeline_cfg.early_overlap_launch = opts.early_overlap_launch;
     pipeline_cfg.skip_tail_update = opts.skip_tail_update;
 
     auto run_once = [&](distributed_qr_col_blockcyclic_pipeline::CommProfile* comm_profile,
@@ -588,13 +583,13 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic-pipeline] ({}): m={} n={} nb={} "
             "block_cols={} update_tile_cols={} row_block_rows={} trail_tile_cols={} "
-            "row_block_mode={} progressive_chained_tail_launch={} skip_tail_update={} "
+            "row_block_mode={} early_overlap_launch={} skip_tail_update={} "
             "comm_stream_priority={} "
             "(priority_range=[{}, {}]) np={} avg {:.3f} ms overall {:.3f} TFLOP/s",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.update_tile,
             opts.row_block_rows, opts.trail_tile_cols,
             distributed_qr_col_blockcyclic_pipeline::TailModeString(opts.row_block_mode),
-            opts.progressive_chained_tail_launch, opts.skip_tail_update, comm_stream_priority,
+            opts.early_overlap_launch, opts.skip_tail_update, comm_stream_priority,
             stream_priority_high, stream_priority_low, env.size, max_ms, overall_tflops);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
@@ -659,8 +654,6 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                                                         "cudaFree ws.d_rowblock_wy_packed");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
-    distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(ws.d_tail_tmp0),
-                                                        "cudaFree ws.d_tail_tmp0");
 
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(d_A0), "cudaFree d_A0");
     distributed_qr_col_blockcyclic_pipeline::AssertCuda(cudaFree(d_A), "cudaFree d_A");
@@ -757,12 +750,11 @@ int main(int argc, char** argv) {
         finalize_mpi_if_needed(env);
         return 1;
     }
-    if (opts.progressive_chained_tail_launch &&
+    if (opts.early_overlap_launch &&
         opts.row_block_mode !=
-            distributed_qr_col_blockcyclic_pipeline::RowBlockPipelineConfig::TailMode::Chained) {
+            distributed_qr_col_blockcyclic_pipeline::RowBlockPipelineConfig::TailMode::Overlap) {
         if (env.rank == 0) {
-            spdlog::error(
-                "--progressive_chained_tail_launch requires --row_block_mode chained.");
+            spdlog::error("--early_overlap_launch requires --row_block_mode overlap.");
         }
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);
