@@ -1866,10 +1866,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
         }
 
         int early_overlap_block_receivers = 0;
+        const int early_overlap_chunk_cols = std::min(cfg.update_tile_cols, owner_block_k);
         const int early_overlap_chunk_count =
-            (owner_block_k + kPanelWidth - 1) / kPanelWidth;
+            (owner_block_k + early_overlap_chunk_cols - 1) / early_overlap_chunk_cols;
         const bool early_overlap_first_tile =
             early_overlap_tail && part.rank != block_owner && !tail_tiles.empty();
+        int early_overlap_flushed_block_cols = 0;
 
         if (early_overlap_tail) {
             if (part.world_size > 1) {
@@ -1900,6 +1902,79 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
                                        early_overlap_events.tail_acc_stream),
                        "cudaEventRecord early_overlap tail_update_done(reset)");
         }
+
+        auto flush_early_overlap = [&](int ready_block_cols, bool flush_remainder = false) {
+            if (!early_overlap_tail) {
+                return;
+            }
+
+            int flush_target = std::min(ready_block_cols, owner_block_k);
+            if (!flush_remainder) {
+                flush_target =
+                    (flush_target / early_overlap_chunk_cols) * early_overlap_chunk_cols;
+            }
+            if (flush_target <= early_overlap_flushed_block_cols) {
+                return;
+            }
+
+            while (early_overlap_flushed_block_cols < flush_target) {
+                const int k_chunk_begin = early_overlap_flushed_block_cols;
+                const int chunk_idx = k_chunk_begin / early_overlap_chunk_cols;
+                const int kc = std::min(early_overlap_chunk_cols, flush_target - k_chunk_begin);
+                T* d_chunk_w =
+                    ws->d_block_w + static_cast<size_t>(k_chunk_begin) * owner_block_rows;
+
+                if (part.rank == block_owner) {
+                    AssertCuda(cudaEventRecord(early_overlap_events.w_chunk_ready[chunk_idx],
+                                               compute_stream),
+                               "cudaEventRecord early_overlap w_chunk_ready");
+                    AssertCuda(cudaStreamWaitEvent(
+                                   comm_stream, early_overlap_events.w_chunk_ready[chunk_idx], 0),
+                               "cudaStreamWaitEvent comm_stream <- early_overlap w_chunk_ready");
+                }
+
+                if (early_overlap_block_receivers > 0) {
+                    const size_t comm_idx =
+                        BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
+                    AssertNccl(ncclBroadcast(
+                                   d_chunk_w, d_chunk_w,
+                                   static_cast<size_t>(owner_block_rows) *
+                                       static_cast<size_t>(kc),
+                                   nccl_type, block_owner, nccl_comm, comm_stream),
+                               "ncclBroadcast early_overlap compact W chunk");
+                    EndPhaseInterval(phase_profile, comm_idx, comm_stream);
+                    if (comm_profile) {
+                        comm_profile->bytes +=
+                            static_cast<size_t>(owner_block_rows) * static_cast<size_t>(kc) *
+                            sizeof(T) * static_cast<size_t>(early_overlap_block_receivers);
+                    }
+                }
+                AssertCuda(cudaEventRecord(early_overlap_events.w_chunk_comm_done[chunk_idx],
+                                           comm_stream),
+                           "cudaEventRecord early_overlap w_chunk_comm_done");
+
+                if (early_overlap_first_tile) {
+                    const size_t tail_wait_idx = BeginPhaseInterval(
+                        phase_profile, PhaseKind::TailAccWait,
+                        early_overlap_events.tail_acc_stream);
+                    AssertCuda(cudaStreamWaitEvent(
+                                   early_overlap_events.tail_acc_stream,
+                                   early_overlap_events.w_chunk_comm_done[chunk_idx], 0),
+                               "cudaStreamWaitEvent tail_acc_stream <- early_overlap "
+                               "w_chunk_comm_done");
+                    EndPhaseInterval(phase_profile, tail_wait_idx,
+                                     early_overlap_events.tail_acc_stream);
+                    TailAccumulateCompactBlockChunkToTmp(
+                        early_overlap_events.tail_acc_cublas_handle, owner_block_begin,
+                        owner_block_rows, owner_block_k, k_chunk_begin, kc,
+                        tail_tiles.front().cols_tile, d_chunk_w, tail_tiles.front().a_tile,
+                        lda_local, ws->d_tmp1, ws->tmp_elems,
+                        early_overlap_events.tail_acc_stream, phase_profile);
+                }
+
+                early_overlap_flushed_block_cols += kc;
+            }
+        };
 
         // Compact block-WY is the canonical block representation here, so the
         // owner clears it once per outer block and then appends each panel
@@ -2016,73 +2091,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic_pipeline(
                         });
                 }
 
-                if (early_overlap_tail) {
-                    const int k_chunk_begin = inner - owner_block_begin;
-                    const int chunk_idx = k_chunk_begin / kPanelWidth;
-                    const int kc = std::min(kPanelWidth, owner_block_end - inner);
-                    T* d_chunk_w =
-                        ws->d_block_w + static_cast<size_t>(k_chunk_begin) * owner_block_rows;
-
-                    if (part.rank == block_owner) {
-                        AssertCuda(cudaEventRecord(early_overlap_events.w_chunk_ready[chunk_idx],
-                                                   compute_stream),
-                                   "cudaEventRecord early_overlap w_chunk_ready");
-                        AssertCuda(
-                            cudaStreamWaitEvent(comm_stream,
-                                                early_overlap_events.w_chunk_ready[chunk_idx], 0),
-                            "cudaStreamWaitEvent comm_stream <- early_overlap w_chunk_ready");
-                    }
-
-                    if (early_overlap_block_receivers > 0) {
-                        const size_t comm_idx =
-                            BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
-                        AssertNccl(ncclBroadcast(
-                                       d_chunk_w, d_chunk_w,
-                                       static_cast<size_t>(owner_block_rows) *
-                                           static_cast<size_t>(kc),
-                                       nccl_type, block_owner, nccl_comm, comm_stream),
-                                   "ncclBroadcast early_overlap compact W chunk");
-                        EndPhaseInterval(phase_profile, comm_idx, comm_stream);
-                        if (comm_profile) {
-                            comm_profile->bytes +=
-                                static_cast<size_t>(owner_block_rows) *
-                                static_cast<size_t>(kc) * sizeof(T) *
-                                static_cast<size_t>(early_overlap_block_receivers);
-                        }
-                    }
-                    AssertCuda(cudaEventRecord(early_overlap_events.w_chunk_comm_done[chunk_idx],
-                                               comm_stream),
-                               "cudaEventRecord early_overlap w_chunk_comm_done");
-
-                    if (early_overlap_first_tile) {
-                        const size_t tail_wait_idx = BeginPhaseInterval(
-                            phase_profile, PhaseKind::TailAccWait,
-                            early_overlap_events.tail_acc_stream);
-                        AssertCuda(
-                            cudaStreamWaitEvent(early_overlap_events.tail_acc_stream,
-                                                early_overlap_events.w_chunk_comm_done[chunk_idx], 0),
-                            "cudaStreamWaitEvent tail_acc_stream <- early_overlap w_chunk_comm_done");
-                        EndPhaseInterval(phase_profile, tail_wait_idx,
-                                         early_overlap_events.tail_acc_stream);
-                        TailAccumulateCompactBlockChunkToTmp(
-                            early_overlap_events.tail_acc_cublas_handle, owner_block_begin,
-                            owner_block_rows, owner_block_k, k_chunk_begin, kc,
-                            tail_tiles.front().cols_tile, d_chunk_w, tail_tiles.front().a_tile,
-                            lda_local, ws->d_tmp1, ws->tmp_elems,
-                            early_overlap_events.tail_acc_stream, phase_profile);
-                    }
-                }
+                flush_early_overlap(inner + kPanelWidth - owner_block_begin);
             }
         }
 
         if (early_overlap_tail) {
-            const int last_chunk_idx = early_overlap_chunk_count - 1;
-            if (part.rank == block_owner && last_chunk_idx >= 0) {
-                AssertCuda(
-                    cudaStreamWaitEvent(comm_stream,
-                                        early_overlap_events.w_chunk_ready[last_chunk_idx], 0),
-                    "cudaStreamWaitEvent comm_stream <- early_overlap last w_chunk_ready(Y)");
-            }
+            flush_early_overlap(owner_block_k, true);
             if (early_overlap_block_receivers > 0) {
                 const size_t comm_idx =
                     BeginPhaseInterval(phase_profile, PhaseKind::Comm, comm_stream);
