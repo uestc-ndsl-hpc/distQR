@@ -31,4 +31,4 @@ target_link_libraries(test_dist_blocked_qr_col_correctness PRIVATE GTest::gtest 
 
 add_executable(test_dist_blocked_qr_col_blockcyclic_correctness test_dist_blocked_qr_col_blockcyclic_correctness.cu)
 target_include_directories(test_dist_blocked_qr_col_blockcyclic_correctness PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(test_dist_blocked_qr_col_blockcyclic_correctness PRIVATE GTest::gtest CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL)
+target_link_libraries(test_dist_blocked_qr_col_blockcyclic_correctness PRIVATE GTest::gtest CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL distqr_nvtx_headers)
