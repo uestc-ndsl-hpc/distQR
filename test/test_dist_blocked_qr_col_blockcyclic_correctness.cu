@@ -73,6 +73,7 @@ void ApplyAllOuterPanelsQTToA(
     int m,
     int n,
     int nb,
+    int overlap_tile,
     cublasHandle_t cublas_handle,
     ncclComm_t nccl_comm,
     const distributed_qr_col_blockcyclic::ColBlockCyclicPartition& part,
@@ -81,7 +82,10 @@ void ApplyAllOuterPanelsQTToA(
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T>* ws,
     cudaStream_t compute_stream) {
     const int lda_local = std::max(m, 1);
-    const int tile_cols = nb;
+    const int tile_cols =
+        (overlap_tile <= 0)
+            ? nb
+            : std::max(distributed_qr_col_blockcyclic::kPanelWidth, std::min(overlap_tile, nb));
     const ncclDataType_t nccl_type = distributed_qr_col_blockcyclic::NcclType<T>();
 
     distributed_qr_col_blockcyclic::AssertCublas(cublasSetStream(cublas_handle, compute_stream),
@@ -184,25 +188,40 @@ void ApplyAllOuterPanelsQTToA(
     }
 }
 
+struct ColBlockCyclicCorrectnessConfig {
+    int m = 2048;
+    int n = 512;
+    int nb = 256;
+    int block_cols = 256;
+    int overlap_tile = 0;
+    distributed_qr_col_blockcyclic::PanelCommMode panel_comm_mode =
+        distributed_qr_col_blockcyclic::PanelCommMode::SendRecv;
+    bool use_compact_local_gemm = true;
+    const char* case_name = "default";
+};
+
 template <typename T>
-void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
+void RunFactorizedAEqualsQtA0(const ColBlockCyclicCorrectnessConfig& cfg,
+                              double rel_upper_tol,
+                              double lower_ratio_tol) {
     ASSERT_NE(g_env, nullptr);
     const auto& env = *g_env;
 
-    constexpr int m = 2048;
-    constexpr int n = 512;
-    constexpr int nb = 256;
-    constexpr int block_cols = nb;
-
-    ASSERT_EQ(n % distributed_qr_col_blockcyclic::kPanelWidth, 0);
-    ASSERT_EQ(nb % distributed_qr_col_blockcyclic::kPanelWidth, 0);
+    ASSERT_EQ(cfg.n % distributed_qr_col_blockcyclic::kPanelWidth, 0);
+    ASSERT_EQ(cfg.nb % distributed_qr_col_blockcyclic::kPanelWidth, 0);
+    ASSERT_GT(cfg.m, 0);
+    ASSERT_GT(cfg.n, 0);
+    ASSERT_GT(cfg.nb, 0);
+    ASSERT_GT(cfg.block_cols, 0);
+    ASSERT_EQ(cfg.block_cols % cfg.nb, 0);
+    ASSERT_EQ(cfg.block_cols % distributed_qr_col_blockcyclic::kPanelWidth, 0);
 
     const auto part = distributed_qr_col_blockcyclic::MakeColBlockCyclicPartition(
-        n, block_cols, env.size, env.rank);
-    const int lda_local = std::max(m, 1);
+        cfg.n, cfg.block_cols, env.size, env.rank);
+    const int lda_local = std::max(cfg.m, 1);
     const size_t elems_alloc =
         static_cast<size_t>(lda_local) * static_cast<size_t>(std::max(part.local_cols, 1));
-    const size_t elems_used = static_cast<size_t>(m) * static_cast<size_t>(part.local_cols);
+    const size_t elems_used = static_cast<size_t>(cfg.m) * static_cast<size_t>(part.local_cols);
 
     T* d_A0 = nullptr;
     T* d_Afact = nullptr;
@@ -234,15 +253,21 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
     distributed_qr_col_blockcyclic::AssertCuda(cudaMemset(d_Y, 0, elems_alloc * sizeof(T)),
                                                "cudaMemset d_Y");
 
-    const int tile_cols = nb;
+    const int tile_cols =
+        (cfg.overlap_tile <= 0)
+            ? std::max(part.local_cols, 1)
+            : std::max(distributed_qr_col_blockcyclic::kPanelWidth,
+                       std::min(cfg.overlap_tile, cfg.nb));
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
-    ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(m), static_cast<size_t>(1));
+    ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(cfg.m), static_cast<size_t>(1));
     ws.pack_elems =
-        static_cast<size_t>(m) * static_cast<size_t>(distributed_qr_col_blockcyclic::kPanelWidth);
-    ws.block_storage_elems = static_cast<size_t>(m) * static_cast<size_t>(nb);
-    ws.block_compact_elems = static_cast<size_t>(nb + distributed_qr_col_blockcyclic::kPanelWidth) *
-                             static_cast<size_t>(nb);
-    ws.tmp_elems = static_cast<size_t>(nb) * static_cast<size_t>(tile_cols);
+        static_cast<size_t>(cfg.m) *
+        static_cast<size_t>(distributed_qr_col_blockcyclic::kPanelWidth);
+    ws.block_storage_elems = static_cast<size_t>(cfg.m) * static_cast<size_t>(cfg.nb);
+    ws.block_compact_elems =
+        static_cast<size_t>(cfg.nb + distributed_qr_col_blockcyclic::kPanelWidth) *
+        static_cast<size_t>(cfg.nb);
+    ws.tmp_elems = static_cast<size_t>(cfg.nb) * static_cast<size_t>(tile_cols);
 
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_r_panel, static_cast<size_t>(distributed_qr_col_blockcyclic::kPanelWidth) *
@@ -294,25 +319,24 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
     distributed_qr_col_blockcyclic::AssertCublas(cublasSetStream(cublas_handle, compute_stream),
                                                  "cublasSetStream compute_stream");
 
-    constexpr bool use_compact_local_gemm = true;
     distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
-        cublas_handle, env.nccl_comm, part, m, n, nb, d_Afact, lda_local, d_W, d_Y, &ws,
-        compute_stream, comm_stream, 0, nullptr,
-        distributed_qr_col_blockcyclic::PanelCommMode::SendRecv, use_compact_local_gemm);
+        cublas_handle, env.nccl_comm, part, cfg.m, cfg.n, cfg.nb, d_Afact, lda_local, d_W, d_Y,
+        &ws, compute_stream, comm_stream, cfg.overlap_tile, nullptr, cfg.panel_comm_mode,
+        cfg.use_compact_local_gemm);
 
     distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                "cudaStreamSynchronize factorize compute");
     distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
                                                "cudaStreamSynchronize factorize comm");
 
-    ApplyAllOuterPanelsQTToA(d_Aqt, m, n, nb, cublas_handle, env.nccl_comm, part, d_W, d_Y, &ws,
-                             compute_stream);
+    ApplyAllOuterPanelsQTToA(d_Aqt, cfg.m, cfg.n, cfg.nb, cfg.overlap_tile, cublas_handle,
+                             env.nccl_comm, part, d_W, d_Y, &ws, compute_stream);
 
     distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                "cudaStreamSynchronize applyQT compute");
 
-    const auto h_Afact = CopyLocalMatrixToHost(d_Afact, lda_local, m, part.local_cols);
-    const auto h_Aqt = CopyLocalMatrixToHost(d_Aqt, lda_local, m, part.local_cols);
+    const auto h_Afact = CopyLocalMatrixToHost(d_Afact, lda_local, cfg.m, part.local_cols);
+    const auto h_Aqt = CopyLocalMatrixToHost(d_Aqt, lda_local, cfg.m, part.local_cols);
 
     double local_upper_diff_sq = 0.0;
     double local_upper_base_sq = 0.0;
@@ -333,9 +357,9 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
             continue;
         }
 
-        for (int row = 0; row < m; ++row) {
+        for (int row = 0; row < cfg.m; ++row) {
             const size_t idx =
-                static_cast<size_t>(row) + static_cast<size_t>(col) * static_cast<size_t>(m);
+                static_cast<size_t>(row) + static_cast<size_t>(col) * static_cast<size_t>(cfg.m);
             const double a_fact = static_cast<double>(h_Afact[idx]);
             const double a_qt = static_cast<double>(h_Aqt[idx]);
             if (row <= global_col) {
@@ -364,9 +388,9 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
 
     if (env.rank == 0) {
         spdlog::info(
-            "Col blockcyclic correctness ({}): rel(upper(Afact), upper(Q^T*A0))={:.3e}, "
+            "Col blockcyclic correctness [{}] ({}): rel(upper(Afact), upper(Q^T*A0))={:.3e}, "
             "lower_ratio={:.3e}",
-            DataTypeString<T>(), rel_upper, lower_ratio);
+            cfg.case_name, DataTypeString<T>(), rel_upper, lower_ratio);
     }
 
     EXPECT_LT(rel_upper, rel_upper_tol);
@@ -402,11 +426,24 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
 }
 
 TEST(DistBlockedQrColBlockCyclicCorrectnessTest, FactorizedAEqualsQtA0Float) {
-    RunFactorizedAEqualsQtA0<float>(8e-4, 8e-4);
+    RunFactorizedAEqualsQtA0<float>({}, 8e-4, 8e-4);
 }
 
 TEST(DistBlockedQrColBlockCyclicCorrectnessTest, FactorizedAEqualsQtA0Double) {
-    RunFactorizedAEqualsQtA0<double>(1e-7, 1e-7);
+    RunFactorizedAEqualsQtA0<double>({}, 1e-7, 1e-7);
+}
+
+TEST(DistBlockedQrColBlockCyclicCorrectnessTest, BroadcastBlockCols2NbTiledSegmentedFloat) {
+    ColBlockCyclicCorrectnessConfig cfg;
+    cfg.m = 8192;
+    cfg.n = 8192;
+    cfg.nb = 1024;
+    cfg.block_cols = 2048;
+    cfg.overlap_tile = 1024;
+    cfg.panel_comm_mode = distributed_qr_col_blockcyclic::PanelCommMode::Broadcast;
+    cfg.use_compact_local_gemm = false;
+    cfg.case_name = "broadcast_block_cols_2048_tiled_segmented";
+    RunFactorizedAEqualsQtA0<float>(cfg, 1.5e-3, 1.5e-3);
 }
 
 }  // namespace
