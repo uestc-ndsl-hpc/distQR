@@ -85,6 +85,7 @@ struct Options {
     PanelCommMode panel_comm_mode = PanelCommMode::SendRecv;
     bool panel_comm_valid = true;
     std::string panel_comm_value = "sendrecv";
+    bool use_compact_local_gemm = false;
 };
 
 bool ParsePanelCommMode(const char* mode, PanelCommMode* out_mode) {
@@ -146,6 +147,10 @@ Options ParseArgs(int argc, char** argv) {
             opts.panel_comm_value = argv[++i];
             opts.panel_comm_valid =
                 ParsePanelCommMode(opts.panel_comm_value.c_str(), &opts.panel_comm_mode);
+        } else if (std::strcmp(argv[i], "--compact-local-gemm") == 0) {
+            opts.use_compact_local_gemm = true;
+        } else if (std::strcmp(argv[i], "--segmented-local-gemm") == 0) {
+            opts.use_compact_local_gemm = false;
         }
     }
     return opts;
@@ -178,9 +183,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     FillDeviceRandom(d_A0, local_elems_used, 2026ULL + static_cast<unsigned long long>(env.rank));
 
     const bool trail_one_shot = opts.overlap_tile <= 0;
-    const int tile_cols =
-        trail_one_shot ? std::max(part.local_cols, 1)
-                       : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
+    const int tile_cols = trail_one_shot
+                              ? std::max(part.local_cols, 1)
+                              : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.pack_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
@@ -252,7 +257,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
 
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
-            &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode);
+            &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode,
+            opts.use_compact_local_gemm);
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                    "cudaStreamSynchronize warmup compute");
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
@@ -306,7 +312,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
             &ws, compute_stream, comm_stream, opts.overlap_tile,
-            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode);
+            opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode,
+            opts.use_compact_local_gemm);
         if (opts.print_comm_bw) {
             distributed_qr_col_blockcyclic::AssertCuda(
                 cudaEventRecord(comm_end_events[i], comm_stream), "cudaEventRecord comm_end");
@@ -404,10 +411,11 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (env.rank == 0) {
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
-            "trail_update={} tile={} panel_comm={} np={} avg {:.3f} ms",
+            "trail_update={} tile={} panel_comm={} local_update={} np={} avg {:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols,
             trail_one_shot ? "one-shot" : "tiled", trail_one_shot ? part.local_cols : tile_cols,
-            PanelCommModeToString(opts.panel_comm_mode), env.size, max_ms);
+            PanelCommModeToString(opts.panel_comm_mode),
+            opts.use_compact_local_gemm ? "compact" : "segmented", env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms (no-barrier {:.3f} ms)", r,

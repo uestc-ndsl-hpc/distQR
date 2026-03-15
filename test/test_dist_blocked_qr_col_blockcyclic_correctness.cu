@@ -294,9 +294,11 @@ void RunFactorizedAEqualsQtA0(double rel_upper_tol, double lower_ratio_tol) {
     distributed_qr_col_blockcyclic::AssertCublas(cublasSetStream(cublas_handle, compute_stream),
                                                  "cublasSetStream compute_stream");
 
+    constexpr bool use_compact_local_gemm = true;
     distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
         cublas_handle, env.nccl_comm, part, m, n, nb, d_Afact, lda_local, d_W, d_Y, &ws,
-        compute_stream, comm_stream);
+        compute_stream, comm_stream, 0, nullptr,
+        distributed_qr_col_blockcyclic::PanelCommMode::SendRecv, use_compact_local_gemm);
 
     distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                "cudaStreamSynchronize factorize compute");

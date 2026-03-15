@@ -130,6 +130,26 @@ inline int LocalColOffset(const ColBlockCyclicPartition& part, int global_col) {
     return -1;
 }
 
+inline int LocalColPrefix(const ColBlockCyclicPartition& part, int global_col) {
+    if (global_col <= 0) {
+        return 0;
+    }
+    if (global_col >= part.n_global) {
+        return part.local_cols;
+    }
+
+    int prefix = 0;
+    for (size_t i = 0; i < part.block_starts.size(); ++i) {
+        const int block_begin = part.block_starts[i];
+        const int block_end = part.block_ends[i];
+        if (global_col <= block_begin) {
+            break;
+        }
+        prefix += std::min(global_col, block_end) - block_begin;
+    }
+    return prefix;
+}
+
 template <typename Func>
 inline void ForEachLocalSegment(const ColBlockCyclicPartition& part,
                                 int begin,
@@ -367,13 +387,12 @@ void block_update_one_shot(cublasHandle_t cublas_handle,
 
     T* a_sub = A_trail + row_offset;
     AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, k, cols_local,
-                                           rows, &one, W, lda_wy, a_sub, lda_local, &zero, work,
-                                           k),
+                                           rows, &one, W, lda_wy, a_sub, lda_local, &zero, work, k),
                  "trail one-shot work = W^T * A");
-    AssertCublas(CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, rows,
-                                           cols_local, k, &minus_one, Y, lda_wy, work, k, &one,
-                                           a_sub, lda_local),
-                 "trail one-shot A -= Y * work");
+    AssertCublas(
+        CublasGemmTraits<T>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, rows, cols_local, k,
+                                  &minus_one, Y, lda_wy, work, k, &one, a_sub, lda_local),
+        "trail one-shot A -= Y * work");
 }
 
 template <typename T>
@@ -393,7 +412,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     cudaStream_t comm_stream,
     int overlap_tile_cols = 0,
     CommProfile* comm_profile = nullptr,
-    PanelCommMode panel_comm_mode = PanelCommMode::SendRecv) {
+    PanelCommMode panel_comm_mode = PanelCommMode::SendRecv,
+    bool use_compact_local_gemm = false) {
     static_assert(kSupportedQrType<T>,
                   "distributed_qr_col_blockcyclic only supports float and double.");
 
@@ -432,9 +452,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     }
 
     const bool trail_one_shot = overlap_tile_cols <= 0;
-    const int tile_cols =
-        trail_one_shot ? std::max(part.local_cols, 1)
-                       : std::max(kPanelWidth, std::min(overlap_tile_cols, nb));
+    const int tile_cols = trail_one_shot ? std::max(part.local_cols, 1)
+                                         : std::max(kPanelWidth, std::min(overlap_tile_cols, nb));
     const size_t tmp_need = static_cast<size_t>(nb) * static_cast<size_t>(tile_cols);
     if (ws->tmp_elems < tmp_need) {
         spdlog::error("Col blockcyclic tmp too small (need {} elems, got {}).", tmp_need,
@@ -680,15 +699,26 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                 }
                 const int inblock_begin = inner + kPanelWidth;
                 const int inblock_end = block_end;
-                ForEachLocalSegment(
-                    part, inblock_begin, inblock_end,
-                    [&](int seg_begin, int seg_end, int local_begin) {
-                        const int cols_local = seg_end - seg_begin;
+                if (use_compact_local_gemm) {
+                    const int local_begin = LocalColPrefix(part, inblock_begin);
+                    const int cols_local = LocalColPrefix(part, inblock_end) - local_begin;
+                    if (cols_local > 0) {
                         T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
                         panel_update_one_shot(cublas_handle, inner, panel_rows, cols_local,
                                               d_pack_w, d_pack_y, panel_rows, a_trail, lda_local,
                                               ws->d_tmp0, ws->tmp_elems);
-                    });
+                    }
+                } else {
+                    ForEachLocalSegment(
+                        part, inblock_begin, inblock_end,
+                        [&](int seg_begin, int seg_end, int local_begin) {
+                            const int cols_local = seg_end - seg_begin;
+                            T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                            panel_update_one_shot(cublas_handle, inner, panel_rows, cols_local,
+                                                  d_pack_w, d_pack_y, panel_rows, a_trail,
+                                                  lda_local, ws->d_tmp0, ws->tmp_elems);
+                        });
+                }
             }
 
             if (part.rank == owner) {
@@ -810,22 +840,44 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         // Apply block WY to trailing columns after the block (full rows, like single-GPU).
         const int block_rows = m - block_begin;
         const int trail_begin = block_end;
-        ForEachLocalSegment(part, trail_begin, n, [&](int seg_begin, int seg_end, int local_begin) {
-            const int cols_local = seg_end - seg_begin;
-            T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
-            if (trail_one_shot) {
-                block_update_one_shot(cublas_handle, block_begin, block_rows, kb, cols_local,
-                                      ws->d_block_w + static_cast<size_t>(block_begin),
-                                      ws->d_block_y + static_cast<size_t>(block_begin), m, a_trail,
-                                      lda_local, ws->d_tmp0, ws->tmp_elems);
-            } else {
-                block_update_tile_pipeline(cublas_handle, compute_stream, block_begin, block_rows,
-                                           kb, cols_local, tile_cols,
-                                           ws->d_block_w + static_cast<size_t>(block_begin),
-                                           ws->d_block_y + static_cast<size_t>(block_begin), m,
-                                           a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
+        if (use_compact_local_gemm) {
+            const int local_begin = LocalColPrefix(part, trail_begin);
+            const int cols_local = LocalColPrefix(part, n) - local_begin;
+            if (cols_local > 0) {
+                T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                if (trail_one_shot) {
+                    block_update_one_shot(cublas_handle, block_begin, block_rows, kb, cols_local,
+                                          ws->d_block_w + static_cast<size_t>(block_begin),
+                                          ws->d_block_y + static_cast<size_t>(block_begin), m,
+                                          a_trail, lda_local, ws->d_tmp0, ws->tmp_elems);
+                } else {
+                    block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
+                                               block_rows, kb, cols_local, tile_cols,
+                                               ws->d_block_w + static_cast<size_t>(block_begin),
+                                               ws->d_block_y + static_cast<size_t>(block_begin), m,
+                                               a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
+                }
             }
-        });
+        } else {
+            ForEachLocalSegment(
+                part, trail_begin, n, [&](int seg_begin, int seg_end, int local_begin) {
+                    const int cols_local = seg_end - seg_begin;
+                    T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                    if (trail_one_shot) {
+                        block_update_one_shot(cublas_handle, block_begin, block_rows, kb,
+                                              cols_local,
+                                              ws->d_block_w + static_cast<size_t>(block_begin),
+                                              ws->d_block_y + static_cast<size_t>(block_begin), m,
+                                              a_trail, lda_local, ws->d_tmp0, ws->tmp_elems);
+                    } else {
+                        block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
+                                                   block_rows, kb, cols_local, tile_cols,
+                                                   ws->d_block_w + static_cast<size_t>(block_begin),
+                                                   ws->d_block_y + static_cast<size_t>(block_begin),
+                                                   m, a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
+                    }
+                });
+        }
     }
 }
 
