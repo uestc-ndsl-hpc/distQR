@@ -14,6 +14,7 @@
 
 #include "panel_process.cuh"
 #include "utils/cublas_gemm_traits.cuh"
+#include "utils/nvtx_range.cuh"
 
 namespace distributed_qr_col_blockcyclic {
 
@@ -559,6 +560,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
         const int block_end = std::min(block_begin + nb, n);
         const int kb = block_end - block_begin;
+        auto block_range =
+            distqr::nvtx::MakeScopedRangef("qr_block r=%d b=%d:%d", part.rank, block_begin,
+                                           block_end);
 
         // Receiver-side lookahead: start receiving the first panel of this block early.
         prefetch_recv(block_begin, panel_seq & 1);
@@ -588,6 +592,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                 // Ensure comm has finished consuming this pack buffer before overwriting it.
                 AssertCuda(cudaStreamWaitEvent(compute_stream, events.comm_done[buf], 0),
                            "cudaStreamWaitEvent compute_stream <- comm_done[buf]");
+
+                auto panel_prepare_range = distqr::nvtx::MakeScopedRangef(
+                    "panel_prepare r=%d b=%d i=%d o=%d", part.rank, block_begin, inner, owner);
 
                 const int local_panel_col = LocalColOffset(part, inner);
                 if (local_panel_col < 0) {
@@ -628,14 +635,24 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
             if (part.world_size > 1) {
                 if (panel_comm_mode == PanelCommMode::Broadcast) {
-                    AssertNccl(ncclBroadcast(d_pack_w, d_pack_w,
-                                             static_cast<size_t>(panel_rows) * kPanelWidth,
-                                             nccl_type, owner, nccl_comm, comm_stream),
-                               "ncclBroadcast panel W");
-                    AssertNccl(ncclBroadcast(d_pack_y, d_pack_y,
-                                             static_cast<size_t>(panel_rows) * kPanelWidth,
-                                             nccl_type, owner, nccl_comm, comm_stream),
-                               "ncclBroadcast panel Y");
+                    {
+                        auto panel_bcast_w_range = distqr::nvtx::MakeScopedRangef(
+                            "panel_bcast_w r=%d b=%d i=%d o=%d", part.rank, block_begin, inner,
+                            owner);
+                        AssertNccl(ncclBroadcast(d_pack_w, d_pack_w,
+                                                 static_cast<size_t>(panel_rows) * kPanelWidth,
+                                                 nccl_type, owner, nccl_comm, comm_stream),
+                                   "ncclBroadcast panel W");
+                    }
+                    {
+                        auto panel_bcast_y_range = distqr::nvtx::MakeScopedRangef(
+                            "panel_bcast_y r=%d b=%d i=%d o=%d", part.rank, block_begin, inner,
+                            owner);
+                        AssertNccl(ncclBroadcast(d_pack_y, d_pack_y,
+                                                 static_cast<size_t>(panel_rows) * kPanelWidth,
+                                                 nccl_type, owner, nccl_comm, comm_stream),
+                                   "ncclBroadcast panel Y");
+                    }
                     if (comm_profile && active_receivers > 0) {
                         comm_profile->bytes += 2ULL * static_cast<size_t>(panel_rows) *
                                                kPanelWidth * sizeof(T) *
@@ -704,6 +721,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     const int cols_local = LocalColPrefix(part, inblock_end) - local_begin;
                     if (cols_local > 0) {
                         T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                        auto panel_apply_range = distqr::nvtx::MakeScopedRangef(
+                            "panel_apply r=%d i=%d seg=%d:%d", part.rank, inner, inblock_begin,
+                            inblock_end);
                         panel_update_one_shot(cublas_handle, inner, panel_rows, cols_local,
                                               d_pack_w, d_pack_y, panel_rows, a_trail, lda_local,
                                               ws->d_tmp0, ws->tmp_elems);
@@ -714,6 +734,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                         [&](int seg_begin, int seg_end, int local_begin) {
                             const int cols_local = seg_end - seg_begin;
                             T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                            auto panel_apply_range = distqr::nvtx::MakeScopedRangef(
+                                "panel_apply r=%d i=%d seg=%d:%d", part.rank, inner, seg_begin,
+                                seg_end);
                             panel_update_one_shot(cublas_handle, inner, panel_rows, cols_local,
                                                   d_pack_w, d_pack_y, panel_rows, a_trail,
                                                   lda_local, ws->d_tmp0, ws->tmp_elems);
@@ -792,6 +815,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             // Now update W_i inside the block WY using the full block rows.
             if (part.rank == owner || self_needs_panel) {
                 if (inner > block_begin) {
+                    auto block_w_update_range = distqr::nvtx::MakeScopedRangef(
+                        "block_w_update r=%d b=%d i=%d", part.rank, block_begin, inner);
                     const int k_prev = inner - block_begin;
                     const int block_rows = m - block_begin;
                     const T one = static_cast<T>(1);
@@ -846,11 +871,17 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             if (cols_local > 0) {
                 T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
                 if (trail_one_shot) {
+                    auto trail_update_range = distqr::nvtx::MakeScopedRangef(
+                        "trail_update_1shot r=%d b=%d seg=%d:%d", part.rank, block_begin,
+                        trail_begin, n);
                     block_update_one_shot(cublas_handle, block_begin, block_rows, kb, cols_local,
                                           ws->d_block_w + static_cast<size_t>(block_begin),
                                           ws->d_block_y + static_cast<size_t>(block_begin), m,
                                           a_trail, lda_local, ws->d_tmp0, ws->tmp_elems);
                 } else {
+                    auto trail_update_range = distqr::nvtx::MakeScopedRangef(
+                        "trail_update_tiled r=%d b=%d seg=%d:%d", part.rank, block_begin,
+                        trail_begin, n);
                     block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
                                                block_rows, kb, cols_local, tile_cols,
                                                ws->d_block_w + static_cast<size_t>(block_begin),
@@ -864,12 +895,18 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     const int cols_local = seg_end - seg_begin;
                     T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
                     if (trail_one_shot) {
+                        auto trail_update_range = distqr::nvtx::MakeScopedRangef(
+                            "trail_update_1shot r=%d b=%d seg=%d:%d", part.rank, block_begin,
+                            seg_begin, seg_end);
                         block_update_one_shot(cublas_handle, block_begin, block_rows, kb,
                                               cols_local,
                                               ws->d_block_w + static_cast<size_t>(block_begin),
                                               ws->d_block_y + static_cast<size_t>(block_begin), m,
                                               a_trail, lda_local, ws->d_tmp0, ws->tmp_elems);
                     } else {
+                        auto trail_update_range = distqr::nvtx::MakeScopedRangef(
+                            "trail_update_tiled r=%d b=%d seg=%d:%d", part.rank, block_begin,
+                            seg_begin, seg_end);
                         block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
                                                    block_rows, kb, cols_local, tile_cols,
                                                    ws->d_block_w + static_cast<size_t>(block_begin),
