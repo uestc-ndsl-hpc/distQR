@@ -154,6 +154,42 @@ inline void ForEachLocalSegment(const ColBlockCyclicPartition& part,
     }
 }
 
+struct LocalColRange {
+    int local_begin = 0;
+    int cols = 0;
+};
+
+inline LocalColRange LocalColRangeForInterval(const ColBlockCyclicPartition& part,
+                                              int begin,
+                                              int end) {
+    LocalColRange range{};
+    int next_local_begin = -1;
+    for (size_t i = 0; i < part.block_starts.size(); ++i) {
+        const int seg_begin = std::max(begin, part.block_starts[i]);
+        const int seg_end = std::min(end, part.block_ends[i]);
+        if (seg_begin >= seg_end) {
+            continue;
+        }
+
+        const int local_begin = part.block_local_offsets[i] + (seg_begin - part.block_starts[i]);
+        if (range.cols == 0) {
+            range.local_begin = local_begin;
+            next_local_begin = local_begin;
+        } else if (local_begin != next_local_begin) {
+            spdlog::error(
+                "Global interval [{}, {}) is not contiguous in local storage (expected local "
+                "begin {}, got {}).",
+                begin, end, next_local_begin, local_begin);
+            std::exit(1);
+        }
+
+        const int cols_local = seg_end - seg_begin;
+        range.cols += cols_local;
+        next_local_begin += cols_local;
+    }
+    return range;
+}
+
 template <typename T>
 __global__ void write_upper_r_to_panel_kernel(
     int panel_row_begin, const T* R, int ldr, T* A, int lda) {
@@ -1193,17 +1229,16 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         int cols_tile = 0;
     };
     std::vector<TailTileTask> tail_tiles;
-    int local_tail_cols = 0;
-    ForEachLocalSegment(part, block_end, n, [&](int seg_begin, int seg_end, int local_begin) {
-        const int cols_local = seg_end - seg_begin;
-        local_tail_cols += cols_local;
-        const int target_cols = std::min(pipeline_cfg.trail_tile_cols, cols_local);
-        for (int col_off = 0; col_off < cols_local; col_off += target_cols) {
-            const int cols_tile = std::min(target_cols, cols_local - col_off);
-            tail_tiles.push_back(
-                {d_A_local + static_cast<size_t>(local_begin + col_off) * lda_local, cols_tile});
+    const LocalColRange local_tail = LocalColRangeForInterval(part, block_end, n);
+    const int local_tail_cols = local_tail.cols;
+    if (local_tail_cols > 0) {
+        const int target_cols = std::min(pipeline_cfg.trail_tile_cols, local_tail_cols);
+        T* a_tail = d_A_local + static_cast<size_t>(local_tail.local_begin) * lda_local;
+        for (int col_off = 0; col_off < local_tail_cols; col_off += target_cols) {
+            const int cols_tile = std::min(target_cols, local_tail_cols - col_off);
+            tail_tiles.push_back({a_tail + static_cast<size_t>(col_off) * lda_local, cols_tile});
         }
-    });
+    }
 
     int chained_k_chunk_cols = 0;
     int chained_packed_buffer_count = 1;
@@ -1298,18 +1333,29 @@ inline void StreamedTailUpdateScaffold(cublasHandle_t cublas_handle,
         }
     } else if (overlap_tail) {
         T* tmp_buffers[2] = {ws->d_tmp0, ws->d_tmp1};
-        for (size_t tile_idx = 0; tile_idx < tail_tiles.size(); ++tile_idx) {
+        if (!tail_tiles.empty()) {
+            TailUpdateColTileFromRowBlockCache(
+                events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, ws->d_block_y_rowmajor,
+                block_begin, block_rows, kb, row_block_rows, tail_tiles.front().a_tile, lda_local,
+                tail_tiles.front().cols_tile, tmp_buffers[0], ws->tmp_elems,
+                events.tail_acc_stream, true, events.rowblock_comm_done, phase_profile);
+        }
+        if (tail_tiles.size() > 1 && row_block_count > 0) {
+            const size_t tail_wait_idx =
+                BeginPhaseInterval(phase_profile, PhaseKind::TailAccWait, events.tail_acc_stream);
+            AssertCuda(cudaStreamWaitEvent(events.tail_acc_stream,
+                                           events.rowblock_comm_done[row_block_count - 1], 0),
+                       "cudaStreamWaitEvent tail_acc_stream <- rowblock_comm_done[last]");
+            EndPhaseInterval(phase_profile, tail_wait_idx, events.tail_acc_stream);
+        }
+        for (size_t tile_idx = 1; tile_idx < tail_tiles.size(); ++tile_idx) {
             const int buf_idx = static_cast<int>(tile_idx % 2);
             const auto& tile = tail_tiles[tile_idx];
-            TailAccumulateColTileFromRowBlockCache(
-                events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, block_begin, block_rows, kb,
-                row_block_rows, tile.a_tile, lda_local, tile.cols_tile, tmp_buffers[buf_idx],
-                ws->tmp_elems, events.tail_acc_stream, true, events.rowblock_comm_done,
-                phase_profile);
-            TailApplyColTileFromRowBlockCache(
-                events.tail_acc_cublas_handle, ws->d_block_y_rowmajor, block_begin, block_rows, kb,
-                row_block_rows, tile.a_tile, lda_local, tile.cols_tile, tmp_buffers[buf_idx],
-                events.tail_acc_stream, phase_profile);
+            TailUpdateColTileFromRowBlockCache(
+                events.tail_acc_cublas_handle, ws->d_block_w_rowmajor, ws->d_block_y_rowmajor,
+                block_begin, block_rows, kb, row_block_rows, tile.a_tile, lda_local,
+                tile.cols_tile, tmp_buffers[buf_idx], ws->tmp_elems, events.tail_acc_stream,
+                false, events.rowblock_comm_done, phase_profile);
         }
     } else {
         for (const auto& tile : tail_tiles) {
