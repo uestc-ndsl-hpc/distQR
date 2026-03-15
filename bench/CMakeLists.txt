@@ -57,6 +57,18 @@ if(CUSOLVERMP_INCLUDE_DIR AND CUSOLVERMP_LIBRARY)
     spdlog::spdlog
     NCCL::NCCL
     ${CUSOLVERMP_LIBRARY})
+
+  add_executable(bench_cusolvermp_ormqr bench_cusolvermp_ormqr.cu)
+  target_include_directories(bench_cusolvermp_ormqr PRIVATE ${CMAKE_SOURCE_DIR}/include ${CUSOLVERMP_INCLUDE_DIR})
+  target_link_libraries(bench_cusolvermp_ormqr PRIVATE
+    CUDA::cublas
+    CUDA::cusolver
+    CUDA::curand
+    CUDA::cudart
+    MPI::MPI_CXX
+    spdlog::spdlog
+    NCCL::NCCL
+    ${CUSOLVERMP_LIBRARY})
 else()
-  message(STATUS "Skip bench_cusolvermp_geqrf: cuSOLVERMp not found (need cusolverMp.h and libcusolverMp).")
+  message(STATUS "Skip bench_cusolvermp_geqrf/bench_cusolvermp_ormqr: cuSOLVERMp not found (need cusolverMp.h and libcusolverMp).")
 endif()

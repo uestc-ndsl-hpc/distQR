@@ -85,6 +85,12 @@ double ExplicitQFromWYFlops(int m, int n, int nb) {
     return sum;
 }
 
+double QrFlops(int m, int n) {
+    const double md = static_cast<double>(m);
+    const double nd = static_cast<double>(n);
+    return 2.0 * md * nd * nd - (2.0 / 3.0) * nd * nd * nd;
+}
+
 double FlopsToTflops(double flops, double ms) {
     if (ms <= 0.0) {
         return 0.0;
@@ -175,6 +181,7 @@ struct Options {
     int block_cols = 0;
     int panel_buffers = 2;
     bool print_per_rank = false;
+    bool e2e = false;
     bool use_double = false;
     bool type_valid = true;
     std::string type_value = "float";
@@ -240,6 +247,11 @@ Options ParseArgs(int argc, char** argv) {
             opts.panel_buffers = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--print_per_rank") == 0) {
             opts.print_per_rank = true;
+        } else if (std::strcmp(argv[i], "--e2e") == 0) {
+            opts.e2e = true;
+        } else if (std::strcmp(argv[i], "--q-only") == 0 ||
+                   std::strcmp(argv[i], "--explicit-q-only") == 0) {
+            opts.e2e = false;
         } else if (std::strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
             opts.type_value = argv[++i];
             opts.type_valid = ParseType(opts.type_value.c_str(), &opts.use_double);
@@ -315,26 +327,44 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     distributed_qr_col_blockcyclic::AssertCublas(cublasSetStream(cublas_handle, compute_stream),
                                                  "cublasSetStream(compute_stream)");
 
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMemcpyAsync(d_Afact, d_A0, local_elems_alloc * sizeof(T), cudaMemcpyDeviceToDevice,
-                        compute_stream),
-        "cudaMemcpyAsync precompute A <- A0");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(T), compute_stream),
-        "cudaMemsetAsync precompute W");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
-        "cudaMemsetAsync precompute Y");
-    distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
-        cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_Afact, lda_local, d_W, d_Y,
-        &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode,
-        opts.use_compact_local_gemm);
-    distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
-                                               "cudaStreamSynchronize precompute compute");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
-                                               "cudaStreamSynchronize precompute comm");
+    if (!opts.e2e) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMemcpyAsync(d_Afact, d_A0, local_elems_alloc * sizeof(T), cudaMemcpyDeviceToDevice,
+                            compute_stream),
+            "cudaMemcpyAsync precompute A <- A0");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(T), compute_stream),
+            "cudaMemsetAsync precompute W");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
+            "cudaMemsetAsync precompute Y");
+        distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
+            cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_Afact, lda_local, d_W,
+            d_Y, &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr,
+            opts.panel_comm_mode, opts.use_compact_local_gemm);
+        distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
+                                                   "cudaStreamSynchronize precompute compute");
+        distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
+                                                   "cudaStreamSynchronize precompute comm");
+    }
 
     for (int i = 0; i < opts.warmup; ++i) {
+        if (opts.e2e) {
+            distributed_qr_col_blockcyclic::AssertCuda(
+                cudaMemcpyAsync(d_Afact, d_A0, local_elems_alloc * sizeof(T),
+                                cudaMemcpyDeviceToDevice, compute_stream),
+                "cudaMemcpyAsync warmup A <- A0");
+            distributed_qr_col_blockcyclic::AssertCuda(
+                cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(T), compute_stream),
+                "cudaMemsetAsync warmup W");
+            distributed_qr_col_blockcyclic::AssertCuda(
+                cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
+                "cudaMemsetAsync warmup Y");
+            distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
+                cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_Afact, lda_local,
+                d_W, d_Y, &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr,
+                opts.panel_comm_mode, opts.use_compact_local_gemm);
+        }
         distributed_qr_col_blockcyclic::generate_explicit_q_from_wy_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_W, d_Y, d_Q, lda_local,
             &ws, compute_stream, comm_stream, opts.overlap_tile, opts.panel_comm_mode);
@@ -361,6 +391,22 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                                                          env.rank, i);
         distributed_qr_col_blockcyclic::AssertCuda(cudaEventRecord(timed_start, compute_stream),
                                                    "cudaEventRecord timed_start");
+        if (opts.e2e) {
+            distributed_qr_col_blockcyclic::AssertCuda(
+                cudaMemcpyAsync(d_Afact, d_A0, local_elems_alloc * sizeof(T),
+                                cudaMemcpyDeviceToDevice, compute_stream),
+                "cudaMemcpyAsync timed A <- A0");
+            distributed_qr_col_blockcyclic::AssertCuda(
+                cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(T), compute_stream),
+                "cudaMemsetAsync timed W");
+            distributed_qr_col_blockcyclic::AssertCuda(
+                cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
+                "cudaMemsetAsync timed Y");
+            distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
+                cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_Afact, lda_local,
+                d_W, d_Y, &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr,
+                opts.panel_comm_mode, opts.use_compact_local_gemm);
+        }
         distributed_qr_col_blockcyclic::generate_explicit_q_from_wy_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_W, d_Y, d_Q, lda_local,
             &ws, compute_stream, comm_stream, opts.overlap_tile, opts.panel_comm_mode);
@@ -412,13 +458,16 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     unsigned long long total_bad = 0;
     MPI_Allreduce(&h_bad, &total_bad, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
 
-    const double q_tflops = FlopsToTflops(ExplicitQFromWYFlops(opts.m, opts.n, opts.nb), max_ms);
+    const double flops = opts.e2e ? (QrFlops(opts.m, opts.n) + ExplicitQFromWYFlops(opts.m, opts.n, opts.nb))
+                                  : ExplicitQFromWYFlops(opts.m, opts.n, opts.nb);
+    const double q_tflops = FlopsToTflops(flops, max_ms);
     if (env.rank == 0) {
         spdlog::info(
-            "Distributed explicit Q [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
+            "Distributed {} [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
             "panel_buffers={} apply={} tile={} panel_comm={} factor_local_update={} np={} avg "
             "{:.3f} ms ({:.3f} TFLOPS)",
-            DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.panel_buffers,
+            opts.e2e ? "QR+explicit Q" : "explicit Q", DataTypeString<T>(), opts.m, opts.n,
+            opts.nb, block_cols, opts.panel_buffers,
             apply_one_shot ? "one-shot" : "tiled", apply_one_shot ? part.local_cols : tile_cols,
             PanelCommModeToString(opts.panel_comm_mode),
             opts.use_compact_local_gemm ? "compact" : "segmented", env.size, max_ms, q_tflops);
@@ -535,6 +584,14 @@ int main(int argc, char** argv) {
     }
 
     if (env.rank == 0) {
+        spdlog::info(
+            "Distributed {} bench: type={} m={} n={} nb={} block_cols={} warmup={} iters={} "
+            "panel_buffers={} panel_comm={} local_update={} tile={} ",
+            opts.e2e ? "QR+explicit-Q" : "explicit-Q", opts.use_double ? "double" : "float",
+            opts.m, opts.n, opts.nb, block_cols, opts.warmup, opts.iters, opts.panel_buffers,
+            PanelCommModeToString(opts.panel_comm_mode),
+            opts.use_compact_local_gemm ? "compact" : "segmented",
+            (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile);
         spdlog::info(
             "Custom NVTX backend: {} (compiled={}, runtime={}, set {}=0 to disable)",
             distqr::nvtx::kBackendName, distqr::nvtx::kCompiledIn ? "yes" : "no",
