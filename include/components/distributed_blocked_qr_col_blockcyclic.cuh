@@ -208,8 +208,10 @@ struct DistributedQrColBlockCyclicWorkspace {
     T* d_tmp1 = nullptr;
     size_t tmp_elems = 0;
 
-    // Compact block WY buffers: [(nb + kPanelWidth) x nb]
-    // Used to build a global block WY without scattering into [m x nb].
+    // Compact block WY buffers.
+    // Factorization only needs [(nb + kPanelWidth) x nb].
+    // Explicit-Q ping-pong may reuse them as a second full block buffer, so callers that use
+    // that path must provision at least [m x nb].
     T* d_block_w_compact = nullptr;
     T* d_block_y_compact = nullptr;
     size_t block_compact_elems = 0;
