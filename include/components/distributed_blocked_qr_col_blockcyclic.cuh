@@ -556,7 +556,144 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                    "cudaEventRecord comm_done[buf](prefetch)");
     };
 
+    auto count_active_receivers = [&](int inner, int owner) {
+        int active_receivers = 0;
+        for (int r = 0; r < part.world_size; ++r) {
+            if (r == owner) {
+                continue;
+            }
+            if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
+                continue;
+            }
+            ++active_receivers;
+        }
+        return active_receivers;
+    };
+
+    auto prepare_owner_panel = [&](int block_begin_for_panel, int inner, int buf) {
+        const int owner = OwnerOfPanel(inner, part);
+        if (part.rank != owner) {
+            return;
+        }
+
+        const int panel_rows = m - inner;
+        T* d_pack_w = ws->d_pack_w[buf];
+        T* d_pack_y = ws->d_pack_y[buf];
+
+        // Ensure comm has finished consuming this pack buffer before overwriting it.
+        AssertCuda(cudaStreamWaitEvent(compute_stream, events.comm_done[buf], 0),
+                   "cudaStreamWaitEvent compute_stream <- comm_done[buf]");
+
+        auto panel_prepare_range = distqr::nvtx::MakeScopedRangef(
+            "panel_prepare r=%d b=%d i=%d o=%d", part.rank, block_begin_for_panel, inner, owner);
+
+        const int local_panel_col = LocalColOffset(part, inner);
+        if (local_panel_col < 0) {
+            spdlog::error("Owner rank {} missing panel col {} in local layout.", owner, inner);
+            std::exit(1);
+        }
+
+        T* panel_A = d_A_local + static_cast<size_t>(local_panel_col) * lda_local;
+        T* panel_A_sub = panel_A + inner;
+
+        tsqr<T>(cublas_handle, panel_rows, panel_A_sub, lda_local, ws->d_r_panel, kPanelWidth,
+                ws->d_tsqr_work_panel, ws->tsqr_work_panel_elems, compute_stream);
+
+        generate_wy<T>(panel_rows, kPanelWidth, panel_A_sub, lda_local, d_pack_y, panel_rows,
+                       d_pack_w, panel_rows, compute_stream);
+
+        const dim3 block_dim(16, 16);
+        const dim3 grid_dim((kPanelWidth + block_dim.x - 1) / block_dim.x,
+                            (kPanelWidth + block_dim.y - 1) / block_dim.y);
+        write_upper_r_to_panel_kernel<<<grid_dim, block_dim, 0, compute_stream>>>(
+            inner, ws->d_r_panel, kPanelWidth, panel_A, lda_local);
+        AssertCuda(cudaGetLastError(), "write_upper_r_to_panel_kernel launch");
+
+        AssertCuda(cudaEventRecord(events.panel_ready[buf], compute_stream),
+                   "cudaEventRecord panel_ready[buf]");
+        AssertCuda(cudaStreamWaitEvent(comm_stream, events.panel_ready[buf], 0),
+                   "cudaStreamWaitEvent comm_stream <- panel_ready[buf]");
+    };
+
+    auto launch_panel_comm = [&](int block_begin_for_panel, int inner, int buf) {
+        const int panel_rows = m - inner;
+        const int owner = OwnerOfPanel(inner, part);
+        const int active_receivers = count_active_receivers(inner, owner);
+        T* d_pack_w = ws->d_pack_w[buf];
+        T* d_pack_y = ws->d_pack_y[buf];
+
+        if (part.world_size > 1) {
+            if (panel_comm_mode == PanelCommMode::Broadcast) {
+                {
+                    auto panel_bcast_w_range = distqr::nvtx::MakeScopedRangef(
+                        "panel_bcast_w r=%d b=%d i=%d o=%d", part.rank, block_begin_for_panel,
+                        inner, owner);
+                    AssertNccl(ncclBroadcast(d_pack_w, d_pack_w,
+                                             static_cast<size_t>(panel_rows) * kPanelWidth,
+                                             nccl_type, owner, nccl_comm, comm_stream),
+                               "ncclBroadcast panel W");
+                }
+                {
+                    auto panel_bcast_y_range = distqr::nvtx::MakeScopedRangef(
+                        "panel_bcast_y r=%d b=%d i=%d o=%d", part.rank, block_begin_for_panel,
+                        inner, owner);
+                    AssertNccl(ncclBroadcast(d_pack_y, d_pack_y,
+                                             static_cast<size_t>(panel_rows) * kPanelWidth,
+                                             nccl_type, owner, nccl_comm, comm_stream),
+                               "ncclBroadcast panel Y");
+                }
+                if (comm_profile && active_receivers > 0) {
+                    comm_profile->bytes += 2ULL * static_cast<size_t>(panel_rows) * kPanelWidth *
+                                           sizeof(T) * static_cast<size_t>(active_receivers);
+                }
+                AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
+                           "cudaEventRecord comm_done[buf](bcast)");
+            } else if (part.rank == owner) {
+                const bool any_send = (active_receivers > 0);
+                if (any_send) {
+                    AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
+                }
+                for (int r = 0; r < part.world_size; ++r) {
+                    if (r == owner) {
+                        continue;
+                    }
+                    if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
+                        continue;
+                    }
+                    AssertNccl(ncclSend(d_pack_w, static_cast<size_t>(panel_rows) * kPanelWidth,
+                                        nccl_type, r, nccl_comm, comm_stream),
+                               "ncclSend panel W");
+                    AssertNccl(ncclSend(d_pack_y, static_cast<size_t>(panel_rows) * kPanelWidth,
+                                        nccl_type, r, nccl_comm, comm_stream),
+                               "ncclSend panel Y");
+                    if (comm_profile) {
+                        comm_profile->bytes +=
+                            2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
+                    }
+                }
+                if (any_send) {
+                    AssertNccl(ncclGroupEnd(), "ncclGroupEnd panel W/Y");
+                    AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
+                               "cudaEventRecord comm_done[buf](send)");
+                } else {
+                    // No sends: buffer can be considered comm-free immediately.
+                    AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
+                               "cudaEventRecord comm_done[buf](nosend)");
+                }
+            }
+        } else {
+            // No NCCL comm: for non-owner there is nothing to receive; for owner the pack is
+            // immediately usable and can be overwritten later due to in-stream ordering.
+            AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
+                       "cudaEventRecord comm_done[buf](np1)");
+        }
+    };
+
     int panel_seq = 0;
+    bool pending_lookahead = false;
+    int pending_block_begin = -1;
+    int pending_inner = -1;
+    int pending_buf = -1;
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
         const int block_end = std::min(block_begin + nb, n);
         const int kb = block_end - block_begin;
@@ -564,140 +701,49 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             distqr::nvtx::MakeScopedRangef("qr_block r=%d b=%d:%d", part.rank, block_begin,
                                            block_end);
 
+        const bool block_has_pending_first_panel =
+            pending_lookahead && pending_block_begin == block_begin && pending_inner == block_begin;
+        if (pending_lookahead && !block_has_pending_first_panel) {
+            spdlog::error(
+                "Invalid pending lookahead state (pending block_begin={} inner={}, current "
+                "block_begin={}).",
+                pending_block_begin, pending_inner, block_begin);
+            std::exit(1);
+        }
+
         // Receiver-side lookahead: start receiving the first panel of this block early.
-        prefetch_recv(block_begin, panel_seq & 1);
+        if (!block_has_pending_first_panel) {
+            prefetch_recv(block_begin, panel_seq & 1);
+        }
 
         for (int inner = block_begin; inner < block_end; inner += kPanelWidth) {
             const int buf = panel_seq & 1;
+            const bool use_pending_panel =
+                pending_lookahead && pending_block_begin == block_begin && pending_inner == inner;
+            if (use_pending_panel && pending_buf != buf) {
+                spdlog::error("Pending lookahead buffer mismatch (pending buf={}, current buf={}).",
+                              pending_buf, buf);
+                std::exit(1);
+            }
             ++panel_seq;
             const int panel_rows = m - inner;
             const int owner = OwnerOfPanel(inner, part);
             const int block_col_off = inner - block_begin;
             const bool self_needs_panel = RankHasColsAfter(part, part.rank, inner + kPanelWidth);
-            int active_receivers = 0;
-            for (int r = 0; r < part.world_size; ++r) {
-                if (r == owner) {
-                    continue;
-                }
-                if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
-                    continue;
-                }
-                ++active_receivers;
-            }
             T* d_pack_w = ws->d_pack_w[buf];
             T* d_pack_y = ws->d_pack_y[buf];
 
-            bool owner_prepared = false;
-            if (part.rank == owner) {
-                // Ensure comm has finished consuming this pack buffer before overwriting it.
-                AssertCuda(cudaStreamWaitEvent(compute_stream, events.comm_done[buf], 0),
-                           "cudaStreamWaitEvent compute_stream <- comm_done[buf]");
-
-                auto panel_prepare_range = distqr::nvtx::MakeScopedRangef(
-                    "panel_prepare r=%d b=%d i=%d o=%d", part.rank, block_begin, inner, owner);
-
-                const int local_panel_col = LocalColOffset(part, inner);
-                if (local_panel_col < 0) {
-                    spdlog::error("Owner rank {} missing panel col {} in local layout.", owner,
-                                  inner);
-                    std::exit(1);
-                }
-
-                T* panel_A = d_A_local + static_cast<size_t>(local_panel_col) * lda_local;
-                T* panel_A_sub = panel_A + inner;
-
-                tsqr<T>(cublas_handle, panel_rows, panel_A_sub, lda_local, ws->d_r_panel,
-                        kPanelWidth, ws->d_tsqr_work_panel, ws->tsqr_work_panel_elems,
-                        compute_stream);
-
-                generate_wy<T>(panel_rows, kPanelWidth, panel_A_sub, lda_local, d_pack_y,
-                               panel_rows, d_pack_w, panel_rows, compute_stream);
-
-                const dim3 block_dim(16, 16);
-                const dim3 grid_dim((kPanelWidth + block_dim.x - 1) / block_dim.x,
-                                    (kPanelWidth + block_dim.y - 1) / block_dim.y);
-                write_upper_r_to_panel_kernel<<<grid_dim, block_dim, 0, compute_stream>>>(
-                    inner, ws->d_r_panel, kPanelWidth, panel_A, lda_local);
-                AssertCuda(cudaGetLastError(), "write_upper_r_to_panel_kernel launch");
-
-                owner_prepared = true;
-
-                AssertCuda(cudaEventRecord(events.panel_ready[buf], compute_stream),
-                           "cudaEventRecord panel_ready[buf]");
-                AssertCuda(cudaStreamWaitEvent(comm_stream, events.panel_ready[buf], 0),
-                           "cudaStreamWaitEvent comm_stream <- panel_ready[buf]");
+            if (use_pending_panel) {
+                pending_lookahead = false;
+                pending_block_begin = -1;
+                pending_inner = -1;
+                pending_buf = -1;
+            } else if (part.rank == owner) {
+                prepare_owner_panel(block_begin, inner, buf);
             }
 
-            if (!owner_prepared && part.rank == owner) {
-                spdlog::error("Owner rank {} failed to prepare panel at col {}.", owner, inner);
-                std::exit(1);
-            }
-
-            if (part.world_size > 1) {
-                if (panel_comm_mode == PanelCommMode::Broadcast) {
-                    {
-                        auto panel_bcast_w_range = distqr::nvtx::MakeScopedRangef(
-                            "panel_bcast_w r=%d b=%d i=%d o=%d", part.rank, block_begin, inner,
-                            owner);
-                        AssertNccl(ncclBroadcast(d_pack_w, d_pack_w,
-                                                 static_cast<size_t>(panel_rows) * kPanelWidth,
-                                                 nccl_type, owner, nccl_comm, comm_stream),
-                                   "ncclBroadcast panel W");
-                    }
-                    {
-                        auto panel_bcast_y_range = distqr::nvtx::MakeScopedRangef(
-                            "panel_bcast_y r=%d b=%d i=%d o=%d", part.rank, block_begin, inner,
-                            owner);
-                        AssertNccl(ncclBroadcast(d_pack_y, d_pack_y,
-                                                 static_cast<size_t>(panel_rows) * kPanelWidth,
-                                                 nccl_type, owner, nccl_comm, comm_stream),
-                                   "ncclBroadcast panel Y");
-                    }
-                    if (comm_profile && active_receivers > 0) {
-                        comm_profile->bytes += 2ULL * static_cast<size_t>(panel_rows) *
-                                               kPanelWidth * sizeof(T) *
-                                               static_cast<size_t>(active_receivers);
-                    }
-                    AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
-                               "cudaEventRecord comm_done[buf](bcast)");
-                } else if (part.rank == owner) {
-                    const bool any_send = (active_receivers > 0);
-                    if (any_send) {
-                        AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
-                    }
-                    for (int r = 0; r < part.world_size; ++r) {
-                        if (r == owner) {
-                            continue;
-                        }
-                        if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
-                            continue;
-                        }
-                        AssertNccl(ncclSend(d_pack_w, static_cast<size_t>(panel_rows) * kPanelWidth,
-                                            nccl_type, r, nccl_comm, comm_stream),
-                                   "ncclSend panel W");
-                        AssertNccl(ncclSend(d_pack_y, static_cast<size_t>(panel_rows) * kPanelWidth,
-                                            nccl_type, r, nccl_comm, comm_stream),
-                                   "ncclSend panel Y");
-                        if (comm_profile) {
-                            comm_profile->bytes +=
-                                2ULL * static_cast<size_t>(panel_rows) * kPanelWidth * sizeof(T);
-                        }
-                    }
-                    if (any_send) {
-                        AssertNccl(ncclGroupEnd(), "ncclGroupEnd panel W/Y");
-                        AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
-                                   "cudaEventRecord comm_done[buf](send)");
-                    } else {
-                        // No sends: buffer can be considered comm-free immediately.
-                        AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
-                                   "cudaEventRecord comm_done[buf](nosend)");
-                    }
-                }
-            } else {
-                // No NCCL comm: for non-owner there is nothing to receive; for owner the pack is
-                // immediately usable and can be overwritten later due to in-stream ordering.
-                AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
-                           "cudaEventRecord comm_done[buf](np1)");
+            if (!use_pending_panel) {
+                launch_panel_comm(block_begin, inner, buf);
             }
 
             // Receiver-side lookahead: enqueue the next panel receive before we start the heavy
@@ -862,9 +908,67 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
         }
 
-        // Apply block WY to trailing columns after the block (full rows, like single-GPU).
+        const int next_block_begin = block_end;
+        const int next_block_end = std::min(next_block_begin + nb, n);
+        const int next_panel_end = std::min(next_block_begin + kPanelWidth, n);
         const int block_rows = m - block_begin;
-        const int trail_begin = block_end;
+        bool frontier_applied_here = false;
+        if (next_block_begin < n) {
+            const int next_buf = panel_seq & 1;
+            const int next_owner = OwnerOfPanel(next_block_begin, part);
+            if (panel_comm_mode == PanelCommMode::SendRecv) {
+                prefetch_recv(next_block_begin, next_buf);
+            }
+
+            if (part.rank == next_owner) {
+                const int local_panel_col = LocalColOffset(part, next_block_begin);
+                if (local_panel_col < 0) {
+                    spdlog::error("Next owner rank {} missing panel col {} in local layout.",
+                                  next_owner, next_block_begin);
+                    std::exit(1);
+                }
+                T* a_frontier = d_A_local + static_cast<size_t>(local_panel_col) * lda_local;
+                const int frontier_cols = next_panel_end - next_block_begin;
+                if (frontier_cols > 0) {
+                    frontier_applied_here = true;
+                    if (trail_one_shot) {
+                        auto frontier_update_range = distqr::nvtx::MakeScopedRangef(
+                            "frontier_update_1shot r=%d b=%d seg=%d:%d", part.rank, block_begin,
+                            next_block_begin, next_panel_end);
+                        block_update_one_shot(cublas_handle, block_begin, block_rows, kb,
+                                              frontier_cols,
+                                              ws->d_block_w + static_cast<size_t>(block_begin),
+                                              ws->d_block_y + static_cast<size_t>(block_begin), m,
+                                              a_frontier, lda_local, ws->d_tmp0, ws->tmp_elems);
+                    } else {
+                        auto frontier_update_range = distqr::nvtx::MakeScopedRangef(
+                            "frontier_update_tiled r=%d b=%d seg=%d:%d", part.rank, block_begin,
+                            next_block_begin, next_panel_end);
+                        block_update_tile_pipeline(
+                            cublas_handle, compute_stream, block_begin, block_rows, kb,
+                            frontier_cols, tile_cols,
+                            ws->d_block_w + static_cast<size_t>(block_begin),
+                            ws->d_block_y + static_cast<size_t>(block_begin), m, a_frontier,
+                            lda_local, ws->d_tmp0, ws->d_tmp1);
+                    }
+                }
+                prepare_owner_panel(next_block_begin, next_block_begin, next_buf);
+            }
+
+            if (panel_comm_mode == PanelCommMode::Broadcast || part.rank == next_owner ||
+                part.world_size <= 1) {
+                launch_panel_comm(next_block_begin, next_block_begin, next_buf);
+            }
+
+            pending_lookahead = true;
+            pending_block_begin = next_block_begin;
+            pending_inner = next_block_begin;
+            pending_buf = next_buf;
+        }
+
+        // Apply block WY to trailing columns after the block (full rows, like single-GPU).
+        const int trail_begin =
+            frontier_applied_here ? std::min(next_panel_end, next_block_end) : block_end;
         if (use_compact_local_gemm) {
             const int local_begin = LocalColPrefix(part, trail_begin);
             const int cols_local = LocalColPrefix(part, n) - local_begin;
