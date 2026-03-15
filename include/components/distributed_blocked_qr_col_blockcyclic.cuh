@@ -191,9 +191,11 @@ struct DistributedQrColBlockCyclicWorkspace {
     size_t tsqr_work_panel_elems = 0;
 
     // Packed (contiguous) W/Y for a single panel: [panel_rows x kPanelWidth].
-    // Double-buffered so that panel k comm can overlap panel k+1 compute.
-    T* d_pack_w[2] = {nullptr, nullptr};
-    T* d_pack_y[2] = {nullptr, nullptr};
+    // Configurable N-buffering so panel comm can overlap later panel compute without forcing
+    // immediate pack-buffer reuse.
+    int pack_buffer_count = 2;
+    std::vector<T*> d_pack_w = std::vector<T*>(2, nullptr);
+    std::vector<T*> d_pack_y = std::vector<T*>(2, nullptr);
     size_t pack_elems = 0;
 
     // Block-level WY buffers for a single outer block (nb columns).
@@ -468,41 +470,60 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     if (comm_profile) {
         comm_profile->bytes = 0;
     }
+    const int pack_buffers = ws->pack_buffer_count;
+    if (pack_buffers < 2) {
+        spdlog::error("Col blockcyclic requires pack_buffer_count >= 2 (got {}).", pack_buffers);
+        std::exit(1);
+    }
     const size_t pack_need = static_cast<size_t>(m) * static_cast<size_t>(kPanelWidth);
-    if (!ws->d_pack_w[0] || !ws->d_pack_w[1] || !ws->d_pack_y[0] || !ws->d_pack_y[1] ||
-        ws->pack_elems < pack_need) {
+    if (static_cast<int>(ws->d_pack_w.size()) < pack_buffers ||
+        static_cast<int>(ws->d_pack_y.size()) < pack_buffers || ws->pack_elems < pack_need) {
         spdlog::error(
-            "Col blockcyclic pack buffers too small or null (need {} elems per buffer, got {}).",
-            pack_need, ws->pack_elems);
+            "Col blockcyclic pack buffer vectors too small (need {} buffers, got W={} Y={}).",
+            pack_buffers, ws->d_pack_w.size(), ws->d_pack_y.size());
         std::exit(1);
     }
-    const size_t block_storage_need = static_cast<size_t>(m) * static_cast<size_t>(nb);
-    if (!ws->d_block_w || !ws->d_block_y || ws->block_storage_elems < block_storage_need) {
-        spdlog::error("Col blockcyclic block storage too small (need {} elems, got {}).",
-                      block_storage_need, ws->block_storage_elems);
-        std::exit(1);
-    }
-    const int compact_rows = nb + kPanelWidth;
-    const size_t compact_need = static_cast<size_t>(compact_rows) * static_cast<size_t>(nb);
-    if (!ws->d_block_w_compact || !ws->d_block_y_compact ||
-        ws->block_compact_elems < compact_need) {
-        spdlog::error("Col blockcyclic compact storage too small (need {} elems, got {}).",
-                      compact_need, ws->block_compact_elems);
-        std::exit(1);
+    for (int i = 0; i < pack_buffers; ++i) {
+        if (!ws->d_pack_w[i] || !ws->d_pack_y[i]) {
+            spdlog::error(
+                "Col blockcyclic pack buffers too small or null (need {} elems per buffer, got "
+                "{}; null at slot {}).",
+                pack_need, ws->pack_elems, i);
+            std::exit(1);
+        }
     }
 
-    AssertCublas(cublasSetStream(cublas_handle, compute_stream), "cublasSetStream(compute_stream)");
-    const ncclDataType_t nccl_type = NcclType<T>();
+    auto pack_buf = [&](int seq) {
+        return seq % pack_buffers;
+    };
+
+    auto destroy_event_vec = [&](std::vector<cudaEvent_t>& event_vec, const char* context) {
+        for (cudaEvent_t event : event_vec) {
+            if (event != nullptr) {
+                AssertCuda(cudaEventDestroy(event), context);
+            }
+        }
+        event_vec.clear();
+    };
 
     struct PersistentEvents {
         bool initialized = false;
-        cudaEvent_t panel_ready[2] = {};
-        cudaEvent_t comm_done[2] = {};
-        cudaEvent_t compute_done[2] = {};
+        int buffer_count = 0;
+        std::vector<cudaEvent_t> panel_ready;
+        std::vector<cudaEvent_t> comm_done;
+        std::vector<cudaEvent_t> compute_done;
     };
     static PersistentEvents events;
-    if (!events.initialized) {
-        for (int i = 0; i < 2; ++i) {
+    if (!events.initialized || events.buffer_count != pack_buffers) {
+        if (events.initialized) {
+            destroy_event_vec(events.panel_ready, "cudaEventDestroy panel_ready");
+            destroy_event_vec(events.comm_done, "cudaEventDestroy comm_done");
+            destroy_event_vec(events.compute_done, "cudaEventDestroy compute_done");
+        }
+        events.panel_ready.assign(pack_buffers, nullptr);
+        events.comm_done.assign(pack_buffers, nullptr);
+        events.compute_done.assign(pack_buffers, nullptr);
+        for (int i = 0; i < pack_buffers; ++i) {
             AssertCuda(cudaEventCreateWithFlags(&events.panel_ready[i], cudaEventDisableTiming),
                        "cudaEventCreate panel_ready[i]");
             AssertCuda(cudaEventCreateWithFlags(&events.comm_done[i], cudaEventDisableTiming),
@@ -511,15 +532,18 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                        "cudaEventCreate compute_done[i]");
         }
         events.initialized = true;
+        events.buffer_count = pack_buffers;
     }
 
-    // Initialize reuse guards: both pack buffers start out free.
-    AssertCuda(cudaEventRecord(events.comm_done[0], comm_stream), "cudaEventRecord comm_done[0]");
-    AssertCuda(cudaEventRecord(events.comm_done[1], comm_stream), "cudaEventRecord comm_done[1]");
-    AssertCuda(cudaEventRecord(events.compute_done[0], compute_stream),
-               "cudaEventRecord compute_done[0]");
-    AssertCuda(cudaEventRecord(events.compute_done[1], compute_stream),
-               "cudaEventRecord compute_done[1]");
+    // Initialize reuse guards: all pack buffers start out free.
+    for (int i = 0; i < pack_buffers; ++i) {
+        AssertCuda(cudaEventRecord(events.comm_done[i], comm_stream), "cudaEventRecord comm_done");
+        AssertCuda(cudaEventRecord(events.compute_done[i], compute_stream),
+                   "cudaEventRecord compute_done");
+    }
+
+    AssertCublas(cublasSetStream(cublas_handle, compute_stream), "cublasSetStream(compute_stream)");
+    const ncclDataType_t nccl_type = NcclType<T>();
 
     auto prefetch_recv = [&](int inner, int buf) {
         if (panel_comm_mode != PanelCommMode::SendRecv) {
@@ -555,6 +579,20 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                    "cudaEventRecord comm_done[buf](prefetch)");
     };
+    const size_t block_storage_need = static_cast<size_t>(m) * static_cast<size_t>(nb);
+    if (!ws->d_block_w || !ws->d_block_y || ws->block_storage_elems < block_storage_need) {
+        spdlog::error("Col blockcyclic block storage too small (need {} elems, got {}).",
+                      block_storage_need, ws->block_storage_elems);
+        std::exit(1);
+    }
+    const int compact_rows = nb + kPanelWidth;
+    const size_t compact_need = static_cast<size_t>(compact_rows) * static_cast<size_t>(nb);
+    if (!ws->d_block_w_compact || !ws->d_block_y_compact ||
+        ws->block_compact_elems < compact_need) {
+        spdlog::error("Col blockcyclic compact storage too small (need {} elems, got {}).",
+                      compact_need, ws->block_compact_elems);
+        std::exit(1);
+    }
 
     int panel_seq = 0;
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
@@ -565,10 +603,10 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                                            block_end);
 
         // Receiver-side lookahead: start receiving the first panel of this block early.
-        prefetch_recv(block_begin, panel_seq & 1);
+        prefetch_recv(block_begin, pack_buf(panel_seq));
 
         for (int inner = block_begin; inner < block_end; inner += kPanelWidth) {
-            const int buf = panel_seq & 1;
+            const int buf = pack_buf(panel_seq);
             ++panel_seq;
             const int panel_rows = m - inner;
             const int owner = OwnerOfPanel(inner, part);
@@ -710,7 +748,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             // compute for this panel.
             const int next_inner = inner + kPanelWidth;
             if (next_inner < block_end) {
-                prefetch_recv(next_inner, buf ^ 1);
+                prefetch_recv(next_inner, pack_buf(panel_seq));
             }
 
             // Apply this panel to local columns inside the current block using the original

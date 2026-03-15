@@ -91,8 +91,10 @@ void ApplyAllOuterPanelsQTToA(
     distributed_qr_col_blockcyclic::AssertCublas(cublasSetStream(cublas_handle, compute_stream),
                                                  "cublasSetStream(compute_stream)");
     ASSERT_NE(ws, nullptr);
-    T* pack_w = ws->d_pack_w[0];
-    T* pack_y = ws->d_pack_y[0];
+    ASSERT_FALSE(ws->d_pack_w.empty());
+    ASSERT_FALSE(ws->d_pack_y.empty());
+    T* pack_w = ws->d_pack_w.front();
+    T* pack_y = ws->d_pack_y.front();
 
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
         const int block_end = std::min(block_begin + nb, n);
@@ -194,6 +196,7 @@ struct ColBlockCyclicCorrectnessConfig {
     int nb = 256;
     int block_cols = 256;
     int overlap_tile = 0;
+    int panel_buffers = 2;
     distributed_qr_col_blockcyclic::PanelCommMode panel_comm_mode =
         distributed_qr_col_blockcyclic::PanelCommMode::SendRecv;
     bool use_compact_local_gemm = true;
@@ -213,6 +216,7 @@ void RunFactorizedAEqualsQtA0(const ColBlockCyclicCorrectnessConfig& cfg,
     ASSERT_GT(cfg.n, 0);
     ASSERT_GT(cfg.nb, 0);
     ASSERT_GT(cfg.block_cols, 0);
+    ASSERT_GE(cfg.panel_buffers, 2);
     ASSERT_EQ(cfg.block_cols % cfg.nb, 0);
     ASSERT_EQ(cfg.block_cols % distributed_qr_col_blockcyclic::kPanelWidth, 0);
 
@@ -259,6 +263,9 @@ void RunFactorizedAEqualsQtA0(const ColBlockCyclicCorrectnessConfig& cfg,
             : std::max(distributed_qr_col_blockcyclic::kPanelWidth,
                        std::min(cfg.overlap_tile, cfg.nb));
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
+    ws.pack_buffer_count = cfg.panel_buffers;
+    ws.d_pack_w.assign(ws.pack_buffer_count, nullptr);
+    ws.d_pack_y.assign(ws.pack_buffer_count, nullptr);
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(cfg.m), static_cast<size_t>(1));
     ws.pack_elems =
         static_cast<size_t>(cfg.m) *
@@ -276,14 +283,12 @@ void RunFactorizedAEqualsQtA0(const ColBlockCyclicCorrectnessConfig& cfg,
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(T)),
         "cudaMalloc ws.d_tsqr_work_panel");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_w[0], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_w[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_w[1], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_w[1]");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_y[0], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_y[1], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[1]");
+    for (int i = 0; i < ws.pack_buffer_count; ++i) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws.d_pack_w[i], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_w[i]");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws.d_pack_y[i], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[i]");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(
@@ -405,10 +410,10 @@ void RunFactorizedAEqualsQtA0(const ColBlockCyclicCorrectnessConfig& cfg,
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_r_panel), "cudaFree ws.d_r_panel");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tsqr_work_panel),
                                                "cudaFree ws.d_tsqr_work_panel");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[0]), "cudaFree ws.d_pack_w[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[1]), "cudaFree ws.d_pack_w[1]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[0]), "cudaFree ws.d_pack_y[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[1]), "cudaFree ws.d_pack_y[1]");
+    for (int i = 0; i < ws.pack_buffer_count; ++i) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[i]), "cudaFree ws.d_pack_w[i]");
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[i]), "cudaFree ws.d_pack_y[i]");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w), "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y), "cudaFree ws.d_block_y");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_compact),
@@ -443,6 +448,20 @@ TEST(DistBlockedQrColBlockCyclicCorrectnessTest, BroadcastBlockCols2NbTiledSegme
     cfg.panel_comm_mode = distributed_qr_col_blockcyclic::PanelCommMode::Broadcast;
     cfg.use_compact_local_gemm = false;
     cfg.case_name = "broadcast_block_cols_2048_tiled_segmented";
+    RunFactorizedAEqualsQtA0<float>(cfg, 1.5e-3, 1.5e-3);
+}
+
+TEST(DistBlockedQrColBlockCyclicCorrectnessTest, BroadcastThreePanelBuffersFloat) {
+    ColBlockCyclicCorrectnessConfig cfg;
+    cfg.m = 4096;
+    cfg.n = 4096;
+    cfg.nb = 512;
+    cfg.block_cols = 1024;
+    cfg.overlap_tile = 512;
+    cfg.panel_buffers = 3;
+    cfg.panel_comm_mode = distributed_qr_col_blockcyclic::PanelCommMode::Broadcast;
+    cfg.use_compact_local_gemm = false;
+    cfg.case_name = "broadcast_three_panel_buffers";
     RunFactorizedAEqualsQtA0<float>(cfg, 1.5e-3, 1.5e-3);
 }
 

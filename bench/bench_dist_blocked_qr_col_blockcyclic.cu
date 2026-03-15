@@ -78,6 +78,7 @@ struct Options {
     int iters = 3;
     int overlap_tile = 0;
     int block_cols = 0;
+    int panel_buffers = 2;
     bool print_per_rank = false;
     bool print_comm_bw = false;
     bool use_double = false;
@@ -137,6 +138,10 @@ Options ParseArgs(int argc, char** argv) {
             opts.overlap_tile = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--block_cols") == 0 && i + 1 < argc) {
             opts.block_cols = std::atoi(argv[++i]);
+        } else if ((std::strcmp(argv[i], "--panel-buffers") == 0 ||
+                    std::strcmp(argv[i], "--pack-buffers") == 0) &&
+                   i + 1 < argc) {
+            opts.panel_buffers = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--print_per_rank") == 0) {
             opts.print_per_rank = true;
         } else if (std::strcmp(argv[i], "--print_comm_bw") == 0) {
@@ -189,6 +194,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                               : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
+    ws.pack_buffer_count = opts.panel_buffers;
+    ws.d_pack_w.assign(ws.pack_buffer_count, nullptr);
+    ws.d_pack_y.assign(ws.pack_buffer_count, nullptr);
     ws.pack_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
     ws.block_storage_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
     ws.block_compact_elems =
@@ -201,14 +209,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_tsqr_work_panel, ws.tsqr_work_panel_elems * sizeof(T)),
         "cudaMalloc ws.d_tsqr_work_panel");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_w[0], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_w[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_w[1], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_w[1]");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_y[0], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(
-        cudaMalloc(&ws.d_pack_y[1], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[1]");
+    for (int i = 0; i < ws.pack_buffer_count; ++i) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws.d_pack_w[i], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_w[i]");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws.d_pack_y[i], ws.pack_elems * sizeof(T)), "cudaMalloc ws.d_pack_y[i]");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(
@@ -412,8 +418,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (env.rank == 0) {
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
-            "trail_update={} tile={} panel_comm={} local_update={} np={} avg {:.3f} ms",
-            DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols,
+            "panel_buffers={} trail_update={} tile={} panel_comm={} local_update={} np={} avg "
+            "{:.3f} ms",
+            DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.panel_buffers,
             trail_one_shot ? "one-shot" : "tiled", trail_one_shot ? part.local_cols : tile_cols,
             PanelCommModeToString(opts.panel_comm_mode),
             opts.use_compact_local_gemm ? "compact" : "segmented", env.size, max_ms);
@@ -460,10 +467,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_r_panel), "cudaFree ws.d_r_panel");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tsqr_work_panel),
                                                "cudaFree ws.d_tsqr_work_panel");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[0]), "cudaFree ws.d_pack_w[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[1]), "cudaFree ws.d_pack_w[1]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[0]), "cudaFree ws.d_pack_y[0]");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[1]), "cudaFree ws.d_pack_y[1]");
+    for (int i = 0; i < ws.pack_buffer_count; ++i) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_w[i]), "cudaFree ws.d_pack_w[i]");
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_pack_y[i]), "cudaFree ws.d_pack_y[i]");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w), "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y), "cudaFree ws.d_block_y");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_compact),
@@ -524,6 +531,15 @@ int main(int argc, char** argv) {
             spdlog::error(
                 "Invalid args: require warmup >= 0 and iters > 0 (got warmup={} iters={})",
                 opts.warmup, opts.iters);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
+    if (opts.panel_buffers < 2) {
+        if (env.rank == 0) {
+            spdlog::error("Invalid args: require panel_buffers >= 2 (got {}).",
+                          opts.panel_buffers);
         }
         finalize_nccl_if_needed(&env);
         finalize_mpi_if_needed(env);
