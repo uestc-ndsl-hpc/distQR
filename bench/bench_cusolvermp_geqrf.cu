@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <curand.h>
 #include <cusolverMp.h>
 #include <mpi.h>
 #include <nccl.h>
@@ -10,7 +11,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <random>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -31,6 +31,37 @@ void AssertCusolver(cusolverStatus_t status, const char* context) {
         spdlog::error("{}: cusolver error {}", context, static_cast<int>(status));
         std::exit(1);
     }
+}
+
+void AssertCurand(curandStatus_t status, const char* context) {
+    if (status != CURAND_STATUS_SUCCESS) {
+        spdlog::error("{}: curand error {}", context, static_cast<int>(status));
+        std::exit(1);
+    }
+}
+
+template <typename T>
+void FillDeviceRandom(T* device_data,
+                      size_t count,
+                      unsigned long long seed,
+                      cudaStream_t stream) {
+    if (count == 0) {
+        return;
+    }
+
+    curandGenerator_t gen = nullptr;
+    AssertCurand(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT),
+                 "curandCreateGenerator");
+    AssertCurand(curandSetPseudoRandomGeneratorSeed(gen, seed),
+                 "curandSetPseudoRandomGeneratorSeed");
+    AssertCurand(curandSetStream(gen, stream), "curandSetStream");
+    if constexpr (std::is_same_v<T, float>) {
+        AssertCurand(curandGenerateUniform(gen, device_data, count), "curandGenerateUniform");
+    } else {
+        AssertCurand(curandGenerateUniformDouble(gen, device_data, count),
+                     "curandGenerateUniformDouble");
+    }
+    AssertCurand(curandDestroyGenerator(gen), "curandDestroyGenerator");
 }
 
 template <typename T>
@@ -217,6 +248,9 @@ int RunSingleCase(const MpiCudaEnv& env,
     const size_t local_elems =
         static_cast<size_t>(lda_local) * static_cast<size_t>(std::max<int64_t>(1, local_cols));
     const size_t local_bytes = local_elems * sizeof(T);
+    const size_t local_elems_used =
+        static_cast<size_t>(std::max<int64_t>(local_rows, 0)) *
+        static_cast<size_t>(std::max<int64_t>(local_cols, 0));
 
     const int64_t local_tau = cusolverMpNUMROC(
         static_cast<int64_t>(n), static_cast<int64_t>(grid_block_size), proc_col, 0, grid_cols);
@@ -257,20 +291,8 @@ int RunSingleCase(const MpiCudaEnv& env,
     cudaStream_t stream = nullptr;
     AssertCusolver(cusolverMpGetStream(mp_handle, &stream), "cusolverMpGetStream");
 
-    std::vector<T> h_A;
-    if (env.rank == 0) {
-        h_A.resize(static_cast<size_t>(m) * static_cast<size_t>(n));
-        std::mt19937 rng(20260305U);
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        for (size_t i = 0; i < h_A.size(); ++i) {
-            h_A[i] = static_cast<T>(dist(rng));
-        }
-    }
-    AssertCusolver(cusolverMpMatrixScatterH2D(
-                       mp_handle, static_cast<int64_t>(m), static_cast<int64_t>(n), d_A0, 1, 1,
-                       descA, 0, (env.rank == 0) ? h_A.data() : nullptr, static_cast<int64_t>(m)),
-                   "cusolverMpMatrixScatterH2D");
-    AssertCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize scatter");
+    FillDeviceRandom(d_A0, local_elems_used,
+                     20260305ULL + static_cast<unsigned long long>(env.rank), stream);
 
     int info = 0;
     for (int i = 0; i < opts.warmup; ++i) {

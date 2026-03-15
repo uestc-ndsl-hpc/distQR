@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <curand.h>
 #include <cusolverMp.h>
 #include <mpi.h>
 #include <nccl.h>
@@ -11,7 +12,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <random>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -32,6 +32,106 @@ void AssertCusolver(cusolverStatus_t status, const char* context) {
         spdlog::error("{}: cusolver error {}", context, static_cast<int>(status));
         std::exit(1);
     }
+}
+
+void AssertCurand(curandStatus_t status, const char* context) {
+    if (status != CURAND_STATUS_SUCCESS) {
+        spdlog::error("{}: curand error {}", context, static_cast<int>(status));
+        std::exit(1);
+    }
+}
+
+template <typename T>
+void FillDeviceRandom(T* device_data,
+                      size_t count,
+                      unsigned long long seed,
+                      cudaStream_t stream) {
+    if (count == 0) {
+        return;
+    }
+
+    curandGenerator_t gen = nullptr;
+    AssertCurand(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT),
+                 "curandCreateGenerator");
+    AssertCurand(curandSetPseudoRandomGeneratorSeed(gen, seed),
+                 "curandSetPseudoRandomGeneratorSeed");
+    AssertCurand(curandSetStream(gen, stream), "curandSetStream");
+    if constexpr (std::is_same_v<T, float>) {
+        AssertCurand(curandGenerateUniform(gen, device_data, count), "curandGenerateUniform");
+    } else {
+        AssertCurand(curandGenerateUniformDouble(gen, device_data, count),
+                     "curandGenerateUniformDouble");
+    }
+    AssertCurand(curandDestroyGenerator(gen), "curandDestroyGenerator");
+}
+
+template <typename T>
+__global__ void set_local_identity_blockcyclic_kernel(int m,
+                                                      int n,
+                                                      int block_size,
+                                                      int proc_row,
+                                                      int proc_col,
+                                                      int grid_rows,
+                                                      int grid_cols,
+                                                      int local_rows,
+                                                      int local_cols,
+                                                      T* A_local,
+                                                      int lda_local) {
+    const int local_col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local_col >= local_cols) {
+        return;
+    }
+
+    const int local_col_block = local_col / block_size;
+    const int col_in_block = local_col % block_size;
+    const int global_col_block = local_col_block * grid_cols + proc_col;
+    const int global_col = global_col_block * block_size + col_in_block;
+    if (global_col >= n || global_col >= m) {
+        return;
+    }
+
+    const int owner_row = global_col_block % grid_rows;
+    if (owner_row != proc_row) {
+        return;
+    }
+
+    const int local_row_block = global_col_block / grid_rows;
+    const int local_row = local_row_block * block_size + col_in_block;
+    if (local_row >= local_rows) {
+        return;
+    }
+
+    A_local[static_cast<size_t>(local_row) + static_cast<size_t>(local_col) * lda_local] =
+        static_cast<T>(1);
+}
+
+template <typename T>
+void SetLocalDistributedIdentity(int m,
+                                 int n,
+                                 int block_size,
+                                 int proc_row,
+                                 int proc_col,
+                                 int grid_rows,
+                                 int grid_cols,
+                                 int local_rows,
+                                 int local_cols,
+                                 T* d_A_local,
+                                 int lda_local,
+                                 cudaStream_t stream) {
+    const size_t elems =
+        static_cast<size_t>(lda_local) * static_cast<size_t>(std::max(local_cols, 1));
+    AssertCuda(cudaMemsetAsync(d_A_local, 0, elems * sizeof(T), stream),
+               "cudaMemsetAsync distributed identity");
+    if (local_cols <= 0 || local_rows <= 0) {
+        return;
+    }
+
+    constexpr int kThreads = 256;
+    const int blocks = (local_cols + kThreads - 1) / kThreads;
+    set_local_identity_blockcyclic_kernel<T><<<blocks, kThreads, 0, stream>>>(
+        m, n, block_size, proc_row, proc_col, grid_rows, grid_cols, local_rows, local_cols,
+        d_A_local, lda_local);
+    AssertCuda(cudaGetLastError(), "set_local_identity_blockcyclic_kernel launch");
 }
 
 template <typename T>
@@ -243,6 +343,9 @@ int RunSingleCase(const MpiCudaEnv& env,
     const size_t local_elems_a =
         static_cast<size_t>(lda_local_a) * static_cast<size_t>(std::max<int64_t>(1, local_cols_a));
     const size_t local_bytes_a = local_elems_a * sizeof(T);
+    const size_t local_elems_a_used =
+        static_cast<size_t>(std::max<int64_t>(local_rows_a, 0)) *
+        static_cast<size_t>(std::max<int64_t>(local_cols_a, 0));
 
     const int64_t local_rows_c = cusolverMpNUMROC(
         static_cast<int64_t>(m), static_cast<int64_t>(grid_block_size), proc_row, 0, grid_rows);
@@ -253,6 +356,9 @@ int RunSingleCase(const MpiCudaEnv& env,
     const size_t local_elems_c =
         static_cast<size_t>(lda_local_c) * static_cast<size_t>(std::max<int64_t>(1, local_cols_c));
     const size_t local_bytes_c = local_elems_c * sizeof(T);
+    const size_t local_elems_c_used =
+        static_cast<size_t>(std::max<int64_t>(local_rows_c, 0)) *
+        static_cast<size_t>(std::max<int64_t>(local_cols_c, 0));
 
     const int64_t local_tau = cusolverMpNUMROC(
         static_cast<int64_t>(n), static_cast<int64_t>(grid_block_size), proc_col, 0, grid_cols);
@@ -317,41 +423,19 @@ int RunSingleCase(const MpiCudaEnv& env,
     cudaStream_t stream = nullptr;
     AssertCusolver(cusolverMpGetStream(mp_handle, &stream), "cusolverMpGetStream");
 
-    std::vector<T> h_A;
-    std::vector<T> h_C;
-    if (env.rank == 0) {
-        h_A.resize(static_cast<size_t>(m) * static_cast<size_t>(n));
-        h_C.resize(static_cast<size_t>(m) * static_cast<size_t>(c_cols), static_cast<T>(0));
-
-        std::mt19937 rng(20260316U);
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        for (size_t i = 0; i < h_A.size(); ++i) {
-            h_A[i] = static_cast<T>(dist(rng));
-        }
-
-        if (opts.random_c) {
-            for (size_t i = 0; i < h_C.size(); ++i) {
-                h_C[i] = static_cast<T>(dist(rng));
-            }
-        } else {
-            const int diag = std::min(m, c_cols);
-            for (int col = 0; col < diag; ++col) {
-                h_C[static_cast<size_t>(col) + static_cast<size_t>(col) * static_cast<size_t>(m)] =
-                    static_cast<T>(1);
-            }
-        }
+    FillDeviceRandom(d_A0, local_elems_a_used,
+                     20260316ULL + static_cast<unsigned long long>(env.rank), stream);
+    if (opts.random_c) {
+        FillDeviceRandom(d_C0, local_elems_c_used,
+                         20260316ULL + 1000003ULL + static_cast<unsigned long long>(env.rank),
+                         stream);
+    } else {
+        SetLocalDistributedIdentity<T>(m, c_cols, grid_block_size, proc_row, proc_col, grid_rows,
+                                       grid_cols, static_cast<int>(local_rows_c),
+                                       static_cast<int>(local_cols_c), d_C0,
+                                       static_cast<int>(lda_local_c), stream);
+        AssertCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize identity init");
     }
-
-    AssertCusolver(cusolverMpMatrixScatterH2D(
-                       mp_handle, static_cast<int64_t>(m), static_cast<int64_t>(n), d_A0, 1, 1,
-                       descA, 0, (env.rank == 0) ? h_A.data() : nullptr, static_cast<int64_t>(m)),
-                   "cusolverMpMatrixScatterH2D A0");
-    AssertCusolver(cusolverMpMatrixScatterH2D(
-                       mp_handle, static_cast<int64_t>(m), static_cast<int64_t>(c_cols), d_C0, 1,
-                       1, descC, 0, (env.rank == 0) ? h_C.data() : nullptr,
-                       static_cast<int64_t>(m)),
-                   "cusolverMpMatrixScatterH2D C0");
-    AssertCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize scatter");
 
     AssertCuda(cudaMemset(d_info, 0, sizeof(int)), "cudaMemset d_info precompute");
     AssertCuda(cudaMemcpyAsync(d_Afact, d_A0, local_bytes_a, cudaMemcpyDeviceToDevice, stream),
