@@ -219,6 +219,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     const int tile_cols = trail_one_shot
                               ? std::max(part.local_cols, 1)
                               : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
+    const bool need_block_lookahead_buffers =
+        opts.panel_comm_mode == PanelCommMode::Broadcast &&
+        opts.broadcast_mode == BroadcastMode::Block;
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.pack_buffer_count = opts.panel_buffers;
@@ -226,9 +229,12 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     ws.d_pack_y.assign(ws.pack_buffer_count, nullptr);
     ws.pack_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(kPanelWidth);
     ws.block_storage_elems = static_cast<size_t>(opts.m) * static_cast<size_t>(opts.nb);
-    ws.block_compact_elems = std::max(
-        static_cast<size_t>(opts.nb + kPanelWidth) * static_cast<size_t>(opts.nb),
-        ws.block_storage_elems);
+    ws.block_compact_elems = need_block_lookahead_buffers
+                                 ? ws.block_storage_elems
+                                 : std::max(
+                                       static_cast<size_t>(opts.nb + kPanelWidth) *
+                                           static_cast<size_t>(opts.nb),
+                                       ws.block_storage_elems);
     ws.tmp_elems = static_cast<size_t>(opts.nb) * static_cast<size_t>(tile_cols);
 
     distributed_qr_col_blockcyclic::AssertCuda(
@@ -247,12 +253,28 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         cudaMalloc(&ws.d_block_w, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_y, ws.block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_y");
+    if (need_block_lookahead_buffers) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws.d_block_w_alt, ws.block_storage_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_w_alt");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws.d_block_y_alt, ws.block_storage_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_y_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_w_compact, ws.block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws.d_block_y_compact, ws.block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_y_compact");
+    if (need_block_lookahead_buffers) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws.d_block_w_compact_alt, ws.block_compact_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_w_compact_alt");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws.d_block_y_compact_alt, ws.block_compact_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_y_compact_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws.d_tmp0, ws.tmp_elems * sizeof(T)),
                                                "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws.d_tmp1, ws.tmp_elems * sizeof(T)),
@@ -502,10 +524,26 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w), "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y), "cudaFree ws.d_block_y");
+    if (ws.d_block_w_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_alt),
+                                                   "cudaFree ws.d_block_w_alt");
+    }
+    if (ws.d_block_y_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y_alt),
+                                                   "cudaFree ws.d_block_y_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_compact),
                                                "cudaFree ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y_compact),
                                                "cudaFree ws.d_block_y_compact");
+    if (ws.d_block_w_compact_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_w_compact_alt),
+                                                   "cudaFree ws.d_block_w_compact_alt");
+    }
+    if (ws.d_block_y_compact_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_block_y_compact_alt),
+                                                   "cudaFree ws.d_block_y_compact_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws.d_tmp1), "cudaFree ws.d_tmp1");
 

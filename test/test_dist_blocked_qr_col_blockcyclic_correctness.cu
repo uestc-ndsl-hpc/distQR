@@ -122,12 +122,28 @@ void AllocateColBlockCyclicWorkspace(
         cudaMalloc(&ws->d_block_w, ws->block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws->d_block_y, ws->block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_y");
+    if (full_block_ping_pong) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws->d_block_w_alt, ws->block_storage_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_w_alt");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws->d_block_y_alt, ws->block_storage_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_y_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws->d_block_w_compact, ws->block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws->d_block_y_compact, ws->block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_y_compact");
+    if (full_block_ping_pong) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws->d_block_w_compact_alt, ws->block_compact_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_w_compact_alt");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws->d_block_y_compact_alt, ws->block_compact_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_y_compact_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws->d_tmp0, ws->tmp_elems * sizeof(T)),
                                                "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws->d_tmp1, ws->tmp_elems * sizeof(T)),
@@ -147,10 +163,26 @@ void FreeColBlockCyclicWorkspace(
     }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_w), "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_y), "cudaFree ws.d_block_y");
+    if (ws->d_block_w_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_w_alt),
+                                                   "cudaFree ws.d_block_w_alt");
+    }
+    if (ws->d_block_y_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_y_alt),
+                                                   "cudaFree ws.d_block_y_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_w_compact),
                                                "cudaFree ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_y_compact),
                                                "cudaFree ws.d_block_y_compact");
+    if (ws->d_block_w_compact_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_w_compact_alt),
+                                                   "cudaFree ws.d_block_w_compact_alt");
+    }
+    if (ws->d_block_y_compact_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_y_compact_alt),
+                                                   "cudaFree ws.d_block_y_compact_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_tmp1), "cudaFree ws.d_tmp1");
 }
@@ -480,7 +512,11 @@ void RunFactorizedAEqualsQtA0(const ColBlockCyclicCorrectnessConfig& cfg,
                        std::min(cfg.overlap_tile, cfg.nb));
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
     ws.pack_buffer_count = cfg.panel_buffers;
-    AllocateColBlockCyclicWorkspace<T>(cfg.m, cfg.nb, tile_cols, cfg.panel_buffers, false, &ws);
+    const bool need_block_lookahead_buffers =
+        cfg.panel_comm_mode == distributed_qr_col_blockcyclic::PanelCommMode::Broadcast &&
+        cfg.broadcast_mode == distributed_qr_col_blockcyclic::BroadcastMode::Block;
+    AllocateColBlockCyclicWorkspace<T>(cfg.m, cfg.nb, tile_cols, cfg.panel_buffers,
+                                       need_block_lookahead_buffers, &ws);
 
     cudaStream_t compute_stream = nullptr;
     cudaStream_t comm_stream = nullptr;
