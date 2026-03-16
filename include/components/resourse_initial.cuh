@@ -22,6 +22,15 @@ struct MpiCudaEnv {
     bool nccl_initialized = false;
 };
 
+inline int get_sm_clock_mhz(int device) {
+    int clock_khz = 0;
+    const cudaError_t err = cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device);
+    if (err != cudaSuccess) {
+        return -1;
+    }
+    return clock_khz / 1000;
+}
+
 inline bool should_print_on_this_rank(const MpiCudaEnv* env) {
     if (env) {
         return env->local_rank == 0;
@@ -71,9 +80,14 @@ inline void init(const MpiCudaEnv* env = nullptr) {
         }
 
         const size_t mem_mb = static_cast<size_t>(prop.totalGlobalMem / (1024 * 1024));
-        const int clock_mhz = prop.clockRate / 1000;
-        spdlog::info("GPU {}: {} (SM {}.{}, {} MB, {} MHz, {} SMs)", device, prop.name, prop.major,
-                     prop.minor, mem_mb, clock_mhz, prop.multiProcessorCount);
+        const int clock_mhz = get_sm_clock_mhz(device);
+        if (clock_mhz >= 0) {
+            spdlog::info("GPU {}: {} (SM {}.{}, {} MB, {} MHz, {} SMs)", device, prop.name,
+                         prop.major, prop.minor, mem_mb, clock_mhz, prop.multiProcessorCount);
+        } else {
+            spdlog::info("GPU {}: {} (SM {}.{}, {} MB, {} SMs)", device, prop.name, prop.major,
+                         prop.minor, mem_mb, prop.multiProcessorCount);
+        }
     }
 }
 
