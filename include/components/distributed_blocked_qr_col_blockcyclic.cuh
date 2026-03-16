@@ -209,9 +209,8 @@ struct DistributedQrColBlockCyclicWorkspace {
     size_t tmp_elems = 0;
 
     // Compact block WY buffers.
-    // Factorization only needs [(nb + kPanelWidth) x nb].
-    // Explicit-Q ping-pong may reuse them as a second full block buffer, so callers that use
-    // that path must provision at least [m x nb].
+    // Panel-broadcast factorization only needs [(nb + kPanelWidth) x nb].
+    // Block-broadcast and explicit-Q ping-pong may reuse them as a full compact [m x nb] buffer.
     T* d_block_w_compact = nullptr;
     T* d_block_y_compact = nullptr;
     size_t block_compact_elems = 0;
@@ -224,6 +223,11 @@ struct CommProfile {
 enum class PanelCommMode {
     SendRecv = 0,
     Broadcast = 1,
+};
+
+enum class BroadcastMode {
+    Panel = 0,
+    Block = 1,
 };
 
 template <typename T>
@@ -418,7 +422,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     int overlap_tile_cols = 0,
     CommProfile* comm_profile = nullptr,
     PanelCommMode panel_comm_mode = PanelCommMode::SendRecv,
-    bool use_compact_local_gemm = false) {
+    bool use_compact_local_gemm = false,
+    BroadcastMode broadcast_mode = BroadcastMode::Panel) {
     static_assert(kSupportedQrType<T>,
                   "distributed_qr_col_blockcyclic only supports float and double.");
 
@@ -455,6 +460,16 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         spdlog::error("Unsupported panel_comm_mode value {}.", static_cast<int>(panel_comm_mode));
         std::exit(1);
     }
+    if (broadcast_mode != BroadcastMode::Panel && broadcast_mode != BroadcastMode::Block) {
+        spdlog::error("Unsupported broadcast_mode value {}.", static_cast<int>(broadcast_mode));
+        std::exit(1);
+    }
+
+    const bool use_panel_broadcast =
+        panel_comm_mode == PanelCommMode::Broadcast && broadcast_mode == BroadcastMode::Panel;
+    const bool use_block_broadcast =
+        panel_comm_mode == PanelCommMode::Broadcast && broadcast_mode == BroadcastMode::Block;
+    const bool use_panel_comm = panel_comm_mode == PanelCommMode::SendRecv || use_panel_broadcast;
 
     const bool trail_one_shot = overlap_tile_cols <= 0;
     const int tile_cols = trail_one_shot ? std::max(part.local_cols, 1)
@@ -514,6 +529,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
         std::vector<cudaEvent_t> panel_ready;
         std::vector<cudaEvent_t> comm_done;
         std::vector<cudaEvent_t> compute_done;
+        cudaEvent_t block_ready = nullptr;
+        cudaEvent_t block_comm_done = nullptr;
     };
     static PersistentEvents events;
     if (!events.initialized || events.buffer_count != pack_buffers) {
@@ -532,6 +549,14 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                        "cudaEventCreate comm_done[i]");
             AssertCuda(cudaEventCreateWithFlags(&events.compute_done[i], cudaEventDisableTiming),
                        "cudaEventCreate compute_done[i]");
+        }
+        if (!events.block_ready) {
+            AssertCuda(cudaEventCreateWithFlags(&events.block_ready, cudaEventDisableTiming),
+                       "cudaEventCreate block_ready");
+        }
+        if (!events.block_comm_done) {
+            AssertCuda(cudaEventCreateWithFlags(&events.block_comm_done, cudaEventDisableTiming),
+                       "cudaEventCreate block_comm_done");
         }
         events.initialized = true;
         events.buffer_count = pack_buffers;
@@ -587,7 +612,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                       block_storage_need, ws->block_storage_elems);
         std::exit(1);
     }
-    const int compact_rows = nb + kPanelWidth;
+    const int compact_rows = use_block_broadcast ? m : (nb + kPanelWidth);
     const size_t compact_need = static_cast<size_t>(compact_rows) * static_cast<size_t>(nb);
     if (!ws->d_block_w_compact || !ws->d_block_y_compact ||
         ws->block_compact_elems < compact_need) {
@@ -600,6 +625,19 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     for (int block_begin = 0; block_begin < n; block_begin += nb) {
         const int block_end = std::min(block_begin + nb, n);
         const int kb = block_end - block_begin;
+        const int block_owner = OwnerOfPanel(block_begin, part);
+        int block_receivers = 0;
+        if (use_block_broadcast && part.world_size > 1) {
+            for (int r = 0; r < part.world_size; ++r) {
+                if (r == block_owner) {
+                    continue;
+                }
+                if (!RankHasColsAfter(part, r, block_end)) {
+                    continue;
+                }
+                ++block_receivers;
+            }
+        }
         auto block_range =
             distqr::nvtx::MakeScopedRangef("qr_block r=%d b=%d:%d", part.rank, block_begin,
                                            block_end);
@@ -611,18 +649,22 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             const int buf = pack_buf(panel_seq);
             ++panel_seq;
             const int panel_rows = m - inner;
-            const int owner = OwnerOfPanel(inner, part);
+            const int owner = block_owner;
             const int block_col_off = inner - block_begin;
-            const bool self_needs_panel = RankHasColsAfter(part, part.rank, inner + kPanelWidth);
+            const bool self_needs_panel =
+                use_panel_comm && RankHasColsAfter(part, part.rank, inner + kPanelWidth);
+            const bool need_panel_now = (part.rank == owner) || self_needs_panel;
             int active_receivers = 0;
-            for (int r = 0; r < part.world_size; ++r) {
-                if (r == owner) {
-                    continue;
+            if (use_panel_comm) {
+                for (int r = 0; r < part.world_size; ++r) {
+                    if (r == owner) {
+                        continue;
+                    }
+                    if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
+                        continue;
+                    }
+                    ++active_receivers;
                 }
-                if (!RankHasColsAfter(part, r, inner + kPanelWidth)) {
-                    continue;
-                }
-                ++active_receivers;
             }
             T* d_pack_w = ws->d_pack_w[buf];
             T* d_pack_y = ws->d_pack_y[buf];
@@ -662,10 +704,12 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
                 owner_prepared = true;
 
-                AssertCuda(cudaEventRecord(events.panel_ready[buf], compute_stream),
-                           "cudaEventRecord panel_ready[buf]");
-                AssertCuda(cudaStreamWaitEvent(comm_stream, events.panel_ready[buf], 0),
-                           "cudaStreamWaitEvent comm_stream <- panel_ready[buf]");
+                if (use_panel_comm) {
+                    AssertCuda(cudaEventRecord(events.panel_ready[buf], compute_stream),
+                               "cudaEventRecord panel_ready[buf]");
+                    AssertCuda(cudaStreamWaitEvent(comm_stream, events.panel_ready[buf], 0),
+                               "cudaStreamWaitEvent comm_stream <- panel_ready[buf]");
+                }
             }
 
             if (!owner_prepared && part.rank == owner) {
@@ -674,7 +718,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
 
             if (part.world_size > 1) {
-                if (panel_comm_mode == PanelCommMode::Broadcast) {
+                if (use_panel_broadcast) {
                     // Broadcast receives into d_pack_* on non-owners, so the comm stream must not
                     // reuse a pack buffer until the previous panel's compute has finished reading
                     // it. Send/recv mode enforces this in prefetch_recv(); broadcast needs the
@@ -706,7 +750,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                     }
                     AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                                "cudaEventRecord comm_done[buf](bcast)");
-                } else if (part.rank == owner) {
+                } else if (panel_comm_mode == PanelCommMode::SendRecv && part.rank == owner) {
                     const bool any_send = (active_receivers > 0);
                     if (any_send) {
                         AssertNccl(ncclGroupStart(), "ncclGroupStart panel W/Y");
@@ -738,6 +782,9 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                         AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
                                    "cudaEventRecord comm_done[buf](nosend)");
                     }
+                } else if (use_block_broadcast) {
+                    AssertCuda(cudaEventRecord(events.comm_done[buf], comm_stream),
+                               "cudaEventRecord comm_done[buf](block)");
                 }
             } else {
                 // No NCCL comm: for non-owner there is nothing to receive; for owner the pack is
@@ -755,8 +802,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
 
             // Apply this panel to local columns inside the current block using the original
             // panel WY (before block-WY update).
-            if (part.rank == owner || self_needs_panel) {
-                if (part.world_size > 1 && part.rank != owner) {
+            if (need_panel_now) {
+                if (use_panel_comm && part.world_size > 1 && part.rank != owner) {
                     AssertCuda(cudaStreamWaitEvent(compute_stream, events.comm_done[buf], 0),
                                "cudaStreamWaitEvent compute_stream <- comm_done[buf](use)");
                 }
@@ -820,7 +867,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
 
             // Scatter packed W/Y into block buffers and zero top of the panel columns.
-            if (part.rank == owner || self_needs_panel) {
+            if (need_panel_now) {
                 T* dst_w = ws->d_block_w + static_cast<size_t>(inner) +
                            static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
                 T* dst_y = ws->d_block_y + static_cast<size_t>(inner) +
@@ -859,7 +906,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
 
             // Now update W_i inside the block WY using the full block rows.
-            if (part.rank == owner || self_needs_panel) {
+            if (need_panel_now) {
                 if (inner > block_begin) {
                     auto block_w_update_range = distqr::nvtx::MakeScopedRangef(
                         "block_w_update r=%d b=%d i=%d", part.rank, block_begin, inner);
@@ -906,60 +953,131 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                         cudaMemcpyDeviceToDevice, compute_stream),
                     "cudaMemcpy2DAsync block_w -> d_W_local");
             }
+
+            if (use_block_broadcast && part.rank == owner) {
+                const int block_rows = m - block_begin;
+                T* src_w = ws->d_block_w + static_cast<size_t>(block_begin) +
+                           static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
+                T* src_y = ws->d_block_y + static_cast<size_t>(block_begin) +
+                           static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
+                T* dst_w =
+                    ws->d_block_w_compact + static_cast<size_t>(block_col_off) * block_rows;
+                T* dst_y =
+                    ws->d_block_y_compact + static_cast<size_t>(block_col_off) * block_rows;
+                AssertCuda(cudaMemcpy2DAsync(dst_w, static_cast<size_t>(block_rows) * sizeof(T),
+                                             src_w, static_cast<size_t>(m) * sizeof(T),
+                                             static_cast<size_t>(block_rows) * sizeof(T),
+                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
+                           "cudaMemcpy2DAsync block_w -> block_w_compact");
+                AssertCuda(cudaMemcpy2DAsync(dst_y, static_cast<size_t>(block_rows) * sizeof(T),
+                                             src_y, static_cast<size_t>(m) * sizeof(T),
+                                             static_cast<size_t>(block_rows) * sizeof(T),
+                                             kPanelWidth, cudaMemcpyDeviceToDevice, compute_stream),
+                           "cudaMemcpy2DAsync block_y -> block_y_compact");
+            }
         }
 
         // Apply block WY to trailing columns after the block (full rows, like single-GPU).
         const int block_rows = m - block_begin;
         const int trail_begin = block_end;
-        if (use_compact_local_gemm) {
-            const int local_begin = LocalColPrefix(part, trail_begin);
-            const int cols_local = LocalColPrefix(part, n) - local_begin;
-            if (cols_local > 0) {
+
+        auto apply_trailing_update = [&](const T* block_w, const T* block_y, int lda_block) {
+            if (use_compact_local_gemm) {
+                const int local_begin = LocalColPrefix(part, trail_begin);
+                const int cols_local = LocalColPrefix(part, n) - local_begin;
+                if (cols_local <= 0) {
+                    return;
+                }
                 T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
                 if (trail_one_shot) {
                     auto trail_update_range = distqr::nvtx::MakeScopedRangef(
                         "trail_update_1shot r=%d b=%d seg=%d:%d", part.rank, block_begin,
                         trail_begin, n);
                     block_update_one_shot(cublas_handle, block_begin, block_rows, kb, cols_local,
-                                          ws->d_block_w + static_cast<size_t>(block_begin),
-                                          ws->d_block_y + static_cast<size_t>(block_begin), m,
-                                          a_trail, lda_local, ws->d_tmp0, ws->tmp_elems);
+                                          block_w, block_y, lda_block, a_trail, lda_local,
+                                          ws->d_tmp0, ws->tmp_elems);
                 } else {
                     auto trail_update_range = distqr::nvtx::MakeScopedRangef(
                         "trail_update_tiled r=%d b=%d seg=%d:%d", part.rank, block_begin,
                         trail_begin, n);
                     block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
-                                               block_rows, kb, cols_local, tile_cols,
-                                               ws->d_block_w + static_cast<size_t>(block_begin),
-                                               ws->d_block_y + static_cast<size_t>(block_begin), m,
-                                               a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
+                                               block_rows, kb, cols_local, tile_cols, block_w,
+                                               block_y, lda_block, a_trail, lda_local, ws->d_tmp0,
+                                               ws->d_tmp1);
+                }
+                return;
+            }
+
+            ForEachLocalSegment(part, trail_begin, n,
+                                [&](int seg_begin, int seg_end, int local_begin) {
+                                    const int cols_local = seg_end - seg_begin;
+                                    T* a_trail =
+                                        d_A_local + static_cast<size_t>(local_begin) * lda_local;
+                                    if (trail_one_shot) {
+                                        auto trail_update_range = distqr::nvtx::MakeScopedRangef(
+                                            "trail_update_1shot r=%d b=%d seg=%d:%d", part.rank,
+                                            block_begin, seg_begin, seg_end);
+                                        block_update_one_shot(
+                                            cublas_handle, block_begin, block_rows, kb, cols_local,
+                                            block_w, block_y, lda_block, a_trail, lda_local,
+                                            ws->d_tmp0, ws->tmp_elems);
+                                    } else {
+                                        auto trail_update_range = distqr::nvtx::MakeScopedRangef(
+                                            "trail_update_tiled r=%d b=%d seg=%d:%d", part.rank,
+                                            block_begin, seg_begin, seg_end);
+                                        block_update_tile_pipeline(
+                                            cublas_handle, compute_stream, block_begin, block_rows,
+                                            kb, cols_local, tile_cols, block_w, block_y, lda_block,
+                                            a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
+                                    }
+                                });
+        };
+
+        if (use_block_broadcast) {
+            if (block_receivers > 0) {
+                AssertCuda(cudaEventRecord(events.block_ready, compute_stream),
+                           "cudaEventRecord block_ready");
+                AssertCuda(cudaStreamWaitEvent(comm_stream, events.block_ready, 0),
+                           "cudaStreamWaitEvent comm_stream <- block_ready");
+                {
+                    auto block_bcast_w_range = distqr::nvtx::MakeScopedRangef(
+                        "block_bcast_w r=%d b=%d:%d o=%d", part.rank, block_begin, block_end,
+                        block_owner);
+                    AssertNccl(ncclBroadcast(ws->d_block_w_compact, ws->d_block_w_compact,
+                                             static_cast<size_t>(block_rows) * kb, nccl_type,
+                                             block_owner, nccl_comm, comm_stream),
+                               "ncclBroadcast block W");
+                }
+                {
+                    auto block_bcast_y_range = distqr::nvtx::MakeScopedRangef(
+                        "block_bcast_y r=%d b=%d:%d o=%d", part.rank, block_begin, block_end,
+                        block_owner);
+                    AssertNccl(ncclBroadcast(ws->d_block_y_compact, ws->d_block_y_compact,
+                                             static_cast<size_t>(block_rows) * kb, nccl_type,
+                                             block_owner, nccl_comm, comm_stream),
+                               "ncclBroadcast block Y");
+                }
+                if (comm_profile) {
+                    comm_profile->bytes += 2ULL * static_cast<size_t>(block_rows) *
+                                           static_cast<size_t>(kb) * sizeof(T) *
+                                           static_cast<size_t>(block_receivers);
                 }
             }
+            AssertCuda(cudaEventRecord(events.block_comm_done, comm_stream),
+                       "cudaEventRecord block_comm_done");
+
+            if (part.world_size > 1 && part.rank != block_owner &&
+                RankHasColsAfter(part, part.rank, block_end) && block_receivers > 0) {
+                AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
+                           "cudaStreamWaitEvent compute_stream <- block_comm_done");
+            }
+
+            apply_trailing_update(ws->d_block_w_compact, ws->d_block_y_compact, block_rows);
+            AssertCuda(cudaStreamWaitEvent(compute_stream, events.block_comm_done, 0),
+                       "cudaStreamWaitEvent compute_stream <- block_comm_done(reuse)");
         } else {
-            ForEachLocalSegment(
-                part, trail_begin, n, [&](int seg_begin, int seg_end, int local_begin) {
-                    const int cols_local = seg_end - seg_begin;
-                    T* a_trail = d_A_local + static_cast<size_t>(local_begin) * lda_local;
-                    if (trail_one_shot) {
-                        auto trail_update_range = distqr::nvtx::MakeScopedRangef(
-                            "trail_update_1shot r=%d b=%d seg=%d:%d", part.rank, block_begin,
-                            seg_begin, seg_end);
-                        block_update_one_shot(cublas_handle, block_begin, block_rows, kb,
-                                              cols_local,
-                                              ws->d_block_w + static_cast<size_t>(block_begin),
-                                              ws->d_block_y + static_cast<size_t>(block_begin), m,
-                                              a_trail, lda_local, ws->d_tmp0, ws->tmp_elems);
-                    } else {
-                        auto trail_update_range = distqr::nvtx::MakeScopedRangef(
-                            "trail_update_tiled r=%d b=%d seg=%d:%d", part.rank, block_begin,
-                            seg_begin, seg_end);
-                        block_update_tile_pipeline(cublas_handle, compute_stream, block_begin,
-                                                   block_rows, kb, cols_local, tile_cols,
-                                                   ws->d_block_w + static_cast<size_t>(block_begin),
-                                                   ws->d_block_y + static_cast<size_t>(block_begin),
-                                                   m, a_trail, lda_local, ws->d_tmp0, ws->d_tmp1);
-                    }
-                });
+            apply_trailing_update(ws->d_block_w + static_cast<size_t>(block_begin),
+                                  ws->d_block_y + static_cast<size_t>(block_begin), m);
         }
     }
 }
