@@ -22,6 +22,7 @@
 namespace {
 
 using distributed_qr_col_blockcyclic::kPanelWidth;
+using distributed_qr_col_blockcyclic::BroadcastMode;
 using distributed_qr_col_blockcyclic::PanelCommMode;
 using distributed_qr_col_blockcyclic::PersistentWyStorageMode;
 
@@ -255,6 +256,9 @@ struct Options {
     PanelCommMode panel_comm_mode = PanelCommMode::SendRecv;
     bool panel_comm_valid = true;
     std::string panel_comm_value = "sendrecv";
+    BroadcastMode broadcast_mode = BroadcastMode::Panel;
+    bool broadcast_mode_valid = true;
+    std::string broadcast_mode_value = "panel";
     PersistentWyStorageMode wy_storage_mode = PersistentWyStorageMode::Compact;
     bool wy_storage_valid = true;
     std::string wy_storage_value = "compact";
@@ -268,6 +272,18 @@ bool ParsePanelCommMode(const char* mode, PanelCommMode* out_mode) {
     }
     if (std::strcmp(mode, "broadcast") == 0) {
         *out_mode = PanelCommMode::Broadcast;
+        return true;
+    }
+    return false;
+}
+
+bool ParseBroadcastMode(const char* mode, BroadcastMode* out_mode) {
+    if (std::strcmp(mode, "panel") == 0) {
+        *out_mode = BroadcastMode::Panel;
+        return true;
+    }
+    if (std::strcmp(mode, "block") == 0) {
+        *out_mode = BroadcastMode::Block;
         return true;
     }
     return false;
@@ -306,6 +322,13 @@ const char* PanelCommModeToString(PanelCommMode mode) {
         return "broadcast";
     }
     return "sendrecv";
+}
+
+const char* BroadcastModeToString(BroadcastMode mode) {
+    if (mode == BroadcastMode::Block) {
+        return "block";
+    }
+    return "panel";
 }
 
 Options ParseArgs(int argc, char** argv) {
@@ -350,7 +373,9 @@ Options ParseArgs(int argc, char** argv) {
             opts.wy_storage_valid =
                 ParseWyStorageMode(opts.wy_storage_value.c_str(), &opts.wy_storage_mode);
         } else if (std::strcmp(argv[i], "--broadcast-mode") == 0 && i + 1 < argc) {
-            ++i;
+            opts.broadcast_mode_value = argv[++i];
+            opts.broadcast_mode_valid =
+                ParseBroadcastMode(opts.broadcast_mode_value.c_str(), &opts.broadcast_mode);
         } else if (std::strcmp(argv[i], "--compact-local-gemm") == 0) {
             opts.use_compact_local_gemm = true;
         } else if (std::strcmp(argv[i], "--segmented-local-gemm") == 0) {
@@ -421,7 +446,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_Afact, lda_local,
             persistent_wy.storage, &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr,
-            opts.panel_comm_mode, opts.use_compact_local_gemm);
+            opts.panel_comm_mode, opts.use_compact_local_gemm, opts.broadcast_mode);
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                    "cudaStreamSynchronize precompute compute");
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
@@ -437,8 +462,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
                 cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_Afact, lda_local,
                 persistent_wy.storage, &ws, compute_stream, comm_stream, opts.overlap_tile,
-                nullptr,
-                opts.panel_comm_mode, opts.use_compact_local_gemm);
+                nullptr, opts.panel_comm_mode, opts.use_compact_local_gemm,
+                opts.broadcast_mode);
         }
         distributed_qr_col_blockcyclic::generate_explicit_q_from_wy_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, persistent_wy.storage,
@@ -475,8 +500,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
                 cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_Afact, lda_local,
                 persistent_wy.storage, &ws, compute_stream, comm_stream, opts.overlap_tile,
-                nullptr,
-                opts.panel_comm_mode, opts.use_compact_local_gemm);
+                nullptr, opts.panel_comm_mode, opts.use_compact_local_gemm,
+                opts.broadcast_mode);
         }
         distributed_qr_col_blockcyclic::generate_explicit_q_from_wy_col_blockcyclic<T>(
             cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, persistent_wy.storage,
@@ -536,12 +561,13 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     if (env.rank == 0) {
         spdlog::info(
             "Distributed {} [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
-            "panel_buffers={} apply={} tile={} panel_comm={} factor_local_update={} store_wy={} "
-            "np={} avg {:.3f} ms ({:.3f} TFLOPS)",
+            "panel_buffers={} apply={} tile={} panel_comm={} broadcast_mode={} "
+            "factor_local_update={} store_wy={} np={} avg {:.3f} ms ({:.3f} TFLOPS)",
             opts.e2e ? "QR+explicit Q" : "explicit Q", DataTypeString<T>(), opts.m, opts.n,
             opts.nb, block_cols, opts.panel_buffers,
             apply_one_shot ? "one-shot" : "tiled", apply_one_shot ? part.local_cols : tile_cols,
             PanelCommModeToString(opts.panel_comm_mode),
+            BroadcastModeToString(opts.broadcast_mode),
             opts.use_compact_local_gemm ? "compact" : "segmented",
             distributed_qr_col_blockcyclic::PersistentWyStorageModeToString(opts.wy_storage_mode),
             env.size, max_ms, q_tflops);
@@ -655,6 +681,15 @@ int main(int argc, char** argv) {
         finalize_mpi_if_needed(env);
         return 1;
     }
+    if (!opts.broadcast_mode_valid) {
+        if (env.rank == 0) {
+            spdlog::error("Invalid --broadcast-mode value '{}'. Supported values: panel, block.",
+                          opts.broadcast_mode_value);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
     if (!opts.wy_storage_valid) {
         if (env.rank == 0) {
             spdlog::error("Invalid --store-wy value '{}'. Supported values: none, dense, compact.",
@@ -676,10 +711,11 @@ int main(int argc, char** argv) {
     if (env.rank == 0) {
         spdlog::info(
             "Distributed {} bench: type={} m={} n={} nb={} block_cols={} warmup={} iters={} "
-            "panel_buffers={} panel_comm={} local_update={} store_wy={} tile={} ",
+            "panel_buffers={} panel_comm={} broadcast_mode={} local_update={} store_wy={} tile={} ",
             opts.e2e ? "QR+explicit-Q" : "explicit-Q", opts.use_double ? "double" : "float",
             opts.m, opts.n, opts.nb, block_cols, opts.warmup, opts.iters, opts.panel_buffers,
             PanelCommModeToString(opts.panel_comm_mode),
+            BroadcastModeToString(opts.broadcast_mode),
             opts.use_compact_local_gemm ? "compact" : "segmented",
             distributed_qr_col_blockcyclic::PersistentWyStorageModeToString(opts.wy_storage_mode),
             (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile);
