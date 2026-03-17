@@ -210,8 +210,7 @@ void generate_explicit_q_from_wy_col_blockcyclic(
     int m,
     int n,
     int nb,
-    const T* d_W_local,
-    const T* d_Y_local,
+    const PersistentWyStorage<T>& persistent_wy,
     T* d_Q_local,
     int lda_local,
     DistributedQrColBlockCyclicWorkspace<T>* ws,
@@ -250,8 +249,8 @@ void generate_explicit_q_from_wy_col_blockcyclic(
             kPanelWidth, part.block_cols);
         std::exit(1);
     }
-    if (!d_W_local || !d_Y_local) {
-        spdlog::error("generate_explicit_q_from_wy_col_blockcyclic requires non-null W/Y.");
+    if (!PersistentWyHasCompleteFactors(persistent_wy)) {
+        spdlog::error("generate_explicit_q_from_wy_col_blockcyclic requires stored W/Y factors.");
         std::exit(1);
     }
     if (part.local_cols > 0 && !d_Q_local) {
@@ -356,34 +355,22 @@ void generate_explicit_q_from_wy_col_blockcyclic(
                    "cudaStreamWaitEvent explicitQ comm <- compute_done[slot]");
 
         if (part.rank == task.owner) {
-            const int local_block_col = LocalColOffset(part, task.block_begin);
-            if (local_block_col < 0) {
-                spdlog::error("Explicit-Q owner rank {} missing block begin col {}.", task.owner,
-                              task.block_begin);
-                std::exit(1);
+            int local_block_col = -1;
+            if (persistent_wy.mode == PersistentWyStorageMode::Dense) {
+                local_block_col = LocalColOffset(part, task.block_begin);
+                if (local_block_col < 0) {
+                    spdlog::error("Explicit-Q owner rank {} missing block begin col {}.",
+                                  task.owner, task.block_begin);
+                    std::exit(1);
+                }
             }
 
             auto pack_range = distqr::nvtx::MakeScopedRangef("explicit_q_pack r=%d b=%d:%d s=%d",
                                                              part.rank, task.block_begin,
                                                              task.block_end, slot);
-            AssertCuda(
-                cudaMemcpy2DAsync(block_w_slots[slot],
-                                  static_cast<size_t>(task.block_rows) * sizeof(T),
-                                  d_W_local + static_cast<size_t>(local_block_col) * lda_local +
-                                      task.block_begin,
-                                  static_cast<size_t>(lda_local) * sizeof(T),
-                                  static_cast<size_t>(task.block_rows) * sizeof(T), task.kb,
-                                  cudaMemcpyDeviceToDevice, comm_stream),
-                "cudaMemcpy2DAsync explicitQ block W pack");
-            AssertCuda(
-                cudaMemcpy2DAsync(block_y_slots[slot],
-                                  static_cast<size_t>(task.block_rows) * sizeof(T),
-                                  d_Y_local + static_cast<size_t>(local_block_col) * lda_local +
-                                      task.block_begin,
-                                  static_cast<size_t>(lda_local) * sizeof(T),
-                                  static_cast<size_t>(task.block_rows) * sizeof(T), task.kb,
-                                  cudaMemcpyDeviceToDevice, comm_stream),
-                "cudaMemcpy2DAsync explicitQ block Y pack");
+            LoadPersistentWyBlock(persistent_wy, task.block_begin, task.block_rows, task.kb,
+                                  local_block_col, block_w_slots[slot], block_y_slots[slot],
+                                  task.block_rows, comm_stream);
         }
 
         if (part.world_size > 1) {
@@ -499,6 +486,31 @@ void generate_explicit_q_from_wy_col_blockcyclic(
         next = enqueue_block(current.valid ? (current.block_begin - nb) : -1, next_slot);
     }
 
+}
+
+template <typename T>
+void generate_explicit_q_from_wy_col_blockcyclic(
+    cublasHandle_t cublas_handle,
+    ncclComm_t nccl_comm,
+    const ColBlockCyclicPartition& part,
+    int m,
+    int n,
+    int nb,
+    const T* d_W_local,
+    const T* d_Y_local,
+    T* d_Q_local,
+    int lda_local,
+    DistributedQrColBlockCyclicWorkspace<T>* ws,
+    cudaStream_t compute_stream,
+    cudaStream_t comm_stream,
+    int tile_cols = 0,
+    PanelCommMode panel_comm_mode = PanelCommMode::SendRecv) {
+    auto persistent_wy = MakeDensePersistentWyStorage(const_cast<T*>(d_W_local),
+                                                      const_cast<T*>(d_Y_local), lda_local);
+    generate_explicit_q_from_wy_col_blockcyclic(cublas_handle, nccl_comm, part, m, n, nb,
+                                                persistent_wy, d_Q_local, lda_local, ws,
+                                                compute_stream, comm_stream, tile_cols,
+                                                panel_comm_mode);
 }
 
 }  // namespace distributed_qr_col_blockcyclic

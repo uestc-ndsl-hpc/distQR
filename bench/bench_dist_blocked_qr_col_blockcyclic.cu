@@ -23,6 +23,7 @@ namespace {
 using distributed_qr_col_blockcyclic::BroadcastMode;
 using distributed_qr_col_blockcyclic::kPanelWidth;
 using distributed_qr_col_blockcyclic::PanelCommMode;
+using distributed_qr_col_blockcyclic::PersistentWyStorageMode;
 
 void AssertCurand(curandStatus_t status, const char* context) {
     if (status != CURAND_STATUS_SUCCESS) {
@@ -71,6 +72,72 @@ const char* DataTypeString() {
     return "double";
 }
 
+template <typename T>
+struct PersistentWyAllocation {
+    T* d_w = nullptr;
+    T* d_y = nullptr;
+    T* d_compact = nullptr;
+    size_t compact_elems = 0;
+    distributed_qr_col_blockcyclic::PersistentWyStorage<T> storage;
+};
+
+template <typename T>
+PersistentWyAllocation<T> AllocatePersistentWyStorage(
+    const distributed_qr_col_blockcyclic::ColBlockCyclicPartition& part,
+    int m,
+    int n,
+    int nb,
+    int lda_local,
+    PersistentWyStorageMode mode) {
+    PersistentWyAllocation<T> alloc{};
+    if (mode == PersistentWyStorageMode::None) {
+        alloc.storage = distributed_qr_col_blockcyclic::MakeNoPersistentWyStorage<T>();
+        return alloc;
+    }
+
+    if (mode == PersistentWyStorageMode::Dense) {
+        const size_t elems_alloc =
+            static_cast<size_t>(lda_local) * static_cast<size_t>(std::max(part.local_cols, 1));
+        distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&alloc.d_w, elems_alloc * sizeof(T)),
+                                                   "cudaMalloc persistent d_w");
+        distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&alloc.d_y, elems_alloc * sizeof(T)),
+                                                   "cudaMalloc persistent d_y");
+        alloc.storage =
+            distributed_qr_col_blockcyclic::MakeDensePersistentWyStorage(alloc.d_w, alloc.d_y,
+                                                                         lda_local);
+        return alloc;
+    }
+
+    alloc.compact_elems = distributed_qr_col_blockcyclic::CompactWyStorageRequiredElems(
+        m, n, nb, part.block_starts, part.block_ends);
+    if (alloc.compact_elems > 0) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&alloc.d_compact, alloc.compact_elems * sizeof(T)),
+            "cudaMalloc persistent compact WY");
+    }
+    alloc.storage = distributed_qr_col_blockcyclic::BuildCompactPersistentWyStorage(
+        m, n, nb, part.block_starts, part.block_ends, alloc.d_compact, alloc.compact_elems);
+    return alloc;
+}
+
+template <typename T>
+void FreePersistentWyStorage(PersistentWyAllocation<T>* alloc) {
+    if (!alloc) {
+        return;
+    }
+    if (alloc->d_w) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(alloc->d_w), "cudaFree persistent d_w");
+    }
+    if (alloc->d_y) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(alloc->d_y), "cudaFree persistent d_y");
+    }
+    if (alloc->d_compact) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(alloc->d_compact),
+                                                   "cudaFree persistent compact WY");
+    }
+    *alloc = PersistentWyAllocation<T>{};
+}
+
 struct Options {
     int m = 16384;
     int n = 1024;
@@ -91,6 +158,9 @@ struct Options {
     BroadcastMode broadcast_mode = BroadcastMode::Panel;
     bool broadcast_mode_valid = true;
     std::string broadcast_mode_value = "panel";
+    PersistentWyStorageMode wy_storage_mode = PersistentWyStorageMode::None;
+    bool wy_storage_valid = true;
+    std::string wy_storage_value = "none";
     bool use_compact_local_gemm = false;
 };
 
@@ -113,6 +183,22 @@ bool ParseBroadcastMode(const char* mode, BroadcastMode* out_mode) {
     }
     if (std::strcmp(mode, "block") == 0) {
         *out_mode = BroadcastMode::Block;
+        return true;
+    }
+    return false;
+}
+
+bool ParseWyStorageMode(const char* mode, PersistentWyStorageMode* out_mode) {
+    if (std::strcmp(mode, "none") == 0) {
+        *out_mode = PersistentWyStorageMode::None;
+        return true;
+    }
+    if (std::strcmp(mode, "dense") == 0) {
+        *out_mode = PersistentWyStorageMode::Dense;
+        return true;
+    }
+    if (std::strcmp(mode, "compact") == 0) {
+        *out_mode = PersistentWyStorageMode::Compact;
         return true;
     }
     return false;
@@ -180,6 +266,10 @@ Options ParseArgs(int argc, char** argv) {
             opts.broadcast_mode_value = argv[++i];
             opts.broadcast_mode_valid =
                 ParseBroadcastMode(opts.broadcast_mode_value.c_str(), &opts.broadcast_mode);
+        } else if (std::strcmp(argv[i], "--store-wy") == 0 && i + 1 < argc) {
+            opts.wy_storage_value = argv[++i];
+            opts.wy_storage_valid =
+                ParseWyStorageMode(opts.wy_storage_value.c_str(), &opts.wy_storage_mode);
         } else if (std::strcmp(argv[i], "--compact-local-gemm") == 0) {
             opts.use_compact_local_gemm = true;
         } else if (std::strcmp(argv[i], "--segmented-local-gemm") == 0) {
@@ -201,17 +291,13 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
 
     T* d_A0 = nullptr;
     T* d_A = nullptr;
-    T* d_W = nullptr;
-    T* d_Y = nullptr;
 
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_A0, local_elems_alloc * sizeof(T)),
                                                "cudaMalloc d_A0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_A, local_elems_alloc * sizeof(T)),
                                                "cudaMalloc d_A");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_W, local_elems_alloc * sizeof(T)),
-                                               "cudaMalloc d_W");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&d_Y, local_elems_alloc * sizeof(T)),
-                                               "cudaMalloc d_Y");
+    auto persistent_wy = AllocatePersistentWyStorage<T>(part, opts.m, opts.n, opts.nb, lda_local,
+                                                        opts.wy_storage_mode);
 
     FillDeviceRandom(d_A0, local_elems_used, 2026ULL + static_cast<unsigned long long>(env.rank));
 
@@ -305,17 +391,10 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(T), cudaMemcpyDeviceToDevice,
                             compute_stream),
             "cudaMemcpyAsync warmup A <- A0");
-        distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(T), compute_stream),
-            "cudaMemsetAsync warmup W");
-        distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
-            "cudaMemsetAsync warmup Y");
-
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
-            cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
-            &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr, opts.panel_comm_mode,
-            opts.use_compact_local_gemm, opts.broadcast_mode);
+            cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local,
+            persistent_wy.storage, &ws, compute_stream, comm_stream, opts.overlap_tile, nullptr,
+            opts.panel_comm_mode, opts.use_compact_local_gemm, opts.broadcast_mode);
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(compute_stream),
                                                    "cudaStreamSynchronize warmup compute");
         distributed_qr_col_blockcyclic::AssertCuda(cudaStreamSynchronize(comm_stream),
@@ -353,12 +432,6 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
             cudaMemcpyAsync(d_A, d_A0, local_elems_alloc * sizeof(T), cudaMemcpyDeviceToDevice,
                             compute_stream),
             "cudaMemcpyAsync timed A <- A0");
-        distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemsetAsync(d_W, 0, local_elems_alloc * sizeof(T), compute_stream),
-            "cudaMemsetAsync timed W");
-        distributed_qr_col_blockcyclic::AssertCuda(
-            cudaMemsetAsync(d_Y, 0, local_elems_alloc * sizeof(T), compute_stream),
-            "cudaMemsetAsync timed Y");
         distributed_qr_col_blockcyclic::CommProfile comm_profile{};
         if (opts.print_comm_bw) {
             distributed_qr_col_blockcyclic::AssertCuda(
@@ -367,8 +440,8 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         distributed_qr_col_blockcyclic::AssertCuda(cudaEventRecord(timed_start, compute_stream),
                                                    "cudaEventRecord timed_start");
         distributed_qr_col_blockcyclic::distributed_blocked_qr_factorize_col_blockcyclic<T>(
-            cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local, d_W, d_Y,
-            &ws, compute_stream, comm_stream, opts.overlap_tile,
+            cublas_handle, env.nccl_comm, part, opts.m, opts.n, opts.nb, d_A, lda_local,
+            persistent_wy.storage, &ws, compute_stream, comm_stream, opts.overlap_tile,
             opts.print_comm_bw ? &comm_profile : nullptr, opts.panel_comm_mode,
             opts.use_compact_local_gemm, opts.broadcast_mode);
         if (opts.print_comm_bw) {
@@ -469,12 +542,14 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         spdlog::info(
             "Distributed blocked QR [col-blockcyclic] ({}): m={} n={} nb={} block_cols={} "
             "panel_buffers={} trail_update={} tile={} panel_comm={} broadcast_mode={} "
-            "local_update={} np={} avg {:.3f} ms",
+            "local_update={} store_wy={} np={} avg {:.3f} ms",
             DataTypeString<T>(), opts.m, opts.n, opts.nb, block_cols, opts.panel_buffers,
             trail_one_shot ? "one-shot" : "tiled", trail_one_shot ? part.local_cols : tile_cols,
             PanelCommModeToString(opts.panel_comm_mode),
             BroadcastModeToString(opts.broadcast_mode),
-            opts.use_compact_local_gemm ? "compact" : "segmented", env.size, max_ms);
+            opts.use_compact_local_gemm ? "compact" : "segmented",
+            distributed_qr_col_blockcyclic::PersistentWyStorageModeToString(opts.wy_storage_mode),
+            env.size, max_ms);
         if (opts.print_per_rank) {
             for (int r = 0; r < env.size; ++r) {
                 spdlog::info("Per-rank time: rank {} -> {:.3f} ms (no-barrier {:.3f} ms)", r,
@@ -549,8 +624,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
 
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_A0), "cudaFree d_A0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_A), "cudaFree d_A");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_W), "cudaFree d_W");
-    distributed_qr_col_blockcyclic::AssertCuda(cudaFree(d_Y), "cudaFree d_Y");
+    FreePersistentWyStorage(&persistent_wy);
 
     return (total_bad == 0) ? 0 : 1;
 }
@@ -639,7 +713,26 @@ int main(int argc, char** argv) {
         finalize_mpi_if_needed(env);
         return 1;
     }
+    if (!opts.wy_storage_valid) {
+        if (env.rank == 0) {
+            spdlog::error("Invalid --store-wy value '{}'. Supported values: none, dense, compact.",
+                          opts.wy_storage_value);
+        }
+        finalize_nccl_if_needed(&env);
+        finalize_mpi_if_needed(env);
+        return 1;
+    }
     if (env.rank == 0) {
+        spdlog::info(
+            "Distributed blocked-QR bench: type={} m={} n={} nb={} block_cols={} warmup={} "
+            "iters={} panel_buffers={} panel_comm={} broadcast_mode={} local_update={} "
+            "store_wy={} tile={}",
+            opts.use_double ? "double" : "float", opts.m, opts.n, opts.nb, block_cols,
+            opts.warmup, opts.iters, opts.panel_buffers, PanelCommModeToString(opts.panel_comm_mode),
+            BroadcastModeToString(opts.broadcast_mode),
+            opts.use_compact_local_gemm ? "compact" : "segmented",
+            distributed_qr_col_blockcyclic::PersistentWyStorageModeToString(opts.wy_storage_mode),
+            (opts.overlap_tile <= 0) ? opts.nb : opts.overlap_tile);
         spdlog::info(
             "Custom NVTX backend: {} (compiled={}, runtime={}, set {}=0 to disable)",
             distqr::nvtx::kBackendName, distqr::nvtx::kCompiledIn ? "yes" : "no",

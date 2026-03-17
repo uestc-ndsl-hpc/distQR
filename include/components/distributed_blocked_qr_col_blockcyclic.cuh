@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "panel_process.cuh"
+#include "persistent_wy_col_blockcyclic.cuh"
 #include "utils/cublas_gemm_traits.cuh"
 #include "utils/nvtx_range.cuh"
 
@@ -485,8 +486,6 @@ void factorize_owner_block_to_full_wy(cublasHandle_t cublas_handle,
                                       int block_begin,
                                       T* d_A_local,
                                       int lda_local,
-                                      T* d_W_local,
-                                      T* d_Y_local,
                                       DistributedQrColBlockCyclicWorkspace<T>* ws,
                                       cudaStream_t compute_stream,
                                       T* full_block_w,
@@ -540,25 +539,6 @@ void factorize_owner_block_to_full_wy(cublasHandle_t cublas_handle,
                 panel_update_one_shot(cublas_handle, inner, panel_rows, cols_local, d_pack_w,
                                       d_pack_y, panel_rows, a_trail, lda_local, ws->d_tmp0,
                                       ws->tmp_elems);
-            }
-        }
-
-        if (d_Y_local) {
-            AssertCuda(
-                cudaMemcpy2DAsync(d_Y_local + static_cast<size_t>(local_panel_col) * lda_local + inner,
-                                  static_cast<size_t>(lda_local) * sizeof(T), d_pack_y,
-                                  static_cast<size_t>(panel_rows) * sizeof(T),
-                                  static_cast<size_t>(panel_rows) * sizeof(T), kPanelWidth,
-                                  cudaMemcpyDeviceToDevice, compute_stream),
-                "cudaMemcpy2DAsync pack_y -> d_Y_local");
-            const int zero_rows = inner - block_begin;
-            if (zero_rows > 0) {
-                T* z_y =
-                    d_Y_local + static_cast<size_t>(local_panel_col) * lda_local + block_begin;
-                AssertCuda(cudaMemset2DAsync(z_y, static_cast<size_t>(lda_local) * sizeof(T), 0,
-                                             static_cast<size_t>(zero_rows) * sizeof(T),
-                                             kPanelWidth, compute_stream),
-                           "cudaMemset2DAsync zero d_Y_local top");
             }
         }
 
@@ -617,19 +597,6 @@ void factorize_owner_block_to_full_wy(cublasHandle_t cublas_handle,
                          "W_i -= W_prev * tmp");
         }
 
-        if (d_W_local) {
-            const int block_rows = m - block_begin;
-            T* src_w = full_block_w + static_cast<size_t>(block_begin) +
-                       static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
-            AssertCuda(
-                cudaMemcpy2DAsync(
-                    d_W_local + static_cast<size_t>(local_panel_col) * lda_local + block_begin,
-                    static_cast<size_t>(lda_local) * sizeof(T), src_w,
-                    static_cast<size_t>(m) * sizeof(T),
-                    static_cast<size_t>(block_rows) * sizeof(T), kPanelWidth,
-                    cudaMemcpyDeviceToDevice, compute_stream),
-                "cudaMemcpy2DAsync full_block_w -> d_W_local");
-        }
     }
 }
 
@@ -674,8 +641,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic_block_broadcast_lookahead(
     int nb,
     T* d_A_local,
     int lda_local,
-    T* d_W_local,
-    T* d_Y_local,
+    const PersistentWyStorage<T>& persistent_wy,
     DistributedQrColBlockCyclicWorkspace<T>* ws,
     cudaStream_t compute_stream,
     cudaStream_t comm_stream,
@@ -739,10 +705,21 @@ void distributed_blocked_qr_factorize_col_blockcyclic_block_broadcast_lookahead(
 
         const int owner = OwnerOfPanel(block_begin, part);
         factorize_owner_block_to_full_wy(cublas_handle, part, m, n, nb, block_begin, d_A_local,
-                                         lda_local, d_W_local, d_Y_local, ws, compute_stream,
-                                         full_w_slots[slot], full_y_slots[slot]);
+                                         lda_local, ws, compute_stream, full_w_slots[slot],
+                                         full_y_slots[slot]);
 
         if (part.rank == owner) {
+            const int local_block_col = LocalColOffset(part, block_begin);
+            if (local_block_col < 0) {
+                spdlog::error("Owner rank {} missing block begin col {} in local layout.", owner,
+                              block_begin);
+                std::exit(1);
+            }
+            StorePersistentWyBlock(persistent_wy, block_begin, local_block_col, m - block_begin,
+                                   std::min(nb, n - block_begin),
+                                   full_w_slots[slot] + static_cast<size_t>(block_begin), m,
+                                   full_y_slots[slot] + static_cast<size_t>(block_begin), m,
+                                   compute_stream);
             AssertCuda(cudaStreamWaitEvent(compute_stream, events.comm_done[slot], 0),
                        "cudaStreamWaitEvent compute_stream <- comm_done[slot](pack)");
             pack_full_block_wy_to_compact(
@@ -877,8 +854,7 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     int nb,
     T* d_A_local,
     int lda_local,
-    T* d_W_local,
-    T* d_Y_local,
+    const PersistentWyStorage<T>& persistent_wy,
     DistributedQrColBlockCyclicWorkspace<T>* ws,
     cudaStream_t compute_stream,
     cudaStream_t comm_stream,
@@ -990,9 +966,8 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
     if (use_block_broadcast && part.world_size > 1 && ws->d_block_w_alt && ws->d_block_y_alt &&
         ws->d_block_w_compact_alt && ws->d_block_y_compact_alt) {
         distributed_blocked_qr_factorize_col_blockcyclic_block_broadcast_lookahead(
-            cublas_handle, nccl_comm, part, m, n, nb, d_A_local, lda_local, d_W_local, d_Y_local,
-            ws, compute_stream, comm_stream, overlap_tile_cols, comm_profile,
-            use_compact_local_gemm);
+            cublas_handle, nccl_comm, part, m, n, nb, d_A_local, lda_local, persistent_wy, ws,
+            compute_stream, comm_stream, overlap_tile_cols, comm_profile, use_compact_local_gemm);
         return;
     }
 
@@ -1308,35 +1283,6 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                 }
             }
 
-            if (part.rank == owner) {
-                const int local_panel_col = LocalColOffset(part, inner);
-                if (local_panel_col < 0) {
-                    spdlog::error("Owner rank {} missing panel col {} in local layout.", owner,
-                                  inner);
-                    std::exit(1);
-                }
-                if (d_Y_local) {
-                    AssertCuda(
-                        cudaMemcpy2DAsync(
-                            d_Y_local + static_cast<size_t>(local_panel_col) * lda_local + inner,
-                            static_cast<size_t>(lda_local) * sizeof(T), d_pack_y,
-                            static_cast<size_t>(panel_rows) * sizeof(T),
-                            static_cast<size_t>(panel_rows) * sizeof(T), kPanelWidth,
-                            cudaMemcpyDeviceToDevice, compute_stream),
-                        "cudaMemcpy2DAsync pack_y -> d_Y_local");
-                    const int zero_rows = inner - block_begin;
-                    if (zero_rows > 0) {
-                        T* z_y = d_Y_local + static_cast<size_t>(local_panel_col) * lda_local +
-                                 block_begin;
-                        AssertCuda(
-                            cudaMemset2DAsync(z_y, static_cast<size_t>(lda_local) * sizeof(T), 0,
-                                              static_cast<size_t>(zero_rows) * sizeof(T),
-                                              kPanelWidth, compute_stream),
-                            "cudaMemset2DAsync zero d_Y_local top");
-                    }
-                }
-            }
-
             // Scatter packed W/Y into block buffers and zero top of the panel columns.
             if (need_panel_now) {
                 T* dst_w = ws->d_block_w + static_cast<size_t>(inner) +
@@ -1405,26 +1351,6 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                 }
             }
 
-            if (part.rank == owner && d_W_local) {
-                const int local_panel_col = LocalColOffset(part, inner);
-                if (local_panel_col < 0) {
-                    spdlog::error("Owner rank {} missing panel col {} in local layout.", owner,
-                                  inner);
-                    std::exit(1);
-                }
-                const int block_rows = m - block_begin;
-                T* src_w = ws->d_block_w + static_cast<size_t>(block_begin) +
-                           static_cast<size_t>(block_col_off) * static_cast<size_t>(m);
-                AssertCuda(
-                    cudaMemcpy2DAsync(
-                        d_W_local + static_cast<size_t>(local_panel_col) * lda_local + block_begin,
-                        static_cast<size_t>(lda_local) * sizeof(T), src_w,
-                        static_cast<size_t>(m) * sizeof(T),
-                        static_cast<size_t>(block_rows) * sizeof(T), kPanelWidth,
-                        cudaMemcpyDeviceToDevice, compute_stream),
-                    "cudaMemcpy2DAsync block_w -> d_W_local");
-            }
-
             if (use_block_broadcast && part.rank == owner) {
                 const int block_rows = m - block_begin;
                 T* src_w = ws->d_block_w + static_cast<size_t>(block_begin) +
@@ -1448,8 +1374,22 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
             }
         }
 
-        // Apply block WY to trailing columns after the block (full rows, like single-GPU).
         const int block_rows = m - block_begin;
+
+        if (part.rank == block_owner) {
+            const int local_block_col = LocalColOffset(part, block_begin);
+            if (local_block_col < 0) {
+                spdlog::error("Owner rank {} missing block begin col {} in local layout.",
+                              block_owner, block_begin);
+                std::exit(1);
+            }
+            StorePersistentWyBlock(persistent_wy, block_begin, local_block_col, block_rows, kb,
+                                   ws->d_block_w + static_cast<size_t>(block_begin), m,
+                                   ws->d_block_y + static_cast<size_t>(block_begin), m,
+                                   compute_stream);
+        }
+
+        // Apply block WY to trailing columns after the block (full rows, like single-GPU).
         const int trail_begin = block_end;
 
         auto apply_trailing_update = [&](const T* block_w, const T* block_y, int lda_block) {
@@ -1551,6 +1491,33 @@ void distributed_blocked_qr_factorize_col_blockcyclic(
                                   ws->d_block_y + static_cast<size_t>(block_begin), m);
         }
     }
+}
+
+template <typename T>
+void distributed_blocked_qr_factorize_col_blockcyclic(
+    cublasHandle_t cublas_handle,
+    ncclComm_t nccl_comm,
+    const ColBlockCyclicPartition& part,
+    int m,
+    int n,
+    int nb,
+    T* d_A_local,
+    int lda_local,
+    T* d_W_local,
+    T* d_Y_local,
+    DistributedQrColBlockCyclicWorkspace<T>* ws,
+    cudaStream_t compute_stream,
+    cudaStream_t comm_stream,
+    int overlap_tile_cols = 0,
+    CommProfile* comm_profile = nullptr,
+    PanelCommMode panel_comm_mode = PanelCommMode::SendRecv,
+    bool use_compact_local_gemm = false,
+    BroadcastMode broadcast_mode = BroadcastMode::Panel) {
+    const auto persistent_wy = MakeDensePersistentWyStorage(d_W_local, d_Y_local, lda_local);
+    distributed_blocked_qr_factorize_col_blockcyclic(
+        cublas_handle, nccl_comm, part, m, n, nb, d_A_local, lda_local, persistent_wy, ws,
+        compute_stream, comm_stream, overlap_tile_cols, comm_profile, panel_comm_mode,
+        use_compact_local_gemm, broadcast_mode);
 }
 
 }  // namespace distributed_qr_col_blockcyclic
