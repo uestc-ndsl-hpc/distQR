@@ -163,6 +163,12 @@ double QrFlops(int m, int n) {
     return 2.0 * md * nd * nd - (2.0 / 3.0) * nd * nd * nd;
 }
 
+double OrgqrFlops(int m, int n) {
+    // Match bench_qr's normalization when ORMQR is used to form explicit Q
+    // from an identity C with c_cols == n.
+    return QrFlops(m, n);
+}
+
 double FlopsToTflops(double flops, double ms) {
     if (ms <= 0.0) {
         return 0.0;
@@ -563,15 +569,19 @@ int RunSingleCase(const MpiCudaEnv& env,
     MPI_Allreduce(&local_info_abs, &global_info_abs, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
     if (env.rank == 0) {
-        const double flops = opts.e2e ? (QrFlops(m, n) + OrmqrLeftFlops(m, c_cols, n))
-                                      : OrmqrLeftFlops(m, c_cols, n);
+        const bool use_orgqr_norm = !opts.random_c && c_cols == n;
+        const double qr_flops = QrFlops(m, n);
+        const double apply_flops =
+            use_orgqr_norm ? OrgqrFlops(m, n) : OrmqrLeftFlops(m, c_cols, n);
+        const double flops = opts.e2e ? (qr_flops + apply_flops) : apply_flops;
         const double tflops = FlopsToTflops(flops, max_ms);
         spdlog::info(
-            "cuSOLVERMp {} [{}]: m={} n={} c_cols={} grid_block={} grid={}x{} C={} avg {:.3f} "
-            "ms ({:.3f} TFLOPS) info={}",
+            "cuSOLVERMp {} [{}]: m={} n={} c_cols={} grid_block={} grid={}x{} C={} flops_norm={} "
+            "avg {:.3f} ms ({:.3f} TFLOPS) info={}",
             opts.e2e ? "GEQRF+ORMQR" : "ORMQR",
             DataTypeString<T>(), m, n, c_cols, grid_block_size, grid_rows, grid_cols,
-            opts.random_c ? "random" : "identity", max_ms, tflops, global_info_abs);
+            opts.random_c ? "random" : "identity",
+            use_orgqr_norm ? "geqrf+orgqr" : "ormqr", max_ms, tflops, global_info_abs);
     }
 
     AssertCuda(cudaEventDestroy(start), "cudaEventDestroy start");

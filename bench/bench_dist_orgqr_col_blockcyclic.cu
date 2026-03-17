@@ -75,22 +75,16 @@ const char* DataTypeString() {
     return "double";
 }
 
-double ExplicitQFromWYFlops(int m, int n, int nb) {
-    double sum = 0.0;
-    for (int start = 0; start < n; start += nb) {
-        const int kb = std::min(nb, n - start);
-        const int m_sub = m - start;
-        const int cols_sub = n - start;
-        sum += 4.0 * static_cast<double>(kb) * static_cast<double>(m_sub) *
-               static_cast<double>(cols_sub);
-    }
-    return sum;
-}
-
 double QrFlops(int m, int n) {
     const double md = static_cast<double>(m);
     const double nd = static_cast<double>(n);
     return 2.0 * md * nd * nd - (2.0 / 3.0) * nd * nd * nd;
+}
+
+double OrgqrFlops(int m, int n) {
+    // Match bench_qr's normalization so distributed explicit-Q and cuSOLVERMp
+    // report comparable GEQRF/ORGQR-equivalent throughput.
+    return QrFlops(m, n);
 }
 
 double FlopsToTflops(double flops, double ms) {
@@ -593,8 +587,9 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
     unsigned long long total_bad = 0;
     MPI_Allreduce(&h_bad, &total_bad, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
 
-    const double flops = opts.e2e ? (QrFlops(opts.m, opts.n) + ExplicitQFromWYFlops(opts.m, opts.n, opts.nb))
-                                  : ExplicitQFromWYFlops(opts.m, opts.n, opts.nb);
+    const double qr_flops = QrFlops(opts.m, opts.n);
+    const double orgqr_flops = OrgqrFlops(opts.m, opts.n);
+    const double flops = opts.e2e ? (qr_flops + orgqr_flops) : orgqr_flops;
     const double q_tflops = FlopsToTflops(flops, max_ms);
     if (env.rank == 0) {
         spdlog::info(
