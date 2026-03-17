@@ -172,6 +172,7 @@ void AllocateColBlockCyclicWorkspace(
     int nb,
     int tile_cols,
     int panel_buffers,
+    bool need_block_lookahead_buffers,
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T>* ws) {
     if (!ws) {
         spdlog::error("AllocateColBlockCyclicWorkspace got null workspace.");
@@ -203,12 +204,28 @@ void AllocateColBlockCyclicWorkspace(
         cudaMalloc(&ws->d_block_w, ws->block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws->d_block_y, ws->block_storage_elems * sizeof(T)), "cudaMalloc ws.d_block_y");
+    if (need_block_lookahead_buffers) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws->d_block_w_alt, ws->block_storage_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_w_alt");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws->d_block_y_alt, ws->block_storage_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_y_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws->d_block_w_compact, ws->block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(
         cudaMalloc(&ws->d_block_y_compact, ws->block_compact_elems * sizeof(T)),
         "cudaMalloc ws.d_block_y_compact");
+    if (need_block_lookahead_buffers) {
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws->d_block_w_compact_alt, ws->block_compact_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_w_compact_alt");
+        distributed_qr_col_blockcyclic::AssertCuda(
+            cudaMalloc(&ws->d_block_y_compact_alt, ws->block_compact_elems * sizeof(T)),
+            "cudaMalloc ws.d_block_y_compact_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws->d_tmp0, ws->tmp_elems * sizeof(T)),
                                                "cudaMalloc ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaMalloc(&ws->d_tmp1, ws->tmp_elems * sizeof(T)),
@@ -231,10 +248,26 @@ void FreeColBlockCyclicWorkspace(
     }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_w), "cudaFree ws.d_block_w");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_y), "cudaFree ws.d_block_y");
+    if (ws->d_block_w_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_w_alt),
+                                                   "cudaFree ws.d_block_w_alt");
+    }
+    if (ws->d_block_y_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_y_alt),
+                                                   "cudaFree ws.d_block_y_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_w_compact),
                                                "cudaFree ws.d_block_w_compact");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_y_compact),
                                                "cudaFree ws.d_block_y_compact");
+    if (ws->d_block_w_compact_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_w_compact_alt),
+                                                   "cudaFree ws.d_block_w_compact_alt");
+    }
+    if (ws->d_block_y_compact_alt) {
+        distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_block_y_compact_alt),
+                                                   "cudaFree ws.d_block_y_compact_alt");
+    }
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_tmp0), "cudaFree ws.d_tmp0");
     distributed_qr_col_blockcyclic::AssertCuda(cudaFree(ws->d_tmp1), "cudaFree ws.d_tmp1");
 }
@@ -415,8 +448,13 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
         apply_one_shot
             ? std::max(part.local_cols, 1)
             : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
+    const bool need_block_lookahead_buffers =
+        part.world_size > 1 &&
+        opts.panel_comm_mode == PanelCommMode::Broadcast &&
+        opts.broadcast_mode == BroadcastMode::Block;
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
-    AllocateColBlockCyclicWorkspace<T>(opts.m, opts.nb, tile_cols, opts.panel_buffers, &ws);
+    AllocateColBlockCyclicWorkspace<T>(opts.m, opts.nb, tile_cols, opts.panel_buffers,
+                                       need_block_lookahead_buffers, &ws);
 
     cudaStream_t compute_stream = nullptr;
     cudaStream_t comm_stream = nullptr;
