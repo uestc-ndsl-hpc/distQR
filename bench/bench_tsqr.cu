@@ -896,7 +896,7 @@ __global__ void legacy_tsqr_kernel(int m, int n, T* A, int lda, T* R, int ldr) {
 
     const int num_data_col = (n + kLegacyTsqrBlockDimY - 1) / kLegacyTsqrBlockDimY;
 
-    T acc[kLegacyTsqrRowsPerThread];
+    volatile T acc[kLegacyTsqrRowsPerThread];
 #pragma unroll
     for (int k = 0; k < kLegacyTsqrRowsPerThread; ++k) {
         const int row_idx = thread_idx_x + k * kLegacyTsqrBlockDimX;
