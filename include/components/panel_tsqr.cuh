@@ -68,9 +68,9 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
     }
     __syncthreads();
 
-    volatile float q[tsqr_n32_data_num_per_thread];
+    float q[tsqr_n32_data_num_per_thread];
     for (auto col = 0; col < tsqr_n32_n; ++col) {
-        float nu = 0.f;
+        volatile float nu = 0.f;
         if (warp_id == col) {
 #pragma unroll
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
@@ -123,7 +123,7 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
         __syncthreads();
 
         if (col < warp_id) {
-            float nu = 0.f;
+            volatile float nu = 0.f;
 #pragma unroll
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
