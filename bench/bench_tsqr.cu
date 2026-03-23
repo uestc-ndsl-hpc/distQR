@@ -1329,18 +1329,20 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     }
 
     float split256_tsqr_ms = 0.0f;
-    if (run_split256_tsqr) {
-        split256_tsqr_ms = TimeKernelMs(
-            [&]() {
-                AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
-                           "cudaMemcpy D2D split256 tsqr");
-            },
-            [&]() {
-                SplitTsqrDouble<256, 192>(cublas_handle, m, d_A_work, lda, d_R, ldr,
-                                          d_work_split256, split256_work_elems_count);
-                AssertCuda(cudaGetLastError(), "split256 tsqr launch");
-            },
-            opts.iters);
+    if constexpr (std::is_same_v<T, double>) {
+        if (run_split256_tsqr) {
+            split256_tsqr_ms = TimeKernelMs(
+                [&]() {
+                    AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                               "cudaMemcpy D2D split256 tsqr");
+                },
+                [&]() {
+                    SplitTsqrDouble<256, 192>(cublas_handle, m, d_A_work, lda, d_R, ldr,
+                                              d_work_split256, split256_work_elems_count);
+                    AssertCuda(cudaGetLastError(), "split256 tsqr launch");
+                },
+                opts.iters);
+        }
     }
 
     float hybrid192_tsqr_ms = 0.0f;
