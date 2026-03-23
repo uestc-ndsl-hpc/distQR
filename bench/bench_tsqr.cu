@@ -135,6 +135,7 @@ struct Options {
     enum class DoubleVariant {
         kCurrent,
         kStatic192,
+        kSplit256,
         kHybrid192,
         kBoth,
         kAll,
@@ -148,6 +149,8 @@ const char* DoubleVariantName(Options::DoubleVariant variant) {
             return "current";
         case Options::DoubleVariant::kStatic192:
             return "static192";
+        case Options::DoubleVariant::kSplit256:
+            return "split256";
         case Options::DoubleVariant::kHybrid192:
             return "hybrid192";
         case Options::DoubleVariant::kBoth:
@@ -168,6 +171,12 @@ bool ShouldRunStatic192Tsqr(const Options& opts) {
     return opts.use_double &&
            (opts.double_variant == Options::DoubleVariant::kStatic192 ||
             opts.double_variant == Options::DoubleVariant::kBoth ||
+            opts.double_variant == Options::DoubleVariant::kAll);
+}
+
+bool ShouldRunSplit256Tsqr(const Options& opts) {
+    return opts.use_double &&
+           (opts.double_variant == Options::DoubleVariant::kSplit256 ||
             opts.double_variant == Options::DoubleVariant::kAll);
 }
 
@@ -195,6 +204,8 @@ Options ParseArgs(int argc, char** argv) {
                 opts.double_variant = Options::DoubleVariant::kCurrent;
             } else if (variant == "static192") {
                 opts.double_variant = Options::DoubleVariant::kStatic192;
+            } else if (variant == "split256") {
+                opts.double_variant = Options::DoubleVariant::kSplit256;
             } else if (variant == "hybrid192") {
                 opts.double_variant = Options::DoubleVariant::kHybrid192;
             } else if (variant == "both") {
@@ -400,6 +411,200 @@ __global__ void static_tsqr_n32_kernel(int m, T* A, int lda, T* R, int ldr) {
     }
 }
 
+template <int BlockSize, int StaticRows>
+__device__ __forceinline__ double SplitSharedRead(const double* shared_head,
+                                                  const double* shared_tail,
+                                                  int row,
+                                                  int col) {
+    constexpr int kTailRows = BlockSize - StaticRows;
+    static_assert(StaticRows > 0 && kTailRows > 0, "Split shared layout must have both regions.");
+    if (row < StaticRows) {
+        return shared_head[row + col * StaticRows];
+    }
+    return shared_tail[(row - StaticRows) + col * kTailRows];
+}
+
+template <int BlockSize, int StaticRows>
+__device__ __forceinline__ void SplitSharedWrite(double* shared_head,
+                                                 double* shared_tail,
+                                                 int row,
+                                                 int col,
+                                                 double value) {
+    constexpr int kTailRows = BlockSize - StaticRows;
+    static_assert(StaticRows > 0 && kTailRows > 0, "Split shared layout must have both regions.");
+    if (row < StaticRows) {
+        shared_head[row + col * StaticRows] = value;
+        return;
+    }
+    shared_tail[(row - StaticRows) + col * kTailRows] = value;
+}
+
+template <int BlockSize, int StaticRows>
+__global__ void split_tsqr_n32_double_kernel(int m, double* A, int lda, double* R, int ldr) {
+    constexpr int kN = kTsqrN;
+    constexpr int kWarpSize = 32;
+    constexpr int kRowsPerThread = (BlockSize + kWarpSize - 1) / kWarpSize;
+    constexpr int kTailRows = BlockSize - StaticRows;
+    constexpr double kEpsilon = 1.0e-7;
+    static_assert(StaticRows > 0 && kTailRows > 0, "Split kernel needs static and dynamic rows.");
+
+    const int lane_id = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int bx = blockIdx.x;
+
+    A += bx * BlockSize;
+    R += bx * kN;
+
+    const int block_size = min(BlockSize, m - bx * BlockSize);
+
+    __shared__ double shared_head[StaticRows * kN];
+    extern __shared__ double shared_tail[];
+
+#pragma unroll
+    for (int i = 0; i < kRowsPerThread; ++i) {
+        const int row_idx = lane_id + i * kWarpSize;
+        if (row_idx < block_size) {
+            SplitSharedWrite<BlockSize, StaticRows>(shared_head, shared_tail, row_idx, warp_id,
+                                                    A[row_idx + warp_id * lda]);
+        }
+    }
+    __syncthreads();
+
+    double q[kRowsPerThread];
+    for (int col = 0; col < kN; ++col) {
+        double nu = 0.0;
+        if (warp_id == col) {
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx >= col && row_idx < block_size) {
+                    q[i] = SplitSharedRead<BlockSize, StaticRows>(shared_head, shared_tail, row_idx,
+                                                                  col);
+                    nu += q[i] * q[i];
+                }
+            }
+            const double norm_square = LegacyWarpAllReduceSum(nu);
+            if (norm_square > kEpsilon * kEpsilon) {
+                const double norm = __dsqrt_rn(norm_square);
+                double scale = 1.0 / norm;
+#pragma unroll
+                for (int i = 0; i < kRowsPerThread; ++i) {
+                    const int row_idx = lane_id + i * kWarpSize;
+                    if (row_idx >= col && row_idx < block_size) {
+                        q[i] *= scale;
+                    }
+                }
+                double u1 = 0.0;
+                const int thread_off = col / kWarpSize;
+                if (lane_id == col % kWarpSize) {
+                    q[thread_off] += (q[thread_off] >= 0.0) ? 1.0 : -1.0;
+                    u1 = q[thread_off];
+                    R[col + ldr * col] = (u1 >= 0.0) ? -norm : norm;
+                }
+                u1 = __shfl_sync(0xffffffff, u1, col % kWarpSize);
+                scale = __drcp_rn(__dsqrt_rn(fabs(u1)));
+#pragma unroll
+                for (int i = 0; i < kRowsPerThread; ++i) {
+                    const int row_idx = lane_id + i * kWarpSize;
+                    if (row_idx >= col && row_idx < block_size) {
+                        SplitSharedWrite<BlockSize, StaticRows>(shared_head, shared_tail, row_idx,
+                                                                col, q[i] * scale);
+                    }
+                }
+            } else {
+                if (lane_id == col % kWarpSize) {
+                    R[col + ldr * col] = 0.0;
+                }
+#pragma unroll
+                for (int i = 0; i < kRowsPerThread; ++i) {
+                    const int row_idx = lane_id + i * kWarpSize;
+                    if (row_idx >= col && row_idx < block_size) {
+                        SplitSharedWrite<BlockSize, StaticRows>(shared_head, shared_tail, row_idx,
+                                                                col, 0.0);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        if (col < warp_id) {
+            nu = 0.0;
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx >= col && row_idx < block_size) {
+                    q[i] = SplitSharedRead<BlockSize, StaticRows>(shared_head, shared_tail, row_idx,
+                                                                  col);
+                    nu += q[i] * SplitSharedRead<BlockSize, StaticRows>(shared_head, shared_tail,
+                                                                        row_idx, warp_id);
+                }
+            }
+            const double utx = LegacyWarpAllReduceSum(nu);
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx >= col && row_idx < block_size) {
+                    const double updated =
+                        SplitSharedRead<BlockSize, StaticRows>(shared_head, shared_tail, row_idx,
+                                                               warp_id) -
+                        utx * q[i];
+                    SplitSharedWrite<BlockSize, StaticRows>(shared_head, shared_tail, row_idx,
+                                                            warp_id, updated);
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+
+    if (lane_id < warp_id) {
+        R[lane_id + ldr * warp_id] =
+            SplitSharedRead<BlockSize, StaticRows>(shared_head, shared_tail, lane_id, warp_id);
+        SplitSharedWrite<BlockSize, StaticRows>(shared_head, shared_tail, lane_id, warp_id, 0.0);
+    }
+    if (lane_id > warp_id) {
+        R[lane_id + ldr * warp_id] = 0.0;
+    }
+
+#pragma unroll
+    for (int i = 0; i < kRowsPerThread; ++i) {
+        const int row_idx = lane_id + i * kWarpSize;
+        q[i] = (row_idx == warp_id) ? 1.0 : 0.0;
+    }
+    __syncwarp();
+    for (int col = kN - 1; col >= 0; --col) {
+        if (warp_id >= col) {
+            double utq = 0.0;
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx < block_size) {
+                    utq += q[i] * SplitSharedRead<BlockSize, StaticRows>(shared_head, shared_tail,
+                                                                         row_idx, col);
+                }
+            }
+            utq = LegacyWarpAllReduceSum(utq);
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx < block_size) {
+                    q[i] -= utq * SplitSharedRead<BlockSize, StaticRows>(shared_head, shared_tail,
+                                                                         row_idx, col);
+                }
+            }
+            __syncwarp();
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < kRowsPerThread; ++i) {
+        const int row_idx = lane_id + i * kWarpSize;
+        if (row_idx < block_size) {
+            A[row_idx + warp_id * lda] = q[i];
+        }
+    }
+}
+
 template <int BlockSize>
 size_t StaticTsqrWorkElems(int m) {
     size_t total = 0;
@@ -433,6 +638,21 @@ size_t HybridTsqrWorkElems(int m, int switch_m) {
     }
     total += tsqr_work_elems<T>(current);
     return total;
+}
+
+template <int BlockSize, int StaticRows>
+void ConfigureSplitTsqrDoubleLaunch() {
+    constexpr int kTailRows = BlockSize - StaticRows;
+    constexpr int kTailSharedBytes = kTailRows * kTsqrN * static_cast<int>(sizeof(double));
+    constexpr int kPreferSharedMemory = 100;
+    AssertCuda(cudaFuncSetAttribute(split_tsqr_n32_double_kernel<BlockSize, StaticRows>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kTailSharedBytes),
+               "cudaFuncSetAttribute split_tsqr_n32_double_kernel max dynamic shared");
+    AssertCuda(cudaFuncSetAttribute(split_tsqr_n32_double_kernel<BlockSize, StaticRows>,
+                                    cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    kPreferSharedMemory),
+               "cudaFuncSetAttribute split_tsqr_n32_double_kernel carveout");
 }
 
 template <typename T, int BlockSize>
@@ -484,6 +704,64 @@ void StaticTsqr(cublasHandle_t cublas_handle,
                          A + (m - remaining_rows), lda, work + full_blocks * kN, ldwork, &zero,
                          A + (m - remaining_rows), lda),
                      "static tsqr tail gemm");
+    }
+}
+
+template <int BlockSize, int StaticRows>
+void SplitTsqrDouble(cublasHandle_t cublas_handle,
+                     int m,
+                     double* A,
+                     int lda,
+                     double* R,
+                     int ldr,
+                     double* work,
+                     size_t work_elems) {
+    constexpr int kN = kTsqrN;
+    constexpr int kTailRows = BlockSize - StaticRows;
+    constexpr int kTailSharedBytes = kTailRows * kN * static_cast<int>(sizeof(double));
+    const dim3 block(32, 32);
+
+    if (m <= 0) {
+        return;
+    }
+
+    ConfigureSplitTsqrDoubleLaunch<BlockSize, StaticRows>();
+
+    if (m <= BlockSize) {
+        split_tsqr_n32_double_kernel<BlockSize, StaticRows><<<1, block, kTailSharedBytes>>>(
+            m, A, lda, R, ldr);
+        return;
+    }
+
+    const int block_num = (m + BlockSize - 1) / BlockSize;
+    const int stack_rows = block_num * kN;
+    const size_t stack_elems = static_cast<size_t>(stack_rows) * kN;
+    assert(stack_elems <= work_elems);
+    const int ldwork = stack_rows;
+
+    split_tsqr_n32_double_kernel<BlockSize, StaticRows><<<block_num, block, kTailSharedBytes>>>(
+        m, A, lda, work, ldwork);
+
+    SplitTsqrDouble<BlockSize, StaticRows>(cublas_handle, stack_rows, work, ldwork, R, ldr,
+                                           work + stack_elems, work_elems - stack_elems);
+
+    const double one = 1.0;
+    const double zero = 0.0;
+    const int full_blocks = m / BlockSize;
+    if (full_blocks > 0) {
+        AssertCublas(CublasGemmTraits<double>::GemmStridedBatched(
+                         cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, BlockSize, kN, kN, &one, A, lda,
+                         BlockSize, work, ldwork, kN, &zero, A, lda, BlockSize, full_blocks),
+                     "split tsqr batched gemm");
+    }
+
+    const int remaining_rows = m % BlockSize;
+    if (remaining_rows > 0) {
+        AssertCublas(CublasGemmTraits<double>::Gemm(
+                         cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, remaining_rows, kN, kN, &one,
+                         A + (m - remaining_rows), lda, work + full_blocks * kN, ldwork, &zero,
+                         A + (m - remaining_rows), lda),
+                     "split tsqr tail gemm");
     }
 }
 
@@ -950,9 +1228,12 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     const size_t tsqr_work_elems_count = tsqr_work_elems<T>(m);
     const bool run_current_tsqr = ShouldRunCurrentTsqr(opts);
     const bool run_static192_tsqr = ShouldRunStatic192Tsqr(opts) && std::is_same_v<T, double>;
+    const bool run_split256_tsqr = ShouldRunSplit256Tsqr(opts) && std::is_same_v<T, double>;
     const bool run_hybrid192_tsqr = ShouldRunHybrid192Tsqr(opts) && std::is_same_v<T, double>;
     const size_t static192_work_elems_count =
         run_static192_tsqr ? StaticTsqrWorkElems<192>(m) : static_cast<size_t>(0);
+    const size_t split256_work_elems_count =
+        run_split256_tsqr ? StaticTsqrWorkElems<256>(m) : static_cast<size_t>(0);
     const size_t hybrid192_work_elems_count =
         run_hybrid192_tsqr ? HybridTsqrWorkElems<T, 192>(m, opts.hybrid_switch_m)
                            : static_cast<size_t>(0);
@@ -964,6 +1245,7 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     T* d_R = nullptr;
     T* d_work_tsqr = nullptr;
     T* d_work_static192 = nullptr;
+    T* d_work_split256 = nullptr;
     T* d_work_hybrid192 = nullptr;
     T* d_work_legacy = nullptr;
     T* d_tau = nullptr;
@@ -985,6 +1267,10 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     if (static192_work_elems_count > 0) {
         AssertCuda(cudaMalloc(&d_work_static192, static192_work_elems_count * sizeof(T)),
                    "cudaMalloc d_work_static192");
+    }
+    if (split256_work_elems_count > 0) {
+        AssertCuda(cudaMalloc(&d_work_split256, split256_work_elems_count * sizeof(T)),
+                   "cudaMalloc d_work_split256");
     }
     if (hybrid192_work_elems_count > 0) {
         AssertCuda(cudaMalloc(&d_work_hybrid192, hybrid192_work_elems_count * sizeof(T)),
@@ -1038,6 +1324,21 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
                 StaticTsqr<T, 192>(cublas_handle, m, d_A_work, lda, d_R, ldr, d_work_static192,
                                    static192_work_elems_count);
                 AssertCuda(cudaGetLastError(), "static192 tsqr launch");
+            },
+            opts.iters);
+    }
+
+    float split256_tsqr_ms = 0.0f;
+    if (run_split256_tsqr) {
+        split256_tsqr_ms = TimeKernelMs(
+            [&]() {
+                AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D split256 tsqr");
+            },
+            [&]() {
+                SplitTsqrDouble<256, 192>(cublas_handle, m, d_A_work, lda, d_R, ldr,
+                                          d_work_split256, split256_work_elems_count);
+                AssertCuda(cudaGetLastError(), "split256 tsqr launch");
             },
             opts.iters);
     }
@@ -1096,6 +1397,10 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
         std::printf("Static192 TSQR avg: %.3f ms (%.3f TFLOPS)\n", static192_tsqr_ms,
                     FlopsToTflops(qr_flops, static192_tsqr_ms));
     }
+    if (run_split256_tsqr) {
+        std::printf("Split256 TSQR avg: %.3f ms (%.3f TFLOPS)\n", split256_tsqr_ms,
+                    FlopsToTflops(qr_flops, split256_tsqr_ms));
+    }
     if (run_hybrid192_tsqr) {
         std::printf("Hybrid192 TSQR avg: %.3f ms (%.3f TFLOPS)\n", hybrid192_tsqr_ms,
                     FlopsToTflops(qr_flops, hybrid192_tsqr_ms));
@@ -1109,6 +1414,9 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
         if (run_static192_tsqr) {
             std::printf("Static192/Legacy speedup: %.3fx\n", legacy_tsqr_ms / static192_tsqr_ms);
         }
+        if (run_split256_tsqr) {
+            std::printf("Split256/Legacy speedup: %.3fx\n", legacy_tsqr_ms / split256_tsqr_ms);
+        }
         if (run_hybrid192_tsqr) {
             std::printf("Hybrid192/Legacy speedup: %.3fx\n", legacy_tsqr_ms / hybrid192_tsqr_ms);
         }
@@ -1118,11 +1426,20 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     if (run_current_tsqr && run_static192_tsqr) {
         std::printf("Current/Static192 speedup: %.3fx\n", static192_tsqr_ms / current_tsqr_ms);
     }
+    if (run_current_tsqr && run_split256_tsqr) {
+        std::printf("Current/Split256 speedup: %.3fx\n", split256_tsqr_ms / current_tsqr_ms);
+    }
     if (run_current_tsqr && run_hybrid192_tsqr) {
         std::printf("Current/Hybrid192 speedup: %.3fx\n", hybrid192_tsqr_ms / current_tsqr_ms);
     }
+    if (run_static192_tsqr && run_split256_tsqr) {
+        std::printf("Static192/Split256 speedup: %.3fx\n", split256_tsqr_ms / static192_tsqr_ms);
+    }
     if (run_static192_tsqr && run_hybrid192_tsqr) {
         std::printf("Static192/Hybrid192 speedup: %.3fx\n", hybrid192_tsqr_ms / static192_tsqr_ms);
+    }
+    if (run_split256_tsqr && run_hybrid192_tsqr) {
+        std::printf("Split256/Hybrid192 speedup: %.3fx\n", hybrid192_tsqr_ms / split256_tsqr_ms);
     }
     std::printf("GEQRF avg:        %.3f ms (%.3f TFLOPS)\n", geqrf_ms, FlopsToTflops(qr_flops, geqrf_ms));
 
@@ -1131,6 +1448,7 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     AssertCuda(cudaFree(d_R), "cudaFree d_R");
     AssertCuda(cudaFree(d_work_tsqr), "cudaFree d_work_tsqr");
     AssertCuda(cudaFree(d_work_static192), "cudaFree d_work_static192");
+    AssertCuda(cudaFree(d_work_split256), "cudaFree d_work_split256");
     AssertCuda(cudaFree(d_work_hybrid192), "cudaFree d_work_hybrid192");
     AssertCuda(cudaFree(d_work_legacy), "cudaFree d_work_legacy");
     AssertCuda(cudaFree(d_tau), "cudaFree d_tau");
