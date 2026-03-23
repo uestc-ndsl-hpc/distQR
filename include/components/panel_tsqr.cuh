@@ -190,11 +190,7 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
     }
 }
 
-__global__ __launch_bounds__(1024, 1) void tsqr_n32_double(int m,
-                                                           double* A,
-                                                           int lda,
-                                                           double* R,
-                                                           int ldr) {
+__global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     constexpr int tsqr_n32_block_size = double_block_size;
     constexpr int tsqr_n32_n = 32;
     constexpr int warp_size = 32;
@@ -314,15 +310,11 @@ __global__ __launch_bounds__(1024, 1) void tsqr_n32_double(int m,
     for (auto col = tsqr_n32_n - 1; col >= 0; --col) {
         if (warp_id >= col) {
             double nu = 0.0;
-            double u[tsqr_n32_data_num_per_thread];
 #pragma unroll
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
                 if (row_idx < block_size) {
-                    u[i] = shared_A[row_idx + col * tsqr_n32_block_size];
-                    nu += q[i] * u[i];
-                } else {
-                    u[i] = 0.0;
+                    nu += q[i] * shared_A[row_idx + col * tsqr_n32_block_size];
                 }
             }
             double utq = warp_all_reduce_sum(nu);
@@ -330,7 +322,7 @@ __global__ __launch_bounds__(1024, 1) void tsqr_n32_double(int m,
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
                 if (row_idx < block_size) {
-                    q[i] -= utq * u[i];
+                    q[i] -= utq * shared_A[row_idx + col * tsqr_n32_block_size];
                 }
             }
             __syncwarp();

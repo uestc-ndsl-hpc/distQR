@@ -873,12 +873,12 @@ __device__ __forceinline__ T LegacyEpsilon();
 
 template <>
 __device__ __forceinline__ float LegacyEpsilon<float>() {
-    return 1.0e-7f;
+    return 1.0e-8f;
 }
 
 template <>
 __device__ __forceinline__ double LegacyEpsilon<double>() {
-    return 1.0e-12;
+    return 1.0e-14;
 }
 
 template <typename T>
@@ -896,7 +896,7 @@ __global__ void legacy_tsqr_kernel(int m, int n, T* A, int lda, T* R, int ldr) {
 
     const int num_data_col = (n + kLegacyTsqrBlockDimY - 1) / kLegacyTsqrBlockDimY;
 
-    volatile T acc[kLegacyTsqrRowsPerThread];
+    T acc[kLegacyTsqrRowsPerThread];
 #pragma unroll
     for (int k = 0; k < kLegacyTsqrRowsPerThread; ++k) {
         const int row_idx = thread_idx_x + k * kLegacyTsqrBlockDimX;
