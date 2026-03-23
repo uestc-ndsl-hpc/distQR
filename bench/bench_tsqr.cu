@@ -192,10 +192,10 @@ template <typename T>
 __device__ __forceinline__ T LegacyWarpAllReduceSum(T value);
 
 template <typename T>
-__device__ __forceinline__ T LegacyAbs(T value);
+__device__ __forceinline__ T PanelTsqrSqrt(T value);
 
 template <typename T>
-__device__ __forceinline__ T LegacySqrt(T value);
+__device__ __forceinline__ T PanelTsqrInvSqrtAbs(T value);
 
 template <>
 __device__ __forceinline__ float PanelTsqrEpsilon<float>() {
@@ -205,6 +205,26 @@ __device__ __forceinline__ float PanelTsqrEpsilon<float>() {
 template <>
 __device__ __forceinline__ double PanelTsqrEpsilon<double>() {
     return 1.0e-7;
+}
+
+template <>
+__device__ __forceinline__ float PanelTsqrSqrt<float>(float value) {
+    return __fsqrt_rn(value);
+}
+
+template <>
+__device__ __forceinline__ double PanelTsqrSqrt<double>(double value) {
+    return __dsqrt_rn(value);
+}
+
+template <>
+__device__ __forceinline__ float PanelTsqrInvSqrtAbs<float>(float value) {
+    return __frsqrt_rn(fabsf(value));
+}
+
+template <>
+__device__ __forceinline__ double PanelTsqrInvSqrtAbs<double>(double value) {
+    return __drcp_rn(__dsqrt_rn(fabs(value)));
 }
 
 template <typename T, int BlockSize>
@@ -246,7 +266,7 @@ __global__ void static_tsqr_n32_kernel(int m, T* A, int lda, T* R, int ldr) {
             const T norm_square = LegacyWarpAllReduceSum(nu);
             const T epsilon = PanelTsqrEpsilon<T>();
             if (norm_square > epsilon * epsilon) {
-                T norm = LegacySqrt(norm_square);
+                T norm = PanelTsqrSqrt(norm_square);
                 T scale = static_cast<T>(1) / norm;
 #pragma unroll
                 for (int i = 0; i < kRowsPerThread; ++i) {
@@ -265,7 +285,7 @@ __global__ void static_tsqr_n32_kernel(int m, T* A, int lda, T* R, int ldr) {
                     R[col + ldr * col] = (u1 >= static_cast<T>(0)) ? -norm : norm;
                 }
                 u1 = __shfl_sync(0xffffffff, u1, col % kWarpSize);
-                scale = static_cast<T>(1) / LegacySqrt(LegacyAbs(u1));
+                scale = PanelTsqrInvSqrtAbs(u1);
 #pragma unroll
                 for (int i = 0; i < kRowsPerThread; ++i) {
                     const int row_idx = lane_id + i * kWarpSize;
