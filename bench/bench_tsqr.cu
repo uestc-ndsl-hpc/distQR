@@ -131,7 +131,33 @@ struct Options {
     int iters = 20;
     int warmup = 5;
     bool use_double = false;
+    enum class DoubleVariant {
+        kCurrent,
+        kStatic192,
+        kBoth,
+    };
+    DoubleVariant double_variant = DoubleVariant::kCurrent;
 };
+
+const char* DoubleVariantName(Options::DoubleVariant variant) {
+    switch (variant) {
+        case Options::DoubleVariant::kCurrent:
+            return "current";
+        case Options::DoubleVariant::kStatic192:
+            return "static192";
+        case Options::DoubleVariant::kBoth:
+            return "both";
+    }
+    return "unknown";
+}
+
+bool ShouldRunCurrentTsqr(const Options& opts) {
+    return !opts.use_double || opts.double_variant != Options::DoubleVariant::kStatic192;
+}
+
+bool ShouldRunStatic192Tsqr(const Options& opts) {
+    return opts.use_double && opts.double_variant != Options::DoubleVariant::kCurrent;
+}
 
 Options ParseArgs(int argc, char** argv) {
     Options opts;
@@ -145,9 +171,254 @@ Options ParseArgs(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
             std::string type = argv[++i];
             opts.use_double = (type == "double" || type == "fp64");
+        } else if (std::strcmp(argv[i], "--double-variant") == 0 && i + 1 < argc) {
+            const std::string variant = argv[++i];
+            if (variant == "current") {
+                opts.double_variant = Options::DoubleVariant::kCurrent;
+            } else if (variant == "static192") {
+                opts.double_variant = Options::DoubleVariant::kStatic192;
+            } else if (variant == "both") {
+                opts.double_variant = Options::DoubleVariant::kBoth;
+            }
         }
     }
     return opts;
+}
+
+template <typename T>
+__device__ __forceinline__ T PanelTsqrEpsilon();
+
+template <typename T>
+__device__ __forceinline__ T LegacyWarpAllReduceSum(T value);
+
+template <typename T>
+__device__ __forceinline__ T LegacyAbs(T value);
+
+template <typename T>
+__device__ __forceinline__ T LegacySqrt(T value);
+
+template <>
+__device__ __forceinline__ float PanelTsqrEpsilon<float>() {
+    return 1.0e-4f;
+}
+
+template <>
+__device__ __forceinline__ double PanelTsqrEpsilon<double>() {
+    return 1.0e-7;
+}
+
+template <typename T, int BlockSize>
+__global__ void static_tsqr_n32_kernel(int m, T* A, int lda, T* R, int ldr) {
+    constexpr int kN = kTsqrN;
+    constexpr int kWarpSize = 32;
+    constexpr int kRowsPerThread = (BlockSize + kWarpSize - 1) / kWarpSize;
+    const int lane_id = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int bx = blockIdx.x;
+
+    A += bx * BlockSize;
+    R += bx * kN;
+
+    const int block_size = min(BlockSize, m - bx * BlockSize);
+
+    __shared__ T shared_A[BlockSize * kN];
+#pragma unroll
+    for (int i = 0; i < kRowsPerThread; ++i) {
+        const int row_idx = lane_id + i * kWarpSize;
+        if (row_idx < block_size) {
+            shared_A[row_idx + warp_id * BlockSize] = A[row_idx + warp_id * lda];
+        }
+    }
+    __syncthreads();
+
+    T q[kRowsPerThread];
+    for (int col = 0; col < kN; ++col) {
+        T nu = static_cast<T>(0);
+        if (warp_id == col) {
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx >= col && row_idx < block_size) {
+                    q[i] = shared_A[row_idx + col * BlockSize];
+                    nu += q[i] * q[i];
+                }
+            }
+            const T norm_square = LegacyWarpAllReduceSum(nu);
+            const T epsilon = PanelTsqrEpsilon<T>();
+            if (norm_square > epsilon * epsilon) {
+                T norm = LegacySqrt(norm_square);
+                T scale = static_cast<T>(1) / norm;
+#pragma unroll
+                for (int i = 0; i < kRowsPerThread; ++i) {
+                    const int row_idx = lane_id + i * kWarpSize;
+                    if (row_idx >= col && row_idx < block_size) {
+                        q[i] *= scale;
+                    }
+                }
+
+                T u1 = static_cast<T>(0);
+                const int thread_off = col / kWarpSize;
+                if (lane_id == col % kWarpSize) {
+                    q[thread_off] +=
+                        (q[thread_off] >= static_cast<T>(0)) ? static_cast<T>(1) : static_cast<T>(-1);
+                    u1 = q[thread_off];
+                    R[col + ldr * col] = (u1 >= static_cast<T>(0)) ? -norm : norm;
+                }
+                u1 = __shfl_sync(0xffffffff, u1, col % kWarpSize);
+                scale = static_cast<T>(1) / LegacySqrt(LegacyAbs(u1));
+#pragma unroll
+                for (int i = 0; i < kRowsPerThread; ++i) {
+                    const int row_idx = lane_id + i * kWarpSize;
+                    if (row_idx >= col && row_idx < block_size) {
+                        shared_A[row_idx + col * BlockSize] = q[i] * scale;
+                    }
+                }
+            } else {
+                if (lane_id == col % kWarpSize) {
+                    R[col + ldr * col] = static_cast<T>(0);
+                }
+#pragma unroll
+                for (int i = 0; i < kRowsPerThread; ++i) {
+                    const int row_idx = lane_id + i * kWarpSize;
+                    if (row_idx >= col && row_idx < block_size) {
+                        shared_A[row_idx + col * BlockSize] = static_cast<T>(0);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        if (col < warp_id) {
+            nu = static_cast<T>(0);
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx >= col && row_idx < block_size) {
+                    q[i] = shared_A[row_idx + col * BlockSize];
+                    nu += q[i] * shared_A[row_idx + warp_id * BlockSize];
+                }
+            }
+            const T utx = LegacyWarpAllReduceSum(nu);
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx >= col && row_idx < block_size) {
+                    shared_A[row_idx + warp_id * BlockSize] -= utx * q[i];
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+
+    if (lane_id < warp_id) {
+        R[lane_id + ldr * warp_id] = shared_A[lane_id + warp_id * BlockSize];
+        shared_A[lane_id + warp_id * BlockSize] = static_cast<T>(0);
+    }
+    if (lane_id > warp_id) {
+        R[lane_id + ldr * warp_id] = static_cast<T>(0);
+    }
+
+#pragma unroll
+    for (int i = 0; i < kRowsPerThread; ++i) {
+        const int row_idx = lane_id + i * kWarpSize;
+        q[i] = (row_idx == warp_id) ? static_cast<T>(1) : static_cast<T>(0);
+    }
+    __syncwarp();
+    for (int col = kN - 1; col >= 0; --col) {
+        if (warp_id >= col) {
+            T utq = static_cast<T>(0);
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx < block_size) {
+                    utq += q[i] * shared_A[row_idx + col * BlockSize];
+                }
+            }
+            utq = LegacyWarpAllReduceSum(utq);
+#pragma unroll
+            for (int i = 0; i < kRowsPerThread; ++i) {
+                const int row_idx = lane_id + i * kWarpSize;
+                if (row_idx < block_size) {
+                    q[i] -= utq * shared_A[row_idx + col * BlockSize];
+                }
+            }
+            __syncwarp();
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < kRowsPerThread; ++i) {
+        const int row_idx = lane_id + i * kWarpSize;
+        if (row_idx < block_size) {
+            A[row_idx + warp_id * lda] = q[i];
+        }
+    }
+}
+
+template <int BlockSize>
+size_t StaticTsqrWorkElems(int m) {
+    size_t total = 0;
+    int current = m;
+    while (current > BlockSize) {
+        const int block_num = (current + BlockSize - 1) / BlockSize;
+        const int stack_rows = block_num * kTsqrN;
+        total += static_cast<size_t>(stack_rows) * kTsqrN;
+        current = stack_rows;
+    }
+    return total;
+}
+
+template <typename T, int BlockSize>
+void StaticTsqr(cublasHandle_t cublas_handle,
+                int m,
+                T* A,
+                int lda,
+                T* R,
+                int ldr,
+                T* work,
+                size_t work_elems) {
+    constexpr int kN = kTsqrN;
+    const dim3 block(32, 32);
+
+    if (m <= 0) {
+        return;
+    }
+
+    if (m <= BlockSize) {
+        static_tsqr_n32_kernel<T, BlockSize><<<1, block>>>(m, A, lda, R, ldr);
+        return;
+    }
+
+    const int block_num = (m + BlockSize - 1) / BlockSize;
+    const int stack_rows = block_num * kN;
+    const size_t stack_elems = static_cast<size_t>(stack_rows) * kN;
+    assert(stack_elems <= work_elems);
+    const int ldwork = stack_rows;
+
+    static_tsqr_n32_kernel<T, BlockSize><<<block_num, block>>>(m, A, lda, work, ldwork);
+
+    StaticTsqr<T, BlockSize>(cublas_handle, stack_rows, work, ldwork, R, ldr, work + stack_elems,
+                             work_elems - stack_elems);
+
+    const T one = static_cast<T>(1);
+    const T zero = static_cast<T>(0);
+    const int full_blocks = m / BlockSize;
+    if (full_blocks > 0) {
+        AssertCublas(CublasGemmTraits<T>::GemmStridedBatched(
+                         cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, BlockSize, kN, kN, &one, A, lda,
+                         BlockSize, work, ldwork, kN, &zero, A, lda, BlockSize, full_blocks),
+                     "static tsqr batched gemm");
+    }
+
+    const int remaining_rows = m % BlockSize;
+    if (remaining_rows > 0) {
+        AssertCublas(CublasGemmTraits<T>::Gemm(
+                         cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, remaining_rows, kN, kN, &one,
+                         A + (m - remaining_rows), lda, work + full_blocks * kN, ldwork, &zero,
+                         A + (m - remaining_rows), lda),
+                     "static tsqr tail gemm");
+    }
 }
 
 template <typename T>
@@ -553,6 +824,10 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     const size_t a_bytes = a_elems * sizeof(T);
     const size_t r_bytes = static_cast<size_t>(ldr) * n * sizeof(T);
     const size_t tsqr_work_elems_count = tsqr_work_elems<T>(m);
+    const bool run_current_tsqr = ShouldRunCurrentTsqr(opts);
+    const bool run_static192_tsqr = ShouldRunStatic192Tsqr(opts) && std::is_same_v<T, double>;
+    const size_t static192_work_elems_count =
+        run_static192_tsqr ? StaticTsqrWorkElems<192>(m) : static_cast<size_t>(0);
     const bool legacy_supported = LegacyTsqrSupported(m, n);
     const size_t legacy_work_elems_count = legacy_supported ? LegacyTsqrWorkElems(m, n) : 0;
 
@@ -560,6 +835,7 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     T* d_A_work = nullptr;
     T* d_R = nullptr;
     T* d_work_tsqr = nullptr;
+    T* d_work_static192 = nullptr;
     T* d_work_legacy = nullptr;
     T* d_tau = nullptr;
     T* d_work_geqrf = nullptr;
@@ -576,6 +852,10 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     if (tsqr_work_elems_count > 0) {
         AssertCuda(cudaMalloc(&d_work_tsqr, tsqr_work_elems_count * sizeof(T)),
                    "cudaMalloc d_work_tsqr");
+    }
+    if (static192_work_elems_count > 0) {
+        AssertCuda(cudaMalloc(&d_work_static192, static192_work_elems_count * sizeof(T)),
+                   "cudaMalloc d_work_static192");
     }
     if (legacy_work_elems_count > 0) {
         AssertCuda(cudaMalloc(&d_work_legacy, legacy_work_elems_count * sizeof(T)),
@@ -599,17 +879,35 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     AssertCuda(cudaFree(d_C), "cudaFree d_C");
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize warmup");
 
-    const float current_tsqr_ms = TimeKernelMs(
-        [&]() {
-            AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
-                       "cudaMemcpy D2D current tsqr");
-        },
-        [&]() {
-            tsqr(cublas_handle, m, d_A_work, lda, d_R, ldr, d_work_tsqr, tsqr_work_elems_count,
-                 nullptr);
-            AssertCuda(cudaGetLastError(), "current tsqr launch");
-        },
-        opts.iters);
+    float current_tsqr_ms = 0.0f;
+    if (run_current_tsqr) {
+        current_tsqr_ms = TimeKernelMs(
+            [&]() {
+                AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D current tsqr");
+            },
+            [&]() {
+                tsqr(cublas_handle, m, d_A_work, lda, d_R, ldr, d_work_tsqr, tsqr_work_elems_count,
+                     nullptr);
+                AssertCuda(cudaGetLastError(), "current tsqr launch");
+            },
+            opts.iters);
+    }
+
+    float static192_tsqr_ms = 0.0f;
+    if (run_static192_tsqr) {
+        static192_tsqr_ms = TimeKernelMs(
+            [&]() {
+                AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D static192 tsqr");
+            },
+            [&]() {
+                StaticTsqr<T, 192>(cublas_handle, m, d_A_work, lda, d_R, ldr, d_work_static192,
+                                   static192_work_elems_count);
+                AssertCuda(cudaGetLastError(), "static192 tsqr launch");
+            },
+            opts.iters);
+    }
 
     float legacy_tsqr_ms = 0.0f;
     if (legacy_supported) {
@@ -640,14 +938,30 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
 
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize bench");
 
-    std::printf("Current TSQR avg: %.3f ms (%.3f TFLOPS)\n", current_tsqr_ms,
-                FlopsToTflops(qr_flops, current_tsqr_ms));
+    if (run_current_tsqr) {
+        std::printf("Current TSQR avg: %.3f ms (%.3f TFLOPS)\n", current_tsqr_ms,
+                    FlopsToTflops(qr_flops, current_tsqr_ms));
+    } else {
+        std::printf("Current TSQR avg: skipped (--double-variant static192)\n");
+    }
+    if (run_static192_tsqr) {
+        std::printf("Static192 TSQR avg: %.3f ms (%.3f TFLOPS)\n", static192_tsqr_ms,
+                    FlopsToTflops(qr_flops, static192_tsqr_ms));
+    }
     if (legacy_supported) {
         std::printf("Legacy  TSQR avg: %.3f ms (%.3f TFLOPS)\n", legacy_tsqr_ms,
                     FlopsToTflops(qr_flops, legacy_tsqr_ms));
-        std::printf("Current/Legacy speedup: %.3fx\n", legacy_tsqr_ms / current_tsqr_ms);
+        if (run_current_tsqr) {
+            std::printf("Current/Legacy speedup: %.3fx\n", legacy_tsqr_ms / current_tsqr_ms);
+        }
+        if (run_static192_tsqr) {
+            std::printf("Static192/Legacy speedup: %.3fx\n", legacy_tsqr_ms / static192_tsqr_ms);
+        }
     } else {
         std::printf("Legacy  TSQR avg: skipped (requires m %% n == 0 and tail block aligned to n)\n");
+    }
+    if (run_current_tsqr && run_static192_tsqr) {
+        std::printf("Current/Static192 speedup: %.3fx\n", static192_tsqr_ms / current_tsqr_ms);
     }
     std::printf("GEQRF avg:        %.3f ms (%.3f TFLOPS)\n", geqrf_ms, FlopsToTflops(qr_flops, geqrf_ms));
 
@@ -655,6 +969,7 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     AssertCuda(cudaFree(d_A_work), "cudaFree d_A_work");
     AssertCuda(cudaFree(d_R), "cudaFree d_R");
     AssertCuda(cudaFree(d_work_tsqr), "cudaFree d_work_tsqr");
+    AssertCuda(cudaFree(d_work_static192), "cudaFree d_work_static192");
     AssertCuda(cudaFree(d_work_legacy), "cudaFree d_work_legacy");
     AssertCuda(cudaFree(d_tau), "cudaFree d_tau");
     AssertCuda(cudaFree(d_work_geqrf), "cudaFree d_work_geqrf");
@@ -665,8 +980,12 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
 
 int main(int argc, char** argv) {
     const Options opts = ParseArgs(argc, argv);
-    std::printf("TSQR bench: m=%d n=%d iters=%d warmup=%d type=%s\n", opts.m, kTsqrN, opts.iters,
+    std::printf("TSQR bench: m=%d n=%d iters=%d warmup=%d type=%s", opts.m, kTsqrN, opts.iters,
                 opts.warmup, opts.use_double ? "double" : "float");
+    if (opts.use_double) {
+        std::printf(" double_variant=%s", DoubleVariantName(opts.double_variant));
+    }
+    std::printf("\n");
 
     cublasHandle_t cublas_handle;
     cusolverDnHandle_t cusolver_handle;
