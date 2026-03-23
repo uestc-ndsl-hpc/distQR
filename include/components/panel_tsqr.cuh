@@ -68,7 +68,7 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
     }
     __syncthreads();
 
-    float q[tsqr_n32_data_num_per_thread];
+    volatile float q[tsqr_n32_data_num_per_thread];
     for (auto col = 0; col < tsqr_n32_n; ++col) {
         float nu = 0.f;
         if (warp_id == col) {
