@@ -150,182 +150,6 @@ Options ParseArgs(int argc, char** argv) {
     return opts;
 }
 
-constexpr int kOldestTsqrBlockSize = 256;
-constexpr int kOldestTsqrBlockDimX = 32;
-constexpr int kOldestTsqrBlockDimY = 32;
-constexpr int kOldestTsqrRowsPerThread = 8;
-
-// Frozen MGS-style baseline derived from the oldest LATER-era implementation.
-__device__ __forceinline__ float OldestWarpAllReduceSum(float value) {
-    for (int mask = warpSize / 2; mask > 0; mask /= 2) {
-        value += __shfl_xor_sync(0xffffffff, value, mask);
-    }
-    return value;
-}
-
-__global__ void oldest_tsqr_kernel(int m, int n, float* AA, int lda, float* RR, int ldr) {
-    int mm = m - blockIdx.x * kOldestTsqrBlockSize;
-    mm = (mm < kOldestTsqrBlockSize) ? mm : kOldestTsqrBlockSize;
-
-    const int mnmin = (mm < n) ? mm : n;
-    __shared__ float oldest_q[kOldestTsqrBlockSize];
-    __shared__ float oldest_r[kTsqrN * kTsqrN];
-
-    float ar[kOldestTsqrRowsPerThread] = {};
-
-#pragma unroll 4
-    for (int l = 0; l < kOldestTsqrRowsPerThread; ++l) {
-        const int row_idx = threadIdx.x + l * kOldestTsqrBlockDimX;
-        if (row_idx < mm && threadIdx.y < mnmin) {
-            ar[l] = AA[blockIdx.x * kOldestTsqrBlockSize + row_idx + threadIdx.y * lda];
-        }
-    }
-
-    __syncthreads();
-
-    for (int k = 0; k < mnmin; ++k) {
-        float nu = 0.0f;
-
-        if (threadIdx.y == k) {
-#pragma unroll 8
-            for (int l = 0; l < kOldestTsqrRowsPerThread; ++l) {
-                const int row_idx = threadIdx.x + l * kOldestTsqrBlockDimX;
-                if (row_idx < mm) {
-                    nu += ar[l] * ar[l];
-                }
-            }
-
-            const float normx = sqrtf(OldestWarpAllReduceSum(nu));
-            if (threadIdx.x == k) {
-                oldest_r[k + k * kTsqrN] = normx;
-            }
-            const float scale = 1.0f / normx;
-
-#pragma unroll 8
-            for (int l = 0; l < kOldestTsqrRowsPerThread; ++l) {
-                const int row_idx = threadIdx.x + l * kOldestTsqrBlockDimX;
-                if (row_idx < mm) {
-                    ar[l] *= scale;
-                    oldest_q[row_idx] = ar[l];
-                }
-            }
-        }
-
-        __syncthreads();
-
-        if (threadIdx.y > k) {
-            float dot = 0.0f;
-
-#pragma unroll 8
-            for (int l = 0; l < kOldestTsqrRowsPerThread; ++l) {
-                const int row_idx = threadIdx.x + l * kOldestTsqrBlockDimX;
-                if (row_idx < mm) {
-                    dot += oldest_q[row_idx] * ar[l];
-                }
-            }
-
-            const float scale = OldestWarpAllReduceSum(dot);
-
-#pragma unroll 8
-            for (int l = 0; l < kOldestTsqrRowsPerThread; ++l) {
-                const int row_idx = threadIdx.x + l * kOldestTsqrBlockDimX;
-                if (row_idx < mm) {
-                    ar[l] -= oldest_q[row_idx] * scale;
-                }
-            }
-
-            if (threadIdx.x == k) {
-                oldest_r[k + threadIdx.y * kTsqrN] = scale;
-            }
-        }
-
-        __syncthreads();
-    }
-
-#pragma unroll 8
-    for (int l = 0; l < kOldestTsqrRowsPerThread; ++l) {
-        const int row_idx = threadIdx.x + l * kOldestTsqrBlockDimX;
-        if (row_idx < mm && threadIdx.y < mnmin) {
-            AA[blockIdx.x * kOldestTsqrBlockSize + row_idx + threadIdx.y * lda] = ar[l];
-        }
-    }
-
-    if (threadIdx.x < mnmin && threadIdx.y < mnmin) {
-        RR[blockIdx.x * kTsqrN + threadIdx.x + threadIdx.y * ldr] =
-            (threadIdx.x <= threadIdx.y) ? oldest_r[threadIdx.x + threadIdx.y * kTsqrN] : 0.0f;
-    }
-}
-
-bool OldestTsqrSupported(int m, int n) {
-    return m >= n && n == kTsqrN;
-}
-
-size_t OldestTsqrWorkElems(int m, int n) {
-    if (m <= kOldestTsqrBlockSize) {
-        return 0;
-    }
-
-    size_t total = 0;
-    int current = m;
-    while (current > kOldestTsqrBlockSize) {
-        const int block_num = (current + kOldestTsqrBlockSize - 1) / kOldestTsqrBlockSize;
-        const int stack_rows = block_num * n;
-        total += static_cast<size_t>(stack_rows) * n;
-        current = stack_rows;
-    }
-    return total;
-}
-
-void OldestTsqr(cublasHandle_t cublas_handle,
-                int m,
-                int n,
-                float* A,
-                int lda,
-                float* R,
-                int ldr,
-                float* work,
-                size_t work_elems) {
-    assert(OldestTsqrSupported(m, n));
-    assert(m <= kOldestTsqrBlockSize || work != nullptr);
-
-    const dim3 block_dim(kOldestTsqrBlockDimX, kOldestTsqrBlockDimY);
-    if (m <= kOldestTsqrBlockSize) {
-        oldest_tsqr_kernel<<<1, block_dim>>>(m, n, A, lda, R, ldr);
-        return;
-    }
-
-    const int block_num = (m + kOldestTsqrBlockSize - 1) / kOldestTsqrBlockSize;
-    const int stack_rows = block_num * n;
-    const size_t stack_elems = static_cast<size_t>(stack_rows) * n;
-    assert(stack_elems <= work_elems);
-    const int ldwork = stack_rows;
-
-    oldest_tsqr_kernel<<<block_num, block_dim>>>(m, n, A, lda, work, ldwork);
-    OldestTsqr(cublas_handle, stack_rows, n, work, ldwork, R, ldr, work + stack_elems,
-               work_elems - stack_elems);
-
-    const float one = 1.0f;
-    const float zero = 0.0f;
-    const int full_blocks = m / kOldestTsqrBlockSize;
-    if (full_blocks > 0) {
-        AssertCublas(CublasGemmTraits<float>::GemmStridedBatched(
-                         cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, kOldestTsqrBlockSize, n, n,
-                         &one, A, lda, kOldestTsqrBlockSize, work, ldwork, n, &zero, A, lda,
-                         kOldestTsqrBlockSize, full_blocks),
-                     "oldest tsqr batched gemm");
-    }
-
-    const int remaining_rows = m % kOldestTsqrBlockSize;
-    if (remaining_rows > 0) {
-        AssertCublas(CublasGemmTraits<float>::Gemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                                   remaining_rows, n, n, &one,
-                                                   A + (m - remaining_rows), lda,
-                                                   work + full_blocks * n, ldwork, &zero,
-                                                   A + (m - remaining_rows), lda),
-                     "oldest tsqr tail gemm");
-    }
-}
-
 template <typename T>
 struct LegacySharedMemory;
 
@@ -731,15 +555,12 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     const size_t tsqr_work_elems_count = tsqr_work_elems<T>(m);
     const bool legacy_supported = LegacyTsqrSupported(m, n);
     const size_t legacy_work_elems_count = legacy_supported ? LegacyTsqrWorkElems(m, n) : 0;
-    const bool oldest_supported = std::is_same_v<T, float> && OldestTsqrSupported(m, n);
-    const size_t oldest_work_elems_count = oldest_supported ? OldestTsqrWorkElems(m, n) : 0;
 
     T* d_A0 = nullptr;
     T* d_A_work = nullptr;
     T* d_R = nullptr;
     T* d_work_tsqr = nullptr;
     T* d_work_legacy = nullptr;
-    float* d_work_oldest = nullptr;
     T* d_tau = nullptr;
     T* d_work_geqrf = nullptr;
     int* d_info = nullptr;
@@ -759,10 +580,6 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     if (legacy_work_elems_count > 0) {
         AssertCuda(cudaMalloc(&d_work_legacy, legacy_work_elems_count * sizeof(T)),
                    "cudaMalloc d_work_legacy");
-    }
-    if (oldest_work_elems_count > 0) {
-        AssertCuda(cudaMalloc(&d_work_oldest, oldest_work_elems_count * sizeof(float)),
-                   "cudaMalloc d_work_oldest");
     }
 
     int lwork = 0;
@@ -809,23 +626,6 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
             opts.iters);
     }
 
-    float oldest_tsqr_ms = 0.0f;
-    if constexpr (std::is_same_v<T, float>) {
-        if (oldest_supported) {
-            oldest_tsqr_ms = TimeKernelMs(
-                [&]() {
-                    AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
-                               "cudaMemcpy D2D oldest tsqr");
-                },
-                [&]() {
-                    OldestTsqr(cublas_handle, m, n, d_A_work, lda, d_R, ldr, d_work_oldest,
-                               oldest_work_elems_count);
-                    AssertCuda(cudaGetLastError(), "oldest tsqr launch");
-                },
-                opts.iters);
-        }
-    }
-
     const float geqrf_ms = TimeKernelMs(
         [&]() {
             AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
@@ -849,13 +649,6 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     } else {
         std::printf("Legacy  TSQR avg: skipped (requires m %% n == 0 and tail block aligned to n)\n");
     }
-    if (oldest_supported) {
-        std::printf("Oldest  TSQR avg: %.3f ms (%.3f TFLOPS)\n", oldest_tsqr_ms,
-                    FlopsToTflops(qr_flops, oldest_tsqr_ms));
-        std::printf("Current/Oldest speedup: %.3fx\n", oldest_tsqr_ms / current_tsqr_ms);
-    } else {
-        std::printf("Oldest  TSQR avg: skipped (float-only frozen MGS baseline)\n");
-    }
     std::printf("GEQRF avg:        %.3f ms (%.3f TFLOPS)\n", geqrf_ms, FlopsToTflops(qr_flops, geqrf_ms));
 
     AssertCuda(cudaFree(d_A0), "cudaFree d_A0");
@@ -863,7 +656,6 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     AssertCuda(cudaFree(d_R), "cudaFree d_R");
     AssertCuda(cudaFree(d_work_tsqr), "cudaFree d_work_tsqr");
     AssertCuda(cudaFree(d_work_legacy), "cudaFree d_work_legacy");
-    AssertCuda(cudaFree(d_work_oldest), "cudaFree d_work_oldest");
     AssertCuda(cudaFree(d_tau), "cudaFree d_tau");
     AssertCuda(cudaFree(d_work_geqrf), "cudaFree d_work_geqrf");
     AssertCuda(cudaFree(d_info), "cudaFree d_info");
