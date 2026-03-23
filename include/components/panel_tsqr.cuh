@@ -15,7 +15,7 @@ static __inline__ __device__ T warp_all_reduce_sum(T val) {
 template <typename T>
 constexpr int tsqr_block_size() {
     if constexpr (std::is_same_v<T, double>) {
-        return 256;
+        return 192;
     } else {
         return 256;
     }
