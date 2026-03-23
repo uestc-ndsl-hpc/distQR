@@ -247,7 +247,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
                     R[col + ldr * col] = (u1 >= 0) ? -norm : norm;
                 }
                 u1 = __shfl_sync(0xffffffff, u1, col % warp_size);
-                scale = __drcp_rn(__dsqrt_rn(abs(u1)));
+                scale = __drcp_rn(__dsqrt_rn(fabs(u1)));
 #pragma unroll
                 for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                     auto row_idx = lane_id + i * warp_size;
