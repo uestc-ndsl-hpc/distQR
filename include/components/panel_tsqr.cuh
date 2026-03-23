@@ -4,8 +4,11 @@
 
 #include "utils/cublas_gemm_traits.cuh"
 
-constexpr int double_block_size = 192;
+constexpr int double_block_size = 256;
 constexpr int float_block_size = 256;
+constexpr int kTsqrN32Cols = 32;
+constexpr size_t kTsqrN32DoubleSharedBytes =
+    static_cast<size_t>(double_block_size) * static_cast<size_t>(kTsqrN32Cols) * sizeof(double);
 
 template <typename T>
 static __inline__ __device__ T warp_all_reduce_sum(T val) {
@@ -201,7 +204,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
 
     int block_size = min(tsqr_n32_block_size, m - bx * tsqr_n32_block_size);
 
-    __shared__ double shared_A[tsqr_n32_block_size * tsqr_n32_n];
+    extern __shared__ double shared_A[];
 #pragma unroll
     for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
         auto row_idx = lane_id + i * warp_size;
@@ -333,6 +336,15 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     }
 }
 
+static inline void configure_tsqr_n32_double_launch() {
+    constexpr int kPreferSharedMemory = 100;
+    const int shared_bytes = static_cast<int>(kTsqrN32DoubleSharedBytes);
+    cudaFuncSetAttribute(tsqr_n32_double, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         shared_bytes);
+    cudaFuncSetAttribute(tsqr_n32_double, cudaFuncAttributePreferredSharedMemoryCarveout,
+                         kPreferSharedMemory);
+}
+
 /**
 Full TSQR for n == 32.
 Note: Constructing the full Q and R requires recursive factorization of stacked
@@ -356,7 +368,8 @@ void tsqr(
         if constexpr (std::is_same_v<T, float>) {
             tsqr_n32_float<<<1, block, 0, stream>>>(m, A, lda, R, ldr);
         } else if constexpr (std::is_same_v<T, double>) {
-            tsqr_n32_double<<<1, block, 0, stream>>>(m, A, lda, R, ldr);
+            configure_tsqr_n32_double_launch();
+            tsqr_n32_double<<<1, block, kTsqrN32DoubleSharedBytes, stream>>>(m, A, lda, R, ldr);
         } else {
             static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                           "tsqr_recursive only supports float and double.");
@@ -375,7 +388,9 @@ void tsqr(
     if constexpr (std::is_same_v<T, float>) {
         tsqr_n32_float<<<block_num, block, 0, stream>>>(m, A, lda, work, ldwork);
     } else if constexpr (std::is_same_v<T, double>) {
-        tsqr_n32_double<<<block_num, block, 0, stream>>>(m, A, lda, work, ldwork);
+        configure_tsqr_n32_double_launch();
+        tsqr_n32_double<<<block_num, block, kTsqrN32DoubleSharedBytes, stream>>>(
+            m, A, lda, work, ldwork);
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                       "tsqr_recursive only supports float and double.");
