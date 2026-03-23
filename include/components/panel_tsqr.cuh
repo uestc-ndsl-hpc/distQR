@@ -7,20 +7,8 @@
 constexpr int double_block_size = 256;
 constexpr int float_block_size = 256;
 constexpr int kTsqrN32Cols = 32;
-constexpr int kTsqrN32DoubleLegacySharedStride = double_block_size;
-// Padding each double column by one element breaks cross-column bank aliasing.
-constexpr int kTsqrN32DoublePaddedSharedStride = double_block_size + 1;
-constexpr size_t kTsqrN32DoubleLegacySharedBytes =
-    static_cast<size_t>(kTsqrN32DoubleLegacySharedStride) * static_cast<size_t>(kTsqrN32Cols) *
-    sizeof(double);
-constexpr size_t kTsqrN32DoublePaddedSharedBytes =
-    static_cast<size_t>(kTsqrN32DoublePaddedSharedStride) * static_cast<size_t>(kTsqrN32Cols) *
-    sizeof(double);
-
-struct TsqrN32DoubleLaunchConfig {
-    bool use_padded_stride = false;
-    size_t shared_bytes = kTsqrN32DoubleLegacySharedBytes;
-};
+constexpr size_t kTsqrN32DoubleSharedBytes =
+    static_cast<size_t>(double_block_size) * static_cast<size_t>(kTsqrN32Cols) * sizeof(double);
 
 template <typename T>
 static __inline__ __device__ T warp_all_reduce_sum(T val) {
@@ -202,22 +190,6 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
     }
 }
 
-template <int SharedStride>
-__device__ __forceinline__ double tsqr_n32_double_shared_read(const double* shared_A,
-                                                              int row,
-                                                              int col) {
-    return shared_A[row + col * SharedStride];
-}
-
-template <int SharedStride>
-__device__ __forceinline__ void tsqr_n32_double_shared_write(double* shared_A,
-                                                             int row,
-                                                             int col,
-                                                             double value) {
-    shared_A[row + col * SharedStride] = value;
-}
-
-template <int SharedStride>
 __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     constexpr int tsqr_n32_block_size = double_block_size;
     constexpr int tsqr_n32_n = 32;
@@ -225,8 +197,6 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     constexpr int tsqr_n32_data_num_per_thread =
         (tsqr_n32_block_size + warp_size - 1) / warp_size;
     constexpr double epsilon = 1e-7;
-    static_assert(SharedStride >= tsqr_n32_block_size,
-                  "Double TSQR shared stride must cover the full block size.");
     const int lane_id = threadIdx.x;
     const int warp_id = threadIdx.y;
     const int bx = blockIdx.x;
@@ -241,8 +211,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
         auto row_idx = lane_id + i * warp_size;
         if (row_idx < block_size) {
-            tsqr_n32_double_shared_write<SharedStride>(shared_A, row_idx, warp_id,
-                                                       A[row_idx + warp_id * lda]);
+            shared_A[row_idx + warp_id * tsqr_n32_block_size] = A[row_idx + warp_id * lda];
         }
     }
     __syncthreads();
@@ -255,7 +224,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
                 if (row_idx >= col && row_idx < block_size) {
-                    q[i] = tsqr_n32_double_shared_read<SharedStride>(shared_A, row_idx, col);
+                    q[i] = shared_A[row_idx + col * tsqr_n32_block_size];
                     nu += q[i] * q[i];
                 }
             }
@@ -283,8 +252,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
                 for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                     auto row_idx = lane_id + i * warp_size;
                     if (row_idx >= col && row_idx < block_size) {
-                        tsqr_n32_double_shared_write<SharedStride>(shared_A, row_idx, col,
-                                                                   q[i] * scale);
+                        shared_A[row_idx + col * tsqr_n32_block_size] = q[i] * scale;
                     }
                 }
             } else {
@@ -295,7 +263,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
                 for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                     auto row_idx = lane_id + i * warp_size;
                     if (row_idx >= col && row_idx < block_size) {
-                        tsqr_n32_double_shared_write<SharedStride>(shared_A, row_idx, col, 0.0);
+                        shared_A[row_idx + col * tsqr_n32_block_size] = 0.0;
                     }
                 }
             }
@@ -308,9 +276,8 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
                 if (row_idx >= col && row_idx < block_size) {
-                    q[i] = tsqr_n32_double_shared_read<SharedStride>(shared_A, row_idx, col);
-                    nu += q[i] *
-                          tsqr_n32_double_shared_read<SharedStride>(shared_A, row_idx, warp_id);
+                    q[i] = shared_A[row_idx + col * tsqr_n32_block_size];
+                    nu += q[i] * shared_A[row_idx + warp_id * tsqr_n32_block_size];
                 }
             }
             double utx = warp_all_reduce_sum(nu);
@@ -318,11 +285,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
                 if (row_idx >= col && row_idx < block_size) {
-                    const double updated =
-                        tsqr_n32_double_shared_read<SharedStride>(shared_A, row_idx, warp_id) -
-                        utx * q[i];
-                    tsqr_n32_double_shared_write<SharedStride>(shared_A, row_idx, warp_id,
-                                                               updated);
+                    shared_A[row_idx + warp_id * tsqr_n32_block_size] -= utx * q[i];
                 }
             }
         }
@@ -331,9 +294,8 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     __syncthreads();
 
     if (lane_id < warp_id) {
-        R[lane_id + ldr * warp_id] =
-            tsqr_n32_double_shared_read<SharedStride>(shared_A, lane_id, warp_id);
-        tsqr_n32_double_shared_write<SharedStride>(shared_A, lane_id, warp_id, 0.0);
+        R[lane_id + ldr * warp_id] = shared_A[lane_id + warp_id * tsqr_n32_block_size];
+        shared_A[lane_id + warp_id * tsqr_n32_block_size] = 0.0;
     }
     if (lane_id > warp_id) {
         R[lane_id + ldr * warp_id] = 0.0;
@@ -348,11 +310,15 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     for (auto col = tsqr_n32_n - 1; col >= 0; --col) {
         if (warp_id >= col) {
             double nu = 0.0;
+            double u[tsqr_n32_data_num_per_thread];
 #pragma unroll
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
                 if (row_idx < block_size) {
-                    nu += q[i] * tsqr_n32_double_shared_read<SharedStride>(shared_A, row_idx, col);
+                    u[i] = shared_A[row_idx + col * tsqr_n32_block_size];
+                    nu += q[i] * u[i];
+                } else {
+                    u[i] = 0.0;
                 }
             }
             double utq = warp_all_reduce_sum(nu);
@@ -360,7 +326,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
                 if (row_idx < block_size) {
-                    q[i] -= utq * tsqr_n32_double_shared_read<SharedStride>(shared_A, row_idx, col);
+                    q[i] -= utq * u[i];
                 }
             }
             __syncwarp();
@@ -376,61 +342,13 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     }
 }
 
-template <int SharedStride>
-static inline bool configure_tsqr_n32_double_launch(size_t shared_bytes) {
+static inline void configure_tsqr_n32_double_launch() {
     constexpr int kPreferSharedMemory = 100;
-    const int shared_bytes_int = static_cast<int>(shared_bytes);
-    const auto max_dynamic_shared_status =
-        cudaFuncSetAttribute(tsqr_n32_double<SharedStride>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes_int);
-    if (max_dynamic_shared_status != cudaSuccess) {
-        return false;
-    }
-    const auto carveout_status =
-        cudaFuncSetAttribute(tsqr_n32_double<SharedStride>,
-                             cudaFuncAttributePreferredSharedMemoryCarveout,
-                             kPreferSharedMemory);
-    return carveout_status == cudaSuccess;
-}
-
-static inline TsqrN32DoubleLaunchConfig select_tsqr_n32_double_launch_config() {
-    TsqrN32DoubleLaunchConfig config;
-
-    int device = 0;
-    if (cudaGetDevice(&device) == cudaSuccess) {
-        int max_shared_bytes = 0;
-        if (cudaDeviceGetAttribute(&max_shared_bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                                   device) == cudaSuccess &&
-            max_shared_bytes >= static_cast<int>(kTsqrN32DoublePaddedSharedBytes) &&
-            configure_tsqr_n32_double_launch<kTsqrN32DoublePaddedSharedStride>(
-                kTsqrN32DoublePaddedSharedBytes)) {
-            config.use_padded_stride = true;
-            config.shared_bytes = kTsqrN32DoublePaddedSharedBytes;
-            return config;
-        }
-    }
-
-    configure_tsqr_n32_double_launch<kTsqrN32DoubleLegacySharedStride>(
-        kTsqrN32DoubleLegacySharedBytes);
-    return config;
-}
-
-static inline void launch_tsqr_n32_double(dim3 grid,
-                                          dim3 block,
-                                          cudaStream_t stream,
-                                          int m,
-                                          double* A,
-                                          int lda,
-                                          double* R,
-                                          int ldr,
-                                          const TsqrN32DoubleLaunchConfig& launch_config) {
-    if (launch_config.use_padded_stride) {
-        tsqr_n32_double<kTsqrN32DoublePaddedSharedStride>
-            <<<grid, block, launch_config.shared_bytes, stream>>>(m, A, lda, R, ldr);
-        return;
-    }
-    tsqr_n32_double<kTsqrN32DoubleLegacySharedStride>
-        <<<grid, block, launch_config.shared_bytes, stream>>>(m, A, lda, R, ldr);
+    const int shared_bytes = static_cast<int>(kTsqrN32DoubleSharedBytes);
+    cudaFuncSetAttribute(tsqr_n32_double, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         shared_bytes);
+    cudaFuncSetAttribute(tsqr_n32_double, cudaFuncAttributePreferredSharedMemoryCarveout,
+                         kPreferSharedMemory);
 }
 
 /**
@@ -439,16 +357,8 @@ Note: Constructing the full Q and R requires recursive factorization of stacked
 R and batched GEMM to apply the stacked Q to each block.
 */
 template <typename T>
-void tsqr_impl(cublasHandle_t cublas_handle,
-               int m,
-               T* A,
-               int lda,
-               T* R,
-               int ldr,
-               T* work,
-               size_t work_elems,
-               cudaStream_t stream,
-               const TsqrN32DoubleLaunchConfig& double_launch_config) {
+void tsqr(
+    cublasHandle_t cublas_handle, int m, T* A, int lda, T* R, int ldr, T* work, size_t work_elems, cudaStream_t stream) {
     const int tsqr_n32_block_size = tsqr_block_size<T>();
     constexpr int tsqr_n32_n = 32;
     constexpr int warp_size = 32;
@@ -464,8 +374,8 @@ void tsqr_impl(cublasHandle_t cublas_handle,
         if constexpr (std::is_same_v<T, float>) {
             tsqr_n32_float<<<1, block, 0, stream>>>(m, A, lda, R, ldr);
         } else if constexpr (std::is_same_v<T, double>) {
-            launch_tsqr_n32_double(dim3(1), block, stream, m, A, lda, R, ldr,
-                                   double_launch_config);
+            configure_tsqr_n32_double_launch();
+            tsqr_n32_double<<<1, block, kTsqrN32DoubleSharedBytes, stream>>>(m, A, lda, R, ldr);
         } else {
             static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                           "tsqr_recursive only supports float and double.");
@@ -484,15 +394,16 @@ void tsqr_impl(cublasHandle_t cublas_handle,
     if constexpr (std::is_same_v<T, float>) {
         tsqr_n32_float<<<block_num, block, 0, stream>>>(m, A, lda, work, ldwork);
     } else if constexpr (std::is_same_v<T, double>) {
-        launch_tsqr_n32_double(dim3(block_num), block, stream, m, A, lda, work, ldwork,
-                               double_launch_config);
+        configure_tsqr_n32_double_launch();
+        tsqr_n32_double<<<block_num, block, kTsqrN32DoubleSharedBytes, stream>>>(
+            m, A, lda, work, ldwork);
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                       "tsqr_recursive only supports float and double.");
     }
 
-    tsqr_impl(cublas_handle, stack_rows, work, ldwork, R, ldr, work + stack_elems,
-              work_elems - stack_elems, stream, double_launch_config);
+    tsqr(cublas_handle, stack_rows, work, ldwork, R, ldr, work + stack_elems,
+         work_elems - stack_elems, stream);
 
     const T one = static_cast<T>(1);
     const T zero = static_cast<T>(0);
@@ -510,26 +421,5 @@ void tsqr_impl(cublasHandle_t cublas_handle,
                                   tsqr_n32_n, tsqr_n32_n, &one, A + (m - remaining_rows), lda,
                                   work + full_blocks * tsqr_n32_n, ldwork, &zero,
                                   A + (m - remaining_rows), lda);
-    }
-}
-
-template <typename T>
-void tsqr(cublasHandle_t cublas_handle,
-          int m,
-          T* A,
-          int lda,
-          T* R,
-          int ldr,
-          T* work,
-          size_t work_elems,
-          cudaStream_t stream) {
-    if constexpr (std::is_same_v<T, double>) {
-        const TsqrN32DoubleLaunchConfig double_launch_config =
-            select_tsqr_n32_double_launch_config();
-        tsqr_impl(cublas_handle, m, A, lda, R, ldr, work, work_elems, stream,
-                  double_launch_config);
-    } else {
-        tsqr_impl(cublas_handle, m, A, lda, R, ldr, work, work_elems, stream,
-                  TsqrN32DoubleLaunchConfig{});
     }
 }
