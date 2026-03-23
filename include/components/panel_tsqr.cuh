@@ -45,8 +45,9 @@ size_t tsqr_work_elems(int m) {
 __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
     constexpr int tsqr_n32_block_size = float_block_size;
     constexpr int tsqr_n32_n = 32;
-    constexpr int tsqr_n32_data_num_per_thread = 8;
     constexpr int warp_size = 32;
+    constexpr int tsqr_n32_data_num_per_thread =
+        (tsqr_n32_block_size + warp_size - 1) / warp_size;
     constexpr float epsilon = 1e-4;
     const int lane_id = threadIdx.x;
     const int warp_id = threadIdx.y;
@@ -192,8 +193,9 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
 __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     constexpr int tsqr_n32_block_size = double_block_size;
     constexpr int tsqr_n32_n = 32;
-    constexpr int tsqr_n32_data_num_per_thread = 8;
     constexpr int warp_size = 32;
+    constexpr int tsqr_n32_data_num_per_thread =
+        (tsqr_n32_block_size + warp_size - 1) / warp_size;
     constexpr double epsilon = 1e-7;
     const int lane_id = threadIdx.x;
     const int warp_id = threadIdx.y;
