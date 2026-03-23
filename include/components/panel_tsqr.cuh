@@ -4,7 +4,7 @@
 
 #include "utils/cublas_gemm_traits.cuh"
 
-constexpr int double_block_size = 192;
+constexpr int double_block_size = 224;
 constexpr int float_block_size = 256;
 
 template <typename T>
