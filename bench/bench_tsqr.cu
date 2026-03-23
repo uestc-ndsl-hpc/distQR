@@ -131,10 +131,13 @@ struct Options {
     int iters = 20;
     int warmup = 5;
     bool use_double = false;
+    int hybrid_switch_m = 4096;
     enum class DoubleVariant {
         kCurrent,
         kStatic192,
+        kHybrid192,
         kBoth,
+        kAll,
     };
     DoubleVariant double_variant = DoubleVariant::kCurrent;
 };
@@ -145,18 +148,33 @@ const char* DoubleVariantName(Options::DoubleVariant variant) {
             return "current";
         case Options::DoubleVariant::kStatic192:
             return "static192";
+        case Options::DoubleVariant::kHybrid192:
+            return "hybrid192";
         case Options::DoubleVariant::kBoth:
             return "both";
+        case Options::DoubleVariant::kAll:
+            return "all";
     }
     return "unknown";
 }
 
 bool ShouldRunCurrentTsqr(const Options& opts) {
-    return !opts.use_double || opts.double_variant != Options::DoubleVariant::kStatic192;
+    return !opts.use_double || opts.double_variant == Options::DoubleVariant::kCurrent ||
+           opts.double_variant == Options::DoubleVariant::kBoth ||
+           opts.double_variant == Options::DoubleVariant::kAll;
 }
 
 bool ShouldRunStatic192Tsqr(const Options& opts) {
-    return opts.use_double && opts.double_variant != Options::DoubleVariant::kCurrent;
+    return opts.use_double &&
+           (opts.double_variant == Options::DoubleVariant::kStatic192 ||
+            opts.double_variant == Options::DoubleVariant::kBoth ||
+            opts.double_variant == Options::DoubleVariant::kAll);
+}
+
+bool ShouldRunHybrid192Tsqr(const Options& opts) {
+    return opts.use_double &&
+           (opts.double_variant == Options::DoubleVariant::kHybrid192 ||
+            opts.double_variant == Options::DoubleVariant::kAll);
 }
 
 Options ParseArgs(int argc, char** argv) {
@@ -177,9 +195,15 @@ Options ParseArgs(int argc, char** argv) {
                 opts.double_variant = Options::DoubleVariant::kCurrent;
             } else if (variant == "static192") {
                 opts.double_variant = Options::DoubleVariant::kStatic192;
+            } else if (variant == "hybrid192") {
+                opts.double_variant = Options::DoubleVariant::kHybrid192;
             } else if (variant == "both") {
                 opts.double_variant = Options::DoubleVariant::kBoth;
+            } else if (variant == "all") {
+                opts.double_variant = Options::DoubleVariant::kAll;
             }
+        } else if (std::strcmp(argv[i], "--hybrid-switch-m") == 0 && i + 1 < argc) {
+            opts.hybrid_switch_m = std::atoi(argv[++i]);
         }
     }
     return opts;
@@ -389,6 +413,28 @@ size_t StaticTsqrWorkElems(int m) {
     return total;
 }
 
+template <typename T, int StaticBlockSize>
+size_t HybridTsqrWorkElems(int m, int switch_m) {
+    const int effective_switch_m = (switch_m < kTsqrN) ? kTsqrN : switch_m;
+    if (m <= 0) {
+        return 0;
+    }
+    if (m <= effective_switch_m) {
+        return tsqr_work_elems<T>(m);
+    }
+
+    size_t total = 0;
+    int current = m;
+    while (current > effective_switch_m) {
+        const int block_num = (current + StaticBlockSize - 1) / StaticBlockSize;
+        const int stack_rows = block_num * kTsqrN;
+        total += static_cast<size_t>(stack_rows) * kTsqrN;
+        current = stack_rows;
+    }
+    total += tsqr_work_elems<T>(current);
+    return total;
+}
+
 template <typename T, int BlockSize>
 void StaticTsqr(cublasHandle_t cublas_handle,
                 int m,
@@ -438,6 +484,64 @@ void StaticTsqr(cublasHandle_t cublas_handle,
                          A + (m - remaining_rows), lda, work + full_blocks * kN, ldwork, &zero,
                          A + (m - remaining_rows), lda),
                      "static tsqr tail gemm");
+    }
+}
+
+template <typename T, int StaticBlockSize>
+void HybridTsqr(cublasHandle_t cublas_handle,
+                int switch_m,
+                int m,
+                T* A,
+                int lda,
+                T* R,
+                int ldr,
+                T* work,
+                size_t work_elems) {
+    const int effective_switch_m = (switch_m < kTsqrN) ? kTsqrN : switch_m;
+    constexpr int kN = kTsqrN;
+    const dim3 block(32, 32);
+
+    if (m <= 0) {
+        return;
+    }
+    if (m <= effective_switch_m) {
+        tsqr(cublas_handle, m, A, lda, R, ldr, work, work_elems, nullptr);
+        return;
+    }
+    if (m <= StaticBlockSize) {
+        static_tsqr_n32_kernel<T, StaticBlockSize><<<1, block>>>(m, A, lda, R, ldr);
+        return;
+    }
+
+    const int block_num = (m + StaticBlockSize - 1) / StaticBlockSize;
+    const int stack_rows = block_num * kN;
+    const size_t stack_elems = static_cast<size_t>(stack_rows) * kN;
+    assert(stack_elems <= work_elems);
+    const int ldwork = stack_rows;
+
+    static_tsqr_n32_kernel<T, StaticBlockSize><<<block_num, block>>>(m, A, lda, work, ldwork);
+
+    HybridTsqr<T, StaticBlockSize>(cublas_handle, effective_switch_m, stack_rows, work, ldwork, R,
+                                   ldr, work + stack_elems, work_elems - stack_elems);
+
+    const T one = static_cast<T>(1);
+    const T zero = static_cast<T>(0);
+    const int full_blocks = m / StaticBlockSize;
+    if (full_blocks > 0) {
+        AssertCublas(CublasGemmTraits<T>::GemmStridedBatched(
+                         cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, StaticBlockSize, kN, kN, &one,
+                         A, lda, StaticBlockSize, work, ldwork, kN, &zero, A, lda, StaticBlockSize,
+                         full_blocks),
+                     "hybrid tsqr batched gemm");
+    }
+
+    const int remaining_rows = m % StaticBlockSize;
+    if (remaining_rows > 0) {
+        AssertCublas(CublasGemmTraits<T>::Gemm(
+                         cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, remaining_rows, kN, kN, &one,
+                         A + (m - remaining_rows), lda, work + full_blocks * kN, ldwork, &zero,
+                         A + (m - remaining_rows), lda),
+                     "hybrid tsqr tail gemm");
     }
 }
 
@@ -846,8 +950,12 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     const size_t tsqr_work_elems_count = tsqr_work_elems<T>(m);
     const bool run_current_tsqr = ShouldRunCurrentTsqr(opts);
     const bool run_static192_tsqr = ShouldRunStatic192Tsqr(opts) && std::is_same_v<T, double>;
+    const bool run_hybrid192_tsqr = ShouldRunHybrid192Tsqr(opts) && std::is_same_v<T, double>;
     const size_t static192_work_elems_count =
         run_static192_tsqr ? StaticTsqrWorkElems<192>(m) : static_cast<size_t>(0);
+    const size_t hybrid192_work_elems_count =
+        run_hybrid192_tsqr ? HybridTsqrWorkElems<T, 192>(m, opts.hybrid_switch_m)
+                           : static_cast<size_t>(0);
     const bool legacy_supported = LegacyTsqrSupported(m, n);
     const size_t legacy_work_elems_count = legacy_supported ? LegacyTsqrWorkElems(m, n) : 0;
 
@@ -856,6 +964,7 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     T* d_R = nullptr;
     T* d_work_tsqr = nullptr;
     T* d_work_static192 = nullptr;
+    T* d_work_hybrid192 = nullptr;
     T* d_work_legacy = nullptr;
     T* d_tau = nullptr;
     T* d_work_geqrf = nullptr;
@@ -876,6 +985,10 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     if (static192_work_elems_count > 0) {
         AssertCuda(cudaMalloc(&d_work_static192, static192_work_elems_count * sizeof(T)),
                    "cudaMalloc d_work_static192");
+    }
+    if (hybrid192_work_elems_count > 0) {
+        AssertCuda(cudaMalloc(&d_work_hybrid192, hybrid192_work_elems_count * sizeof(T)),
+                   "cudaMalloc d_work_hybrid192");
     }
     if (legacy_work_elems_count > 0) {
         AssertCuda(cudaMalloc(&d_work_legacy, legacy_work_elems_count * sizeof(T)),
@@ -929,6 +1042,21 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
             opts.iters);
     }
 
+    float hybrid192_tsqr_ms = 0.0f;
+    if (run_hybrid192_tsqr) {
+        hybrid192_tsqr_ms = TimeKernelMs(
+            [&]() {
+                AssertCuda(cudaMemcpy(d_A_work, d_A0, a_bytes, cudaMemcpyDeviceToDevice),
+                           "cudaMemcpy D2D hybrid192 tsqr");
+            },
+            [&]() {
+                HybridTsqr<T, 192>(cublas_handle, opts.hybrid_switch_m, m, d_A_work, lda, d_R, ldr,
+                                   d_work_hybrid192, hybrid192_work_elems_count);
+                AssertCuda(cudaGetLastError(), "hybrid192 tsqr launch");
+            },
+            opts.iters);
+    }
+
     float legacy_tsqr_ms = 0.0f;
     if (legacy_supported) {
         legacy_tsqr_ms = TimeKernelMs(
@@ -962,11 +1090,15 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
         std::printf("Current TSQR avg: %.3f ms (%.3f TFLOPS)\n", current_tsqr_ms,
                     FlopsToTflops(qr_flops, current_tsqr_ms));
     } else {
-        std::printf("Current TSQR avg: skipped (--double-variant static192)\n");
+        std::printf("Current TSQR avg: skipped by variant selection\n");
     }
     if (run_static192_tsqr) {
         std::printf("Static192 TSQR avg: %.3f ms (%.3f TFLOPS)\n", static192_tsqr_ms,
                     FlopsToTflops(qr_flops, static192_tsqr_ms));
+    }
+    if (run_hybrid192_tsqr) {
+        std::printf("Hybrid192 TSQR avg: %.3f ms (%.3f TFLOPS)\n", hybrid192_tsqr_ms,
+                    FlopsToTflops(qr_flops, hybrid192_tsqr_ms));
     }
     if (legacy_supported) {
         std::printf("Legacy  TSQR avg: %.3f ms (%.3f TFLOPS)\n", legacy_tsqr_ms,
@@ -977,11 +1109,20 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
         if (run_static192_tsqr) {
             std::printf("Static192/Legacy speedup: %.3fx\n", legacy_tsqr_ms / static192_tsqr_ms);
         }
+        if (run_hybrid192_tsqr) {
+            std::printf("Hybrid192/Legacy speedup: %.3fx\n", legacy_tsqr_ms / hybrid192_tsqr_ms);
+        }
     } else {
         std::printf("Legacy  TSQR avg: skipped (requires m %% n == 0 and tail block aligned to n)\n");
     }
     if (run_current_tsqr && run_static192_tsqr) {
         std::printf("Current/Static192 speedup: %.3fx\n", static192_tsqr_ms / current_tsqr_ms);
+    }
+    if (run_current_tsqr && run_hybrid192_tsqr) {
+        std::printf("Current/Hybrid192 speedup: %.3fx\n", hybrid192_tsqr_ms / current_tsqr_ms);
+    }
+    if (run_static192_tsqr && run_hybrid192_tsqr) {
+        std::printf("Static192/Hybrid192 speedup: %.3fx\n", hybrid192_tsqr_ms / static192_tsqr_ms);
     }
     std::printf("GEQRF avg:        %.3f ms (%.3f TFLOPS)\n", geqrf_ms, FlopsToTflops(qr_flops, geqrf_ms));
 
@@ -990,6 +1131,7 @@ void RunBench(const Options& opts, cublasHandle_t cublas_handle, cusolverDnHandl
     AssertCuda(cudaFree(d_R), "cudaFree d_R");
     AssertCuda(cudaFree(d_work_tsqr), "cudaFree d_work_tsqr");
     AssertCuda(cudaFree(d_work_static192), "cudaFree d_work_static192");
+    AssertCuda(cudaFree(d_work_hybrid192), "cudaFree d_work_hybrid192");
     AssertCuda(cudaFree(d_work_legacy), "cudaFree d_work_legacy");
     AssertCuda(cudaFree(d_tau), "cudaFree d_tau");
     AssertCuda(cudaFree(d_work_geqrf), "cudaFree d_work_geqrf");
@@ -1003,7 +1145,8 @@ int main(int argc, char** argv) {
     std::printf("TSQR bench: m=%d n=%d iters=%d warmup=%d type=%s", opts.m, kTsqrN, opts.iters,
                 opts.warmup, opts.use_double ? "double" : "float");
     if (opts.use_double) {
-        std::printf(" double_variant=%s", DoubleVariantName(opts.double_variant));
+        std::printf(" double_variant=%s hybrid_switch_m=%d", DoubleVariantName(opts.double_variant),
+                    opts.hybrid_switch_m);
     }
     std::printf("\n");
 
