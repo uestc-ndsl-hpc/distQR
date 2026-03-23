@@ -4,6 +4,9 @@
 
 #include "utils/cublas_gemm_traits.cuh"
 
+constexpr int double_block_size = 256;
+constexpr int float_block_size = 256;
+
 template <typename T>
 static __inline__ __device__ T warp_all_reduce_sum(T val) {
     for (int mask = warpSize / 2; mask > 0; mask /= 2) {
@@ -15,9 +18,9 @@ static __inline__ __device__ T warp_all_reduce_sum(T val) {
 template <typename T>
 constexpr int tsqr_block_size() {
     if constexpr (std::is_same_v<T, double>) {
-        return 192;
+        return double_block_size;
     } else {
-        return 256;
+        return float_block_size;
     }
 }
 
@@ -37,7 +40,7 @@ size_t tsqr_work_elems(int m) {
 }
 
 __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
-    constexpr int tsqr_n32_block_size = 256;
+    constexpr int tsqr_n32_block_size = float_block_size;
     constexpr int tsqr_n32_n = 32;
     constexpr int tsqr_n32_data_num_per_thread = 8;
     constexpr int warp_size = 32;
@@ -184,7 +187,7 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
 }
 
 __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
-    constexpr int tsqr_n32_block_size = 192;
+    constexpr int tsqr_n32_block_size = double_block_size;
     constexpr int tsqr_n32_n = 32;
     constexpr int tsqr_n32_data_num_per_thread = 8;
     constexpr int warp_size = 32;
