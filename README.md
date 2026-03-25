@@ -94,7 +94,7 @@ mpirun -np 4 --mca pml ucx --mca coll_hcoll_enable 0 \
 Useful options for the distributed col-blockcyclic benches:
 - `--block_cols <int>`: block-cyclic ownership granularity. It must be a positive multiple of `nb`.
 - `--panel-comm <sendrecv|broadcast>`: select panel communication mode.
-- `--broadcast-mode <panel|block>`: select panel-level or block-level broadcast for the factorization path. This applies to `bench_dist_blocked_qr_col_blockcyclic` and to `bench_dist_orgqr_col_blockcyclic --e2e`.
+- `--broadcast-mode <panel|block|block-a>`: select panel-level broadcast, full block `W/Y` broadcast, or block-`A`-only broadcast for the factorization path. `block-a` halves block-broadcast traffic by sending only factorized block `A`, then rebuilding block `W/Y` locally on receivers. This applies to `bench_dist_blocked_qr_col_blockcyclic` and to `bench_dist_orgqr_col_blockcyclic --e2e`.
 - `--overlap_tile <int>` or `--update_tile <int>`: trailing-update tile width. `0` means one-shot update.
 - `--panel-buffers <int>`: number of packed panel buffers. Must be at least `2`.
 - `--compact-local-gemm` / `--segmented-local-gemm`: choose local trailing-update implementation.

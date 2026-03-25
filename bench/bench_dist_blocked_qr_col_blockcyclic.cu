@@ -185,6 +185,11 @@ bool ParseBroadcastMode(const char* mode, BroadcastMode* out_mode) {
         *out_mode = BroadcastMode::Block;
         return true;
     }
+    if (std::strcmp(mode, "block-a") == 0 || std::strcmp(mode, "block_a") == 0 ||
+        std::strcmp(mode, "block-a-only") == 0) {
+        *out_mode = BroadcastMode::BlockAOnly;
+        return true;
+    }
     return false;
 }
 
@@ -224,6 +229,9 @@ const char* PanelCommModeToString(PanelCommMode mode) {
 }
 
 const char* BroadcastModeToString(BroadcastMode mode) {
+    if (mode == BroadcastMode::BlockAOnly) {
+        return "block-a";
+    }
     if (mode == BroadcastMode::Block) {
         return "block";
     }
@@ -307,7 +315,7 @@ int RunBenchmarkTyped(const MpiCudaEnv& env, const Options& opts, int block_cols
                               : std::max(kPanelWidth, std::min(opts.overlap_tile, opts.nb));
     const bool need_block_lookahead_buffers =
         opts.panel_comm_mode == PanelCommMode::Broadcast &&
-        opts.broadcast_mode == BroadcastMode::Block;
+        distributed_qr_col_blockcyclic::IsBlockBroadcastMode(opts.broadcast_mode);
     distributed_qr_col_blockcyclic::DistributedQrColBlockCyclicWorkspace<T> ws{};
     ws.tsqr_work_panel_elems = std::max(tsqr_work_elems<T>(opts.m), static_cast<size_t>(1));
     ws.pack_buffer_count = opts.panel_buffers;
@@ -706,7 +714,8 @@ int main(int argc, char** argv) {
     }
     if (!opts.broadcast_mode_valid) {
         if (env.rank == 0) {
-            spdlog::error("Invalid --broadcast-mode value '{}'. Supported values: panel, block.",
+            spdlog::error(
+                "Invalid --broadcast-mode value '{}'. Supported values: panel, block, block-a.",
                           opts.broadcast_mode_value);
         }
         finalize_nccl_if_needed(&env);
