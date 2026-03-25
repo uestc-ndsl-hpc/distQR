@@ -318,6 +318,11 @@ bool ParseBroadcastMode(const char* mode, BroadcastMode* out_mode) {
         *out_mode = BroadcastMode::BlockAOnly;
         return true;
     }
+    if (std::strcmp(mode, "block-yt") == 0 || std::strcmp(mode, "block_yt") == 0 ||
+        std::strcmp(mode, "yt") == 0) {
+        *out_mode = BroadcastMode::BlockYT;
+        return true;
+    }
     return false;
 }
 
@@ -357,6 +362,9 @@ const char* PanelCommModeToString(PanelCommMode mode) {
 }
 
 const char* BroadcastModeToString(BroadcastMode mode) {
+    if (mode == BroadcastMode::BlockYT) {
+        return "block-yt";
+    }
     if (mode == BroadcastMode::BlockAOnly) {
         return "block-a";
     }
@@ -725,7 +733,7 @@ int main(int argc, char** argv) {
     if (!opts.broadcast_mode_valid) {
         if (env.rank == 0) {
             spdlog::error(
-                "Invalid --broadcast-mode value '{}'. Supported values: panel, block, block-a.",
+                "Invalid --broadcast-mode value '{}'. Supported values: panel, block, block-a, block-yt.",
                           opts.broadcast_mode_value);
         }
         finalize_nccl_if_needed(&env);

@@ -94,7 +94,7 @@ mpirun -np 4 --mca pml ucx --mca coll_hcoll_enable 0 \
 分布式 col-blockcyclic benchmark 常用参数：
 - `--block_cols <int>`：block-cyclic 的拥有粒度，必须是正数并且是 `nb` 的整数倍。
 - `--panel-comm <sendrecv|broadcast>`：选择 panel 通信方式。
-- `--broadcast-mode <panel|block|block-a>`：为 factorization 路径选择 panel 级广播、完整 block `W/Y` 广播，或只广播 block `A`。`block-a` 只发送 factorize 后的 block `A`，由接收方本地重建 block `W/Y`，因此 block 级通信量减半。它既适用于 `bench_dist_blocked_qr_col_blockcyclic`，也适用于 `bench_dist_orgqr_col_blockcyclic --e2e`。
+- `--broadcast-mode <panel|block|block-a|block-yt>`：为 factorization 路径选择 panel 级广播、完整 block `W/Y` 广播、只广播 block `A`，或广播 block `Y/T`。`block-a` 只发送 factorize 后的 block `A`，由接收方本地重建 block `W/Y`，因此 block 级通信量减半。`block-yt` 发送 compact `Y` 和较小的三角 `T`，接收方本地重建 `W = Y * T^T`。它既适用于 `bench_dist_blocked_qr_col_blockcyclic`，也适用于 `bench_dist_orgqr_col_blockcyclic --e2e`。
 - `--overlap_tile <int>` 或 `--update_tile <int>`：尾面板更新的 tile 宽度。`0` 表示 one-shot update。
 - `--panel-buffers <int>`：panel pack buffer 的个数，至少为 `2`。
 - `--compact-local-gemm` / `--segmented-local-gemm`：选择本地尾面板更新实现。
