@@ -22,6 +22,10 @@ add_executable(bench_dist_orgqr_col_blockcyclic bench_dist_orgqr_col_blockcyclic
 target_include_directories(bench_dist_orgqr_col_blockcyclic PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(bench_dist_orgqr_col_blockcyclic PRIVATE CUDA::cublas CUDA::curand CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL distqr_nvtx_headers)
 
+add_executable(bench_nccl_broadcast_vs_hierarchical bench_nccl_broadcast_vs_hierarchical.cu)
+target_include_directories(bench_nccl_broadcast_vs_hierarchical PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(bench_nccl_broadcast_vs_hierarchical PRIVATE CUDA::cudart MPI::MPI_CXX spdlog::spdlog NCCL::NCCL)
+
 if(CUDAToolkit_FOUND)
   get_filename_component(_CUDA_ROOT_FROM_BIN "${CUDAToolkit_BIN_DIR}" DIRECTORY)
 endif()
