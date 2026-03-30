@@ -13,6 +13,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "components/panel_cusolver.cuh"
 #include "components/panel_process.cuh"
 #include "utils/cublas_gemm_traits.cuh"
 
@@ -134,6 +135,36 @@ double FlopsToTflops(double flops, float ms) {
         return 0.0;
     }
     return flops / (static_cast<double>(ms) * 1e-3) / 1e12;
+}
+
+enum class PanelBackend {
+    Tsqr,
+    Cusolver,
+};
+
+bool ParsePanelBackend(const char* value, PanelBackend* backend) {
+    if (!value || !backend) {
+        return false;
+    }
+    if (std::strcmp(value, "tsqr") == 0) {
+        *backend = PanelBackend::Tsqr;
+        return true;
+    }
+    if (std::strcmp(value, "cusolver") == 0) {
+        *backend = PanelBackend::Cusolver;
+        return true;
+    }
+    return false;
+}
+
+const char* PanelBackendToString(PanelBackend backend) {
+    switch (backend) {
+        case PanelBackend::Tsqr:
+            return "tsqr";
+        case PanelBackend::Cusolver:
+            return "cusolver";
+    }
+    return "unknown";
 }
 
 template <typename T>
@@ -357,7 +388,47 @@ void GenerateExplicitQFromWYStridedBatched(int m,
 }
 
 template <typename T>
+void FactorizePanelToWy(cublasHandle_t cublas_handle,
+                        cusolverDnHandle_t cusolver_handle,
+                        PanelBackend panel_backend,
+                        int panel_height,
+                        T* panel_A,
+                        int lda,
+                        T* panel_W,
+                        T* panel_Y,
+                        T* d_rtmp,
+                        T* d_tsqr_work,
+                        size_t tsqr_work_elems_m,
+                        T* d_panel_tau,
+                        T* d_panel_work,
+                        int panel_lwork,
+                        int* d_panel_info,
+                        cudaStream_t stream) {
+    if (panel_backend == PanelBackend::Tsqr) {
+        tsqr<T>(cublas_handle, panel_height, panel_A, lda, d_rtmp, kPanelWidth, d_tsqr_work,
+                tsqr_work_elems_m, stream);
+        generate_wy(panel_height, kPanelWidth, panel_A, lda, panel_Y, lda, panel_W, lda, stream);
+        write_back_R2A(kPanelWidth, kPanelWidth, d_rtmp, kPanelWidth, panel_A, lda, stream);
+        return;
+    }
+
+    AssertCusolver(CusolverPanelQrTraits<T>::Geqrf(cusolver_handle, panel_height, kPanelWidth,
+                                                   panel_A, lda, d_panel_tau, d_panel_work,
+                                                   panel_lwork, d_panel_info),
+                   "panel cusolver geqrf");
+    pack_upper_triangle(kPanelWidth, kPanelWidth, panel_A, lda, d_rtmp, kPanelWidth, stream);
+    AssertCusolver(CusolverPanelQrTraits<T>::Orgqr(cusolver_handle, panel_height, kPanelWidth,
+                                                   kPanelWidth, panel_A, lda, d_panel_tau,
+                                                   d_panel_work, panel_lwork, d_panel_info),
+                   "panel cusolver orgqr");
+    generate_wy(panel_height, kPanelWidth, panel_A, lda, panel_Y, lda, panel_W, lda, stream);
+    write_back_R2A(kPanelWidth, kPanelWidth, d_rtmp, kPanelWidth, panel_A, lda, stream);
+}
+
+template <typename T>
 void BlockedQrFactorize(cublasHandle_t cublas_handle,
+                        cusolverDnHandle_t cusolver_handle,
+                        PanelBackend panel_backend,
                         int m,
                         int n,
                         int nb,
@@ -369,6 +440,10 @@ void BlockedQrFactorize(cublasHandle_t cublas_handle,
                         T* d_rtmp,
                         T* d_tsqr_work,
                         size_t tsqr_work_elems_m,
+                        T* d_panel_tau,
+                        T* d_panel_work,
+                        int panel_lwork,
+                        int* d_panel_info,
                         cudaStream_t stream,
                         bool trail_one_shot) {
     const T one = static_cast<T>(1);
@@ -388,11 +463,10 @@ void BlockedQrFactorize(cublasHandle_t cublas_handle,
             T* panel_W = d_W + Idx2D(inner_index, inner_index, lda);
             T* panel_Y = d_Y + Idx2D(inner_index, inner_index, lda);
 
-            tsqr<T>(cublas_handle, panel_height, panel_A, lda, d_rtmp, kPanelWidth, d_tsqr_work,
-                    tsqr_work_elems_m, stream);
-            generate_wy(panel_height, kPanelWidth, panel_A, lda, panel_Y, lda, panel_W, lda,
-                        stream);
-            write_back_R2A(kPanelWidth, kPanelWidth, d_rtmp, kPanelWidth, panel_A, lda, stream);
+            FactorizePanelToWy<T>(cublas_handle, cusolver_handle, panel_backend, panel_height,
+                                  panel_A, lda, panel_W, panel_Y, d_rtmp, d_tsqr_work,
+                                  tsqr_work_elems_m, d_panel_tau, d_panel_work, panel_lwork,
+                                  d_panel_info, stream);
 
             const int n_remain_in_block = end - (inner_index + kPanelWidth);
             if (n_remain_in_block > 0) {
@@ -470,6 +544,9 @@ struct Options {
     bool with_q_batched = false;
     bool trail_one_shot = false;
     int trail_tile_cols = 0;
+    PanelBackend panel_backend = PanelBackend::Tsqr;
+    bool panel_backend_valid = true;
+    std::string panel_backend_value = "tsqr";
 };
 
 Options ParseArgs(int argc, char** argv) {
@@ -528,6 +605,10 @@ Options ParseArgs(int argc, char** argv) {
             opts.trail_one_shot = false;
         } else if (std::strcmp(argv[i], "--trail-tile-cols") == 0 && i + 1 < argc) {
             opts.trail_tile_cols = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--panel-backend") == 0 && i + 1 < argc) {
+            opts.panel_backend_value = argv[++i];
+            opts.panel_backend_valid =
+                ParsePanelBackend(opts.panel_backend_value.c_str(), &opts.panel_backend);
         }
     }
     return opts;
@@ -563,6 +644,10 @@ void RunBench(const Options& opts,
     T* d_Y = nullptr;
     T* d_rtmp = nullptr;
     T* d_work_tsqr = nullptr;
+    T* d_panel_tau = nullptr;
+    T* d_panel_work = nullptr;
+    int* d_panel_info = nullptr;
+    int panel_lwork = 0;
 
     AssertCuda(cudaMalloc(&d_A0, a_bytes), "cudaMalloc d_A0");
     AssertCuda(cudaMalloc(&d_A, a_bytes), "cudaMalloc d_A");
@@ -571,6 +656,23 @@ void RunBench(const Options& opts,
     AssertCuda(cudaMalloc(&d_rtmp, rtmp_bytes), "cudaMalloc d_rtmp");
     if (tsqr_work_elems_m > 0) {
         AssertCuda(cudaMalloc(&d_work_tsqr, tsqr_work_bytes), "cudaMalloc d_work_tsqr");
+    }
+    if (opts.panel_backend == PanelBackend::Cusolver) {
+        AssertCuda(cudaMalloc(&d_panel_tau, static_cast<size_t>(kPanelWidth) * sizeof(T)),
+                   "cudaMalloc d_panel_tau");
+        AssertCuda(cudaMalloc(&d_panel_info, sizeof(int)), "cudaMalloc d_panel_info");
+        int panel_lwork_geqrf = 0;
+        int panel_lwork_orgqr = 0;
+        AssertCusolver(CusolverPanelQrTraits<T>::GeqrfBufferSize(cusolver_handle, m, kPanelWidth,
+                                                                 d_A, lda, &panel_lwork_geqrf),
+                       "panel cusolver geqrf_bufferSize");
+        AssertCusolver(CusolverPanelQrTraits<T>::OrgqrBufferSize(cusolver_handle, m, kPanelWidth,
+                                                                 kPanelWidth, d_A, lda,
+                                                                 d_panel_tau, &panel_lwork_orgqr),
+                       "panel cusolver orgqr_bufferSize");
+        panel_lwork = std::max(panel_lwork_geqrf, panel_lwork_orgqr);
+        AssertCuda(cudaMalloc(&d_panel_work, static_cast<size_t>(panel_lwork) * sizeof(T)),
+                   "cudaMalloc d_panel_work");
     }
 
     FillDeviceRandom(d_A0, a_elems, 1234ULL);
@@ -581,8 +683,10 @@ void RunBench(const Options& opts,
                    "cudaMemcpy D2D warmup");
         AssertCuda(cudaMemset(d_W, 0, wy_bytes), "cudaMemset d_W warmup");
         AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y warmup");
-        BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W, d_Y, d_rtmp,
-                              d_work_tsqr, tsqr_work_elems_m, nullptr, opts.trail_one_shot);
+        BlockedQrFactorize<T>(cublas_handle, cusolver_handle, opts.panel_backend, m, n, nb,
+                              trail_tile_cols, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
+                              tsqr_work_elems_m, d_panel_tau, d_panel_work, panel_lwork,
+                              d_panel_info, nullptr, opts.trail_one_shot);
         AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize warmup");
     }
 
@@ -594,15 +698,17 @@ void RunBench(const Options& opts,
             AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y");
         },
         [&]() {
-            BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W, d_Y,
-                                  d_rtmp, d_work_tsqr, tsqr_work_elems_m, nullptr,
-                                  opts.trail_one_shot);
+            BlockedQrFactorize<T>(cublas_handle, cusolver_handle, opts.panel_backend, m, n, nb,
+                                  trail_tile_cols, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
+                                  tsqr_work_elems_m, d_panel_tau, d_panel_work, panel_lwork,
+                                  d_panel_info, nullptr, opts.trail_one_shot);
             AssertCuda(cudaGetLastError(), "blocked qr launch");
         },
         opts.iters);
 
     const double blocked_tflops = FlopsToTflops(qr_flops, blocked_ms);
-    spdlog::info("BlockedQR avg: {:.3f} ms ({:.3f} TFLOPS)", blocked_ms, blocked_tflops);
+    spdlog::info("BlockedQR avg: {:.3f} ms ({:.3f} TFLOPS, panel={})", blocked_ms,
+                 blocked_tflops, PanelBackendToString(opts.panel_backend));
 
     if (opts.with_q && !opts.run_geqrf) {
         spdlog::warn("--with-q with --run_geqrf false: skip cuSOLVER (GEQRF/ORGQR) timings");
@@ -707,9 +813,10 @@ void RunBench(const Options& opts,
                 AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y wyQ");
             };
             auto wy_q_fn = [&]() {
-                BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W, d_Y,
-                                      d_rtmp, d_work_tsqr, tsqr_work_elems_m, nullptr,
-                                      opts.trail_one_shot);
+                BlockedQrFactorize<T>(cublas_handle, cusolver_handle, opts.panel_backend, m, n, nb,
+                                      trail_tile_cols, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
+                                      tsqr_work_elems_m, d_panel_tau, d_panel_work, panel_lwork,
+                                      d_panel_info, nullptr, opts.trail_one_shot);
                 GenerateExplicitQFromWY<T>(m, n, nb, d_W, d_Y, d_A, d_work_geqrf,
                                            static_cast<size_t>(lwork), cublas_handle);
             };
@@ -729,9 +836,10 @@ void RunBench(const Options& opts,
                        "cudaMemcpy D2D WY precompute");
             AssertCuda(cudaMemset(d_W, 0, wy_bytes), "cudaMemset d_W WY precompute");
             AssertCuda(cudaMemset(d_Y, 0, wy_bytes), "cudaMemset d_Y WY precompute");
-            BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W, d_Y,
-                                  d_rtmp, d_work_tsqr, tsqr_work_elems_m, nullptr,
-                                  opts.trail_one_shot);
+            BlockedQrFactorize<T>(cublas_handle, cusolver_handle, opts.panel_backend, m, n, nb,
+                                  trail_tile_cols, d_A, lda, d_W, d_Y, d_rtmp, d_work_tsqr,
+                                  tsqr_work_elems_m, d_panel_tau, d_panel_work, panel_lwork,
+                                  d_panel_info, nullptr, opts.trail_one_shot);
             AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize WY precompute");
 
             auto wy_apply_setup = [&]() {
@@ -757,8 +865,10 @@ void RunBench(const Options& opts,
             if (opts.with_q_batched) {
                 // End-to-end explicit Q using StridedBatchedGEMM (factorize + explicit-Q).
                 auto wy_q_batched_fn = [&]() {
-                    BlockedQrFactorize<T>(cublas_handle, m, n, nb, trail_tile_cols, d_A, lda, d_W,
-                                          d_Y, d_rtmp, d_work_tsqr, tsqr_work_elems_m, nullptr,
+                    BlockedQrFactorize<T>(cublas_handle, cusolver_handle, opts.panel_backend, m, n,
+                                          nb, trail_tile_cols, d_A, lda, d_W, d_Y, d_rtmp,
+                                          d_work_tsqr, tsqr_work_elems_m, d_panel_tau,
+                                          d_panel_work, panel_lwork, d_panel_info, nullptr,
                                           opts.trail_one_shot);
                     GenerateExplicitQFromWYStridedBatched<T>(m, n, nb, d_W, d_Y, d_A, d_work_geqrf,
                                                              static_cast<size_t>(lwork),
@@ -891,6 +1001,15 @@ void RunBench(const Options& opts,
     if (d_work_tsqr) {
         AssertCuda(cudaFree(d_work_tsqr), "cudaFree d_work_tsqr");
     }
+    if (d_panel_tau) {
+        AssertCuda(cudaFree(d_panel_tau), "cudaFree d_panel_tau");
+    }
+    if (d_panel_work) {
+        AssertCuda(cudaFree(d_panel_work), "cudaFree d_panel_work");
+    }
+    if (d_panel_info) {
+        AssertCuda(cudaFree(d_panel_info), "cudaFree d_panel_info");
+    }
 }
 
 }  // namespace
@@ -914,11 +1033,17 @@ int main(int argc, char** argv) {
         spdlog::error("Invalid args: require trail_tile_cols > 0");
         return 1;
     }
+    if (!opts.panel_backend_valid) {
+        spdlog::error("Invalid --panel-backend value '{}'. Supported values: tsqr, cusolver.",
+                      opts.panel_backend_value);
+        return 1;
+    }
 
     spdlog::info("QR bench: m={} n={} nb={} b={} iters={} warmup={} type={} {} {}", opts.m, opts.n,
                  opts.nb, kPanelWidth, opts.iters, opts.warmup,
                  opts.use_double ? "double" : "float", opts.run_geqrf ? "" : "(no geqrf)",
                  opts.with_q ? "(with Q)" : "");
+    spdlog::info("Panel backend: {}", PanelBackendToString(opts.panel_backend));
     spdlog::info("Trailing update mode: {}", opts.trail_one_shot ? "one-shot GEMM" : "tiled GEMM");
     spdlog::info("Trailing tiled cols: {}",
                  opts.trail_tile_cols > 0 ? opts.trail_tile_cols : opts.nb);

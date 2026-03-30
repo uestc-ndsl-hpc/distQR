@@ -10,11 +10,17 @@
 
 #include <spdlog/spdlog.h>
 
+#include "components/panel_cusolver.cuh"
 #include "components/panel_process.cuh"
 
 namespace {
 
 constexpr int kPanelWidth = 32;
+
+enum class PanelBackend {
+    Tsqr,
+    Cusolver,
+};
 
 static inline size_t Idx2D(int row, int col, int ld) {
     return static_cast<size_t>(row) + static_cast<size_t>(col) * static_cast<size_t>(ld);
@@ -213,18 +219,60 @@ static void GenerateExplicitQFromWY(int m,
     }
 }
 
+void FactorizePanelToWy(cublasHandle_t cublas_handle,
+                        cusolverDnHandle_t cusolver_handle,
+                        PanelBackend panel_backend,
+                        int panel_height,
+                        float* panel_A,
+                        int lda,
+                        float* panel_W,
+                        float* panel_Y,
+                        float* d_rtmp,
+                        float* d_tsqr_work,
+                        size_t tsqr_work_elems_m,
+                        float* d_panel_tau,
+                        float* d_panel_work,
+                        int panel_lwork,
+                        int* d_panel_info) {
+    if (panel_backend == PanelBackend::Tsqr) {
+        tsqr<float>(cublas_handle, panel_height, panel_A, lda, d_rtmp, kPanelWidth, d_tsqr_work,
+                    tsqr_work_elems_m, nullptr);
+        generate_wy(panel_height, kPanelWidth, panel_A, lda, panel_Y, lda, panel_W, lda, nullptr);
+        write_back_R2A(kPanelWidth, kPanelWidth, d_rtmp, kPanelWidth, panel_A, lda, nullptr);
+        return;
+    }
+
+    AssertCusolver(CusolverPanelQrTraits<float>::Geqrf(cusolver_handle, panel_height, kPanelWidth,
+                                                       panel_A, lda, d_panel_tau, d_panel_work,
+                                                       panel_lwork, d_panel_info),
+                   "panel cusolver geqrf");
+    pack_upper_triangle(kPanelWidth, kPanelWidth, panel_A, lda, d_rtmp, kPanelWidth, nullptr);
+    AssertCusolver(CusolverPanelQrTraits<float>::Orgqr(cusolver_handle, panel_height, kPanelWidth,
+                                                       kPanelWidth, panel_A, lda, d_panel_tau,
+                                                       d_panel_work, panel_lwork, d_panel_info),
+                   "panel cusolver orgqr");
+    generate_wy(panel_height, kPanelWidth, panel_A, lda, panel_Y, lda, panel_W, lda, nullptr);
+    write_back_R2A(kPanelWidth, kPanelWidth, d_rtmp, kPanelWidth, panel_A, lda, nullptr);
+}
+
 void SingleCardBlockedQrFactorize(float* d_Afact,
                                   int m,
                                   int n,
                                   int nb,
                                   int trail_tile_cols,
                                   cublasHandle_t cublas_handle,
+                                  cusolverDnHandle_t cusolver_handle,
                                   float* d_W,
                                   float* d_Y,
                                   float* d_rtmp,
                                   float* d_tsqr_work,
                                   size_t tsqr_work_elems_m,
-                                  bool trail_one_shot) {
+                                  bool trail_one_shot,
+                                  PanelBackend panel_backend = PanelBackend::Tsqr,
+                                  float* d_panel_tau = nullptr,
+                                  float* d_panel_work = nullptr,
+                                  int panel_lwork = 0,
+                                  int* d_panel_info = nullptr) {
     const int lda = m;
     const float one = 1.0f;
     const float zero = 0.0f;
@@ -243,11 +291,10 @@ void SingleCardBlockedQrFactorize(float* d_Afact,
             auto panel_W = d_W + Idx2D(inner_index, inner_index, lda);
             auto panel_Y = d_Y + Idx2D(inner_index, inner_index, lda);
 
-            tsqr<float>(cublas_handle, panel_height, panel_A, lda, d_rtmp, kPanelWidth, d_tsqr_work,
-                        tsqr_work_elems_m, nullptr);
-            generate_wy(panel_height, kPanelWidth, panel_A, lda, panel_Y, lda, panel_W, lda,
-                        nullptr);
-            write_back_R2A(kPanelWidth, kPanelWidth, d_rtmp, kPanelWidth, panel_A, lda, nullptr);
+            FactorizePanelToWy(cublas_handle, cusolver_handle, panel_backend, panel_height,
+                               panel_A, lda, panel_W, panel_Y, d_rtmp, d_tsqr_work,
+                               tsqr_work_elems_m, d_panel_tau, d_panel_work, panel_lwork,
+                               d_panel_info);
 
             // Update remaining columns inside this outer block:
             // A(inner:m, inner+b:end) <- Q_i^T * A(inner:m, inner+b:end)
@@ -537,8 +584,9 @@ static void RunQrCase(const QrCase& test_case,
     AssertCublas(cublasCreate(&handle), "cublasCreate");
 
     // Factorize Afact to get WY (and R in Afact's upper triangle).
-    SingleCardBlockedQrFactorize(d_Afact.ptr, m, n, nb, trail_tile_cols, handle, d_W.ptr, d_Y.ptr,
-                                 d_rtmp.ptr, d_tsqr.ptr, elems_tsqr, trail_one_shot);
+    SingleCardBlockedQrFactorize(d_Afact.ptr, m, n, nb, trail_tile_cols, handle, nullptr,
+                                 d_W.ptr, d_Y.ptr, d_rtmp.ptr, d_tsqr.ptr, elems_tsqr,
+                                 trail_one_shot);
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after factorize");
     AssertCuda(cudaGetLastError(), "cudaGetLastError after factorize");
 
@@ -659,7 +707,8 @@ static void RunOrgqrCompareCase(const QrCase& test_case,
                                 ReusableDeviceBufferF& d_Qdiff,
                                 ReusableDeviceBufferF& d_tau,
                                 ReusableDeviceBufferF& d_cusolver_work,
-                                ReusableNormalRng& rng) {
+                                ReusableNormalRng& rng,
+                                PanelBackend panel_backend = PanelBackend::Tsqr) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
         GTEST_SKIP() << "No CUDA device available.";
@@ -726,9 +775,14 @@ static void RunOrgqrCompareCase(const QrCase& test_case,
     const size_t work_q_elems = static_cast<size_t>(nb) * static_cast<size_t>(n);
     ASSERT_TRUE(d_cusolver_work.Ensure(std::max(static_cast<size_t>(lwork), work_q_elems)));
 
+    int* d_info = nullptr;
+    AssertCuda(cudaMalloc(&d_info, sizeof(int)), "cudaMalloc d_info");
+
     // WY factorization.
-    SingleCardBlockedQrFactorize(d_Afact.ptr, m, n, nb, trail_tile_cols, cublas_handle, d_W.ptr,
-                                 d_Y.ptr, d_rtmp.ptr, d_tsqr.ptr, elems_tsqr, trail_one_shot);
+    SingleCardBlockedQrFactorize(d_Afact.ptr, m, n, nb, trail_tile_cols, cublas_handle,
+                                 cusolver_handle, d_W.ptr, d_Y.ptr, d_rtmp.ptr, d_tsqr.ptr,
+                                 elems_tsqr, trail_one_shot, panel_backend, d_tau.ptr,
+                                 d_cusolver_work.ptr, lwork, d_info);
     AssertCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after WY factorize");
     AssertCuda(cudaGetLastError(), "cudaGetLastError after WY factorize");
 
@@ -739,9 +793,6 @@ static void RunOrgqrCompareCase(const QrCase& test_case,
     AssertCuda(cudaGetLastError(), "cudaGetLastError after Q_wy");
 
     // orgqr via cusolverDnSgeqrf + cusolverDnSorgqr.
-    int* d_info = nullptr;
-    AssertCuda(cudaMalloc(&d_info, sizeof(int)), "cudaMalloc d_info");
-
     AssertCusolver(cusolverDnSgeqrf(cusolver_handle, m, n, d_Ageqrf.ptr, m, d_tau.ptr,
                                     d_cusolver_work.ptr, lwork, d_info),
                    "cusolverDnSgeqrf");
@@ -861,6 +912,12 @@ TEST(SingleCardQrTest, WyVsOrgqr2048_NB256_OneShotTrail) {
 TEST(SingleCardQrTest, WyVsOrgqr2048_NB256_Tile96) {
     RunOrgqrCompareCase({2048, 256}, false, 96, g_A0, g_Afact, g_Ageqrf, g_W, g_Y, g_rtmp, g_tsqr,
                         g_Qwy, g_Qorgqr, g_Qdiff, g_tau, g_cusolver_work, g_rng);
+}
+
+TEST(SingleCardQrTest, WyVsOrgqr2048_NB256_CusolverPanel) {
+    RunOrgqrCompareCase({2048, 256}, false, 256, g_A0, g_Afact, g_Ageqrf, g_W, g_Y, g_rtmp,
+                        g_tsqr, g_Qwy, g_Qorgqr, g_Qdiff, g_tau, g_cusolver_work, g_rng,
+                        PanelBackend::Cusolver);
 }
 
 }  // namespace

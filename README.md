@@ -47,6 +47,7 @@ Build and run the blocked QR benchmark:
 - `--no-geqrf`: shorthand for disabling GEQRF path.
 - `--with-q`: include explicit-Q generation timings.
 - `--with-q-batched`: add StridedBatchedGEMM explicit-Q timings (implies `--with-q`).
+- `--panel-backend <tsqr|cusolver>`: choose the panel factorization backend for blocked QR. `cusolver` uses per-panel `geqrf+orgqr` to align its panel output with the existing TSQR/WY path, which is useful for ablation studies.
 - `--trail-one-shot`: use one-shot trailing-update GEMM.
 - `--trail-tiled`: use tiled trailing-update GEMM.
 - `--trail-tile-cols <int>`: tile width for tiled trailing-update GEMM. If omitted (or set to `0`), it defaults to `nb`.
@@ -66,6 +67,11 @@ Example with custom tiled width:
 Example with explicit-Q timings:
 ```bash
 ./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --with-q --iters 10 --warmup 2
+```
+
+Example with cuSOLVER panel ablation:
+```bash
+./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --panel-backend cusolver --iters 10 --warmup 2
 ```
 
 ## Distributed Col-Blockcyclic

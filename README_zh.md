@@ -47,6 +47,7 @@ cmake --build build
 - `--no-geqrf`：关闭 GEQRF 路径的简写。
 - `--with-q`：包含显式 Q 生成的计时。
 - `--with-q-batched`：额外加入 StridedBatchedGEMM 的显式 Q 计时（隐含 `--with-q`）。
+- `--panel-backend <tsqr|cusolver>`：选择 blocked QR 的 panel 分解后端。`cusolver` 会对每个 panel 执行 `geqrf+orgqr`，把输出对齐到现有 TSQR/WY 路径，适合做消融实验。
 - `--trail-one-shot`：使用 one-shot 的 trailing-update GEMM。
 - `--trail-tiled`：使用分块（tiled）的 trailing-update GEMM。
 - `--trail-tile-cols <int>`：分块 trailing-update GEMM 的列方向 tile 宽度。未指定（或设置为 `0`）时，默认使用 `nb`。
@@ -66,6 +67,11 @@ cmake --build build
 包含显式 Q 计时的示例：
 ```bash
 ./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --with-q --iters 10 --warmup 2
+```
+
+使用 cuSOLVER panel backend 做消融的示例：
+```bash
+./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --panel-backend cusolver --iters 10 --warmup 2
 ```
 
 ## 分布式 Col-Blockcyclic
