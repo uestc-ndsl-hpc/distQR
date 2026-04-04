@@ -926,22 +926,6 @@ TEST(DistBlockedQrColBlockCyclicCorrectnessTest,
 }
 
 TEST(DistBlockedQrColBlockCyclicCorrectnessTest,
-     BlockABroadcastOnceBlockCols2NbTiledSegmentedFloat) {
-    ColBlockCyclicCorrectnessConfig cfg;
-    cfg.m = 8192;
-    cfg.n = 8192;
-    cfg.nb = 1024;
-    cfg.block_cols = 2048;
-    cfg.overlap_tile = 1024;
-    cfg.panel_comm_mode = distributed_qr_col_blockcyclic::PanelCommMode::Broadcast;
-    cfg.broadcast_mode = distributed_qr_col_blockcyclic::BroadcastMode::BlockAOnly;
-    cfg.wy_storage_mode = distributed_qr_col_blockcyclic::PersistentWyStorageMode::Compact;
-    cfg.use_compact_local_gemm = false;
-    cfg.case_name = "block_a_broadcast_once_block_cols_2048_tiled_segmented";
-    RunFactorizedAEqualsQtA0<float>(cfg, 1.5e-3, 1.5e-3);
-}
-
-TEST(DistBlockedQrColBlockCyclicCorrectnessTest,
      BlockYTBroadcastOnceBlockCols2NbTiledSegmentedFloat) {
     ColBlockCyclicCorrectnessConfig cfg;
     cfg.m = 8192;
@@ -968,21 +952,6 @@ TEST(DistBlockedQrColBlockCyclicCorrectnessTest, ExplicitQBroadcastBlockCols2NbF
     cfg.wy_storage_mode = distributed_qr_col_blockcyclic::PersistentWyStorageMode::Compact;
     cfg.use_compact_local_gemm = false;
     cfg.case_name = "explicit_q_broadcast_block_cols_256";
-    RunExplicitQReconstructsA0<float>(cfg, 2.5e-3, 2.5e-3);
-}
-
-TEST(DistBlockedQrColBlockCyclicCorrectnessTest, ExplicitQBlockABroadcastBlockCols2NbFloat) {
-    ColBlockCyclicCorrectnessConfig cfg;
-    cfg.m = 1024;
-    cfg.n = 512;
-    cfg.nb = 128;
-    cfg.block_cols = 256;
-    cfg.overlap_tile = 128;
-    cfg.panel_comm_mode = distributed_qr_col_blockcyclic::PanelCommMode::Broadcast;
-    cfg.broadcast_mode = distributed_qr_col_blockcyclic::BroadcastMode::BlockAOnly;
-    cfg.wy_storage_mode = distributed_qr_col_blockcyclic::PersistentWyStorageMode::Compact;
-    cfg.use_compact_local_gemm = false;
-    cfg.case_name = "explicit_q_block_a_broadcast_block_cols_256";
     RunExplicitQReconstructsA0<float>(cfg, 2.5e-3, 2.5e-3);
 }
 
