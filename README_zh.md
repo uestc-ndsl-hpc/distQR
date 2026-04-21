@@ -47,6 +47,7 @@ cmake --build build
 - `--no-geqrf`：关闭 GEQRF 路径的简写。
 - `--with-q`：包含显式 Q 生成的计时。
 - `--with-q-batched`：额外加入 StridedBatchedGEMM 的显式 Q 计时（隐含 `--with-q`）。
+- `--panel-backend <tsqr|cusolver>`：选择 blocked QR 的 panel 分解后端。`cusolver` 会对每个 panel 执行 `geqrf+orgqr`，把输出对齐到现有 TSQR/WY 路径，适合做消融实验。
 - `--trail-one-shot`：使用 one-shot 的 trailing-update GEMM。
 - `--trail-tiled`：使用分块（tiled）的 trailing-update GEMM。
 - `--trail-tile-cols <int>`：分块 trailing-update GEMM 的列方向 tile 宽度。未指定（或设置为 `0`）时，默认使用 `nb`。
@@ -66,4 +67,56 @@ cmake --build build
 包含显式 Q 计时的示例：
 ```bash
 ./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --with-q --iters 10 --warmup 2
+```
+
+使用 cuSOLVER panel backend 做消融的示例：
+```bash
+./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --panel-backend cusolver --iters 10 --warmup 2
+```
+
+## 分布式 Col-Blockcyclic
+
+仓库里也提供了 1D 列 block-cyclic 布局下的分布式 blocked QR 和 explicit Q 基准测试。
+
+分布式 blocked QR 基准测试：
+```bash
+mpirun -np 4 --mca pml ucx --mca coll_hcoll_enable 0 \
+  ./build/bench/bench_dist_blocked_qr_col_blockcyclic \
+  --m 65536 --n 65536 --nb 1024 --block_cols 1024 \
+  --iters 2 --warmup 3 --panel-buffers 2 \
+  --panel-comm broadcast --broadcast-mode block \
+  --update_tile 1024 --store-wy none
+```
+
+分布式 explicit Q 基准测试：
+```bash
+mpirun -np 4 --mca pml ucx --mca coll_hcoll_enable 0 \
+  ./build/bench/bench_dist_orgqr_col_blockcyclic \
+  --m 8192 --n 8192 --nb 1024 --block_cols 1024 \
+  --iters 2 --warmup 1 --panel-buffers 2 \
+  --panel-comm broadcast --broadcast-mode block --store-wy compact --e2e
+```
+
+分布式 col-blockcyclic benchmark 常用参数：
+- `--block_cols <int>`：block-cyclic 的拥有粒度，必须是正数并且是 `nb` 的整数倍。
+- `--panel-comm <sendrecv|broadcast>`：选择 panel 通信方式。
+- `--broadcast-mode <panel|block|block-a|block-yt>`：为 factorization 路径选择 panel 级广播、完整 block `W/Y` 广播、只广播 block `A`，或广播 block `Y/T`。`block-a` 只发送 factorize 后的 block `A`，由接收方本地重建 block `W/Y`，因此 block 级通信量减半。`block-yt` 发送 compact `Y` 和较小的三角 `T`，接收方本地重建 `W = Y * T^T`。它既适用于 `bench_dist_blocked_qr_col_blockcyclic`，也适用于 `bench_dist_orgqr_col_blockcyclic --e2e`。
+- `--overlap_tile <int>` 或 `--update_tile <int>`：尾面板更新的 tile 宽度。`0` 表示 one-shot update。
+- `--panel-buffers <int>`：panel pack buffer 的个数，至少为 `2`。
+- `--compact-local-gemm` / `--segmented-local-gemm`：选择本地尾面板更新实现。
+- `--store-wy <none|dense|compact>`：persistent WY 的存储模式。
+
+`--store-wy` 的行为：
+- `none`：不分配 persistent `W/Y`。这是 `bench_dist_blocked_qr_col_blockcyclic` 的默认模式，适合只测 factorization、显存占用最低。
+- `dense`：保留原来的 dense 本地 `W/Y` 布局。
+- `compact`：把 persistent `W/Y` 按本 rank 拥有的 outer block 压缩存进一个 arena。这是 `bench_dist_orgqr_col_blockcyclic` 的默认模式。
+
+说明：
+- `bench_dist_orgqr_col_blockcyclic` 默认只测 explicit Q。加上 `--e2e` 后会把 factorization 也计入计时。
+- `bench_dist_orgqr_col_blockcyclic` 要求 `--store-wy dense` 或 `--store-wy compact`，不接受 `--store-wy none`。
+
+分布式正确性测试：
+```bash
+mpirun -np 4 --mca pml ucx --mca coll_hcoll_enable 0 \
+  ./build/test/test_dist_blocked_qr_col_blockcyclic_correctness
 ```

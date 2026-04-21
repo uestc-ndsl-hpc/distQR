@@ -4,6 +4,12 @@
 
 #include "utils/cublas_gemm_traits.cuh"
 
+constexpr int double_block_size = 256;
+constexpr int float_block_size = 256;
+constexpr int kTsqrN32Cols = 32;
+constexpr size_t kTsqrN32DoubleSharedBytes =
+    static_cast<size_t>(double_block_size) * static_cast<size_t>(kTsqrN32Cols) * sizeof(double);
+
 template <typename T>
 static __inline__ __device__ T warp_all_reduce_sum(T val) {
     for (int mask = warpSize / 2; mask > 0; mask /= 2) {
@@ -15,9 +21,9 @@ static __inline__ __device__ T warp_all_reduce_sum(T val) {
 template <typename T>
 constexpr int tsqr_block_size() {
     if constexpr (std::is_same_v<T, double>) {
-        return 192;
+        return double_block_size;
     } else {
-        return 256;
+        return float_block_size;
     }
 }
 
@@ -37,10 +43,11 @@ size_t tsqr_work_elems(int m) {
 }
 
 __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
-    constexpr int tsqr_n32_block_size = 256;
+    constexpr int tsqr_n32_block_size = float_block_size;
     constexpr int tsqr_n32_n = 32;
-    constexpr int tsqr_n32_data_num_per_thread = 8;
     constexpr int warp_size = 32;
+    constexpr int tsqr_n32_data_num_per_thread =
+        (tsqr_n32_block_size + warp_size - 1) / warp_size;
     constexpr float epsilon = 1e-4;
     const int lane_id = threadIdx.x;
     const int warp_id = threadIdx.y;
@@ -63,7 +70,7 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
 
     float q[tsqr_n32_data_num_per_thread];
     for (auto col = 0; col < tsqr_n32_n; ++col) {
-        float nu = 0.f;
+        volatile float nu = 0.f;
         if (warp_id == col) {
 #pragma unroll
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
@@ -116,7 +123,7 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
         __syncthreads();
 
         if (col < warp_id) {
-            float nu = 0.f;
+            volatile float nu = 0.f;
 #pragma unroll
             for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                 auto row_idx = lane_id + i * warp_size;
@@ -184,10 +191,11 @@ __global__ void tsqr_n32_float(int m, float* A, int lda, float* R, int ldr) {
 }
 
 __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
-    constexpr int tsqr_n32_block_size = 192;
+    constexpr int tsqr_n32_block_size = double_block_size;
     constexpr int tsqr_n32_n = 32;
-    constexpr int tsqr_n32_data_num_per_thread = 8;
     constexpr int warp_size = 32;
+    constexpr int tsqr_n32_data_num_per_thread =
+        (tsqr_n32_block_size + warp_size - 1) / warp_size;
     constexpr double epsilon = 1e-7;
     const int lane_id = threadIdx.x;
     const int warp_id = threadIdx.y;
@@ -198,7 +206,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
 
     int block_size = min(tsqr_n32_block_size, m - bx * tsqr_n32_block_size);
 
-    __shared__ double shared_A[tsqr_n32_block_size * tsqr_n32_n];
+    extern __shared__ double shared_A[];
 #pragma unroll
     for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
         auto row_idx = lane_id + i * warp_size;
@@ -239,7 +247,7 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
                     R[col + ldr * col] = (u1 >= 0) ? -norm : norm;
                 }
                 u1 = __shfl_sync(0xffffffff, u1, col % warp_size);
-                scale = __drcp_rn(__dsqrt_rn(abs(u1)));
+                scale = rsqrt(fabs(u1));
 #pragma unroll
                 for (auto i = 0; i < tsqr_n32_data_num_per_thread; ++i) {
                     auto row_idx = lane_id + i * warp_size;
@@ -330,6 +338,15 @@ __global__ void tsqr_n32_double(int m, double* A, int lda, double* R, int ldr) {
     }
 }
 
+static inline void configure_tsqr_n32_double_launch() {
+    constexpr int kPreferSharedMemory = 100;
+    const int shared_bytes = static_cast<int>(kTsqrN32DoubleSharedBytes);
+    cudaFuncSetAttribute(tsqr_n32_double, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         shared_bytes);
+    cudaFuncSetAttribute(tsqr_n32_double, cudaFuncAttributePreferredSharedMemoryCarveout,
+                         kPreferSharedMemory);
+}
+
 /**
 Full TSQR for n == 32.
 Note: Constructing the full Q and R requires recursive factorization of stacked
@@ -353,7 +370,8 @@ void tsqr(
         if constexpr (std::is_same_v<T, float>) {
             tsqr_n32_float<<<1, block, 0, stream>>>(m, A, lda, R, ldr);
         } else if constexpr (std::is_same_v<T, double>) {
-            tsqr_n32_double<<<1, block, 0, stream>>>(m, A, lda, R, ldr);
+            configure_tsqr_n32_double_launch();
+            tsqr_n32_double<<<1, block, kTsqrN32DoubleSharedBytes, stream>>>(m, A, lda, R, ldr);
         } else {
             static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                           "tsqr_recursive only supports float and double.");
@@ -372,7 +390,9 @@ void tsqr(
     if constexpr (std::is_same_v<T, float>) {
         tsqr_n32_float<<<block_num, block, 0, stream>>>(m, A, lda, work, ldwork);
     } else if constexpr (std::is_same_v<T, double>) {
-        tsqr_n32_double<<<block_num, block, 0, stream>>>(m, A, lda, work, ldwork);
+        configure_tsqr_n32_double_launch();
+        tsqr_n32_double<<<block_num, block, kTsqrN32DoubleSharedBytes, stream>>>(
+            m, A, lda, work, ldwork);
     } else {
         static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
                       "tsqr_recursive only supports float and double.");

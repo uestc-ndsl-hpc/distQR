@@ -47,6 +47,7 @@ Build and run the blocked QR benchmark:
 - `--no-geqrf`: shorthand for disabling GEQRF path.
 - `--with-q`: include explicit-Q generation timings.
 - `--with-q-batched`: add StridedBatchedGEMM explicit-Q timings (implies `--with-q`).
+- `--panel-backend <tsqr|cusolver>`: choose the panel factorization backend for blocked QR. `cusolver` uses per-panel `geqrf+orgqr` to align its panel output with the existing TSQR/WY path, which is useful for ablation studies.
 - `--trail-one-shot`: use one-shot trailing-update GEMM.
 - `--trail-tiled`: use tiled trailing-update GEMM.
 - `--trail-tile-cols <int>`: tile width for tiled trailing-update GEMM. If omitted (or set to `0`), it defaults to `nb`.
@@ -66,4 +67,56 @@ Example with custom tiled width:
 Example with explicit-Q timings:
 ```bash
 ./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --with-q --iters 10 --warmup 2
+```
+
+Example with cuSOLVER panel ablation:
+```bash
+./build/bench/bench_qr --m 8192 --n 8192 --nb 512 --panel-backend cusolver --iters 10 --warmup 2
+```
+
+## Distributed Col-Blockcyclic
+
+The repository also provides distributed blocked-QR and explicit-Q benchmarks for the 1D column block-cyclic layout.
+
+Distributed blocked-QR benchmark:
+```bash
+mpirun -np 4 --mca pml ucx --mca coll_hcoll_enable 0 \
+  ./build/bench/bench_dist_blocked_qr_col_blockcyclic \
+  --m 65536 --n 65536 --nb 1024 --block_cols 1024 \
+  --iters 2 --warmup 3 --panel-buffers 2 \
+  --panel-comm broadcast --broadcast-mode block \
+  --update_tile 1024 --store-wy none
+```
+
+Distributed explicit-Q benchmark:
+```bash
+mpirun -np 4 --mca pml ucx --mca coll_hcoll_enable 0 \
+  ./build/bench/bench_dist_orgqr_col_blockcyclic \
+  --m 8192 --n 8192 --nb 1024 --block_cols 1024 \
+  --iters 2 --warmup 1 --panel-buffers 2 \
+  --panel-comm broadcast --broadcast-mode block --store-wy compact --e2e
+```
+
+Useful options for the distributed col-blockcyclic benches:
+- `--block_cols <int>`: block-cyclic ownership granularity. It must be a positive multiple of `nb`.
+- `--panel-comm <sendrecv|broadcast>`: select panel communication mode.
+- `--broadcast-mode <panel|block|block-a|block-yt>`: select panel-level broadcast, full block `W/Y` broadcast, block-`A`-only broadcast, or block-`Y/T` broadcast for the factorization path. `block-a` halves block-broadcast traffic by sending only factorized block `A`, then rebuilding block `W/Y` locally on receivers. `block-yt` sends compact `Y` plus the small triangular `T`, then reconstructs `W = Y * T^T` locally on receivers. This applies to `bench_dist_blocked_qr_col_blockcyclic` and to `bench_dist_orgqr_col_blockcyclic --e2e`.
+- `--overlap_tile <int>` or `--update_tile <int>`: trailing-update tile width. `0` means one-shot update.
+- `--panel-buffers <int>`: number of packed panel buffers. Must be at least `2`.
+- `--compact-local-gemm` / `--segmented-local-gemm`: choose local trailing-update implementation.
+- `--store-wy <none|dense|compact>`: persistent WY storage mode.
+
+`--store-wy` behavior:
+- `none`: do not allocate persistent `W/Y`. This is the default for `bench_dist_blocked_qr_col_blockcyclic` and is the lowest-memory choice for factorization-only runs.
+- `dense`: keep the original dense local `W/Y` layout.
+- `compact`: store persistent `W/Y` in a compact arena, grouped by owned outer blocks. This is the default for `bench_dist_orgqr_col_blockcyclic`.
+
+Notes:
+- `bench_dist_orgqr_col_blockcyclic` runs explicit-Q only by default. Add `--e2e` to include factorization in the timed region.
+- `bench_dist_orgqr_col_blockcyclic` requires `--store-wy dense` or `--store-wy compact`; `--store-wy none` is rejected.
+
+Distributed correctness test:
+```bash
+mpirun -np 4 --mca pml ucx --mca coll_hcoll_enable 0 \
+  ./build/test/test_dist_blocked_qr_col_blockcyclic_correctness
 ```
